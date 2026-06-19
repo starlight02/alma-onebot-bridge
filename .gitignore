@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+
+# Local config
+config.toml
+
+# Persistent state (runtime-generated)
+bridge-state.db
+bridge-state.json
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

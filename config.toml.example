@@ -1,0 +1,28 @@
+# Alma OneBot Bridge Configuration
+# Copy this file to config.toml and edit as needed.
+# Environment variables take priority over config file values.
+
+[bridge]
+port = 8090
+
+[alma]
+api = "http://localhost:23001"
+# model = "anthropic:claude-sonnet-4-20250514"  # Uncomment to override Alma's default model
+timeout = 120               # Generation timeout in seconds
+max_retries = 2             # Max retry attempts on generation failure (0 = no retry)
+retry_delay_ms = 3000       # Base delay between retries in ms (exponential backoff)
+
+[database]
+path = "bridge-state.db"
+
+[people]
+# dir = "~/.config/alma/people"  # People Profiles directory
+
+[onebot]
+api_timeout = 30            # OneBot API call timeout in seconds
+# access_token = ""         # OneBot access token (uncomment to require Bearer auth on WS connections)
+
+[chat]
+group_history_size = 30     # Recent group messages for AI context (0 = disabled)
+# thinking_message = ""     # Optional message sent before AI generation (e.g. "思考中...")
+# show_thinking = false      # Show AI thinking content as a separate message (strips by default)

@@ -1,0 +1,185 @@
+# Alma OneBot Bridge
+
+A bridge service that connects [Alma](https://github.com/anthropics/alma) (local AI chat assistant) to QQ via the [OneBot v11](https://github.com/botuniverse/onebot-11) protocol. It enables Alma to serve as a bot in QQ private and group chats using a reverse WebSocket architecture.
+
+## Features
+
+- **Full Alma pipeline** — Messages go through Alma's WebSocket protocol, so SOUL, Memory, People Profiles, and Skills all work as expected
+- **Bidirectional sync** — Messages sent from the Alma GUI are forwarded to QQ, and vice versa
+- **Group chat support** — Responds to @mentions in group chats, with group card (群名片) as display name
+- **Group chat history** — Injects recent group messages into AI context so the bot knows what the group has been discussing
+- **Rich message handling** — Face emojis converted to readable text (`[emoji:斜眼笑]`), images/voice/video described with labels, forwarded messages summarized with content extraction
+- **Reply & @mention** — Full reply/quoting protocol (incoming quotes and outgoing reply references), with automatic @mention in group replies
+- **People Profiles** — Automatically creates Alma People Profile files for each QQ user, with `qq_id` frontmatter for cross-platform identity matching
+- **Message splitting** — Long replies are split by paragraph and QQ's 4500-character limit
+- **Persistent state** — Thread mappings and user profiles stored in a Turso (libsql) database
+- **Security** — Optional WebSocket access token authentication (`Bearer` header)
+- **Configurable** — TOML config file with environment variable overrides
+
+## Architecture
+
+```
+QQ User ──► snowluma/NapCat ──WS──► Bridge (this service) ──WS──► Alma
+                     (OneBot v11)          │                        │
+                                           ├── REST: thread creation
+                                           └── WS:   generate_response
+```
+
+The bridge acts as a **WebSocket server** for the OneBot client and a **WebSocket client** for Alma's internal chat pipeline (`ws://localhost:23001/ws/threads`).
+
+## Quick Start
+
+### Prerequisites
+
+- [Alma](https://github.com/anthropics/alma) running locally (`alma status` to verify)
+- A OneBot v11 client (e.g., [snowluma](https://github.com/nickyc975/snowluma) or NapCat) configured for reverse WebSocket
+- Rust toolchain (1.85+, edition 2024)
+
+### Build
+
+```bash
+git clone <repo-url>
+cd alma-onebot-bridge
+cargo build --release
+```
+
+### Configure
+
+Copy the example config and edit as needed:
+
+```bash
+cp config.toml.example config.toml
+# Edit config.toml with your preferred settings
+```
+
+Key settings in `config.toml`:
+
+```toml
+[bridge]
+port = 8090
+
+[alma]
+api = "http://localhost:23001"
+# model = "anthropic:claude-sonnet-4-20250514"  # Override default model
+timeout = 120
+
+[onebot]
+api_timeout = 30
+# access_token = ""  # Uncomment to require Bearer token on WS connections
+
+[chat]
+group_history_size = 30        # Recent group messages for AI context (0 = disabled)
+# thinking_message = "思考中..."  # Optional message before AI generation
+```
+
+> **Note**: `config.toml` is in `.gitignore` — it won't be committed to git. Only `config.toml.example` is tracked.
+
+Environment variables override config file values (e.g., `ALMA_MODEL`, `BRIDGE_PORT`).
+
+### Configure OneBot Client
+
+Add a reverse WebSocket connection in your OneBot client config. For snowluma, edit `/app/snowluma-data/config/onebot_<qq_id>.json`:
+
+```json
+{
+  "networks": {
+    "wsClients": [
+      {
+        "name": "Alma",
+        "url": "ws://<bridge-host>:8090/ws",
+        "messageFormat": "array",
+        "reportSelfMessage": false,
+        "role": "Universal",
+        "reconnectIntervalMs": 5000
+      }
+    ]
+  }
+}
+```
+
+If the OneBot client runs in Docker, use `host.docker.internal` as `<bridge-host>`.
+
+### Run
+
+```bash
+# Start the bridge
+./target/release/alma-onebot-bridge
+
+# Or with debug logging
+RUST_LOG=debug ./target/release/alma-onebot-bridge
+```
+
+Startup order: Alma → Bridge → OneBot client.
+
+## Configuration Reference
+
+| Variable | TOML Key | Default | Description |
+|----------|----------|---------|-------------|
+| `BRIDGE_PORT` | `bridge.port` | `8090` | Listen port |
+| `ALMA_API` | `alma.api` | `http://localhost:23001` | Alma API base URL |
+| `ALMA_MODEL` | `alma.model` | *(Alma settings)* | Override AI model |
+| `ALMA_TIMEOUT` | `alma.timeout` | `120` | Generation timeout (seconds) |
+| `ALMA_MAX_RETRIES` | `alma.max_retries` | `2` | Retry attempts for failed generations |
+| `ALMA_RETRY_DELAY` | `alma.retry_delay_ms` | `3000` | Base retry delay (ms, exponential backoff) |
+| `DB_PATH` | `database.path` | `bridge-state.db` | Database file path |
+| `PEOPLE_DIR` | `people.dir` | `~/.config/alma/people` | People profiles directory |
+| `ONEBOT_API_TIMEOUT` | `onebot.api_timeout` | `30` | OneBot API timeout (seconds) |
+| `ACCESS_TOKEN` | `onebot.access_token` | *(none)* | Bearer token for WS auth |
+| `GROUP_HISTORY_SIZE` | `chat.group_history_size` | `30` | Group history context size (0 = disabled) |
+| `THINKING_MESSAGE` | `chat.thinking_message` | *(none)* | Pre-generation indicator message |
+| `RUST_LOG` | — | `info` | Log level (env-filter syntax) |
+
+## How It Works
+
+### Message Flow (QQ → Alma → QQ)
+
+1. QQ user sends a message (or @mentions the bot in a group)
+2. OneBot client pushes the event to the bridge via reverse WebSocket
+3. Bridge extracts text, face emojis, and media info; records to group history
+4. Bridge handles reply/quoting context and forwarded message extraction
+5. Bridge ensures a People Profile exists for the user
+6. Bridge finds or creates an Alma thread (keyed by `private:{user_id}` or `group:{group_id}`)
+7. Bridge sends `generate_response` via Alma WebSocket with sender identity and ephemeral context
+8. Alma processes with full pipeline (SOUL + Memory + People Profiles)
+9. Bridge collects the response and sends it back to QQ (with reply reference and @mention for groups)
+
+### Bidirectional Sync (Alma GUI → QQ)
+
+Messages typed in the Alma GUI for a tracked thread are forwarded to QQ. A dedup mechanism (first 100 characters) prevents echo loops when the bridge itself generates replies.
+
+### Sender Identity
+
+Messages are formatted to match Alma's channel bridge protocol (Telegram-style):
+
+- Group: `[From: Alice | id:12345678]\n\n[msg:12345] 消息内容`
+- Private: `[From: Bob | id:12345678]\n\n[msg:67890] 消息内容`
+- With quote: `[From: Alice | id:12345678]\n\n[msg:12346] [Replying to Bob's message: "之前的话"]\n这是回复`
+
+The `[msg:N]` tag uses the real OneBot message ID. Face emojis are converted to text (e.g., `[emoji:斜眼笑]`), and images/voice/video are described with labels. The QQ ID is included as a stable identifier since nicknames change frequently.
+
+## WebSocket Paths
+
+The bridge accepts OneBot connections at:
+
+- `/` — generic
+- `/ws` — NapCat / snowluma default
+- `/onebot/v11/ws` — Lagrange default
+
+## Development
+
+```bash
+# Debug build
+cargo build
+
+# Run with full debug logging
+RUST_LOG=debug cargo run
+
+# Release build
+cargo build --release
+```
+
+See [DEVELOPMENT_KNOWLEDGE_BASE.md](./DEVELOPMENT_KNOWLEDGE_BASE.md) for detailed technical documentation including Alma WebSocket protocol findings, event sequences, and common pitfalls.
+
+## License
+
+[AGPL-3.0](./LICENSE) — GNU Affero General Public License v3.0
