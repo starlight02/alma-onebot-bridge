@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::onebot::event::Sender;
 use crate::onebot::{PendingCalls, call_api};
@@ -8,24 +9,71 @@ use crate::state::SharedState;
 use tokio::sync::mpsc;
 use warp::ws::Message;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GroupCardInfo {
+    card: String,
+}
+
 /// Ensure a People Profile exists for the given QQ user.
 /// If the profile doesn't exist, fetch user info from OneBot and create it.
+/// If it already exists and we have group context, update the group card (群名片).
+///
+/// `group_id` — Some(group_id) when the message came from a group chat.
 pub async fn ensure_people_profile(
     user_id: i64,
     sender: Option<&Sender>,
+    group_id: Option<i64>,
     state: &SharedState,
     ws_tx: &mpsc::UnboundedSender<Message>,
     pending: &PendingCalls,
 ) {
     let user_id_str = user_id.to_string();
 
-    if state.has_profile(&user_id_str).await {
+    // Extract group card (群名片) — only present in group chat context
+    let card = sender
+        .and_then(|s| s.card.as_deref())
+        .filter(|c| !c.is_empty());
+    let group_id_str = group_id.map(|g| g.to_string());
+
+    let profile_path = state.config.people_dir.join(format!("{}.md", user_id));
+    let preferred_name = sender
+        .and_then(|s| s.nickname.as_deref())
+        .filter(|n| !n.is_empty())
+        .or(card);
+
+    // ── Existing profile on disk: update group card if applicable ──────
+    if profile_path.exists() {
+        if let Err(e) = sync_profile_file(
+            &profile_path,
+            user_id,
+            preferred_name,
+            group_id_str.as_deref(),
+            card,
+        ) {
+            warn!(
+                "[People] Failed to sync people profile for user {}: {}",
+                user_id, e
+            );
+        } else {
+            state.set_profile(user_id_str.clone(), user_id_str).await;
+        }
         return;
     }
 
-    // Try to get detailed user info from OneBot
+    // Cached DB mapping can be stale after manual cleanup or migration.
+    if state.has_profile(&user_id_str).await {
+        warn!(
+            "[People] Profile cache exists for user {}, but file is missing; recreating",
+            user_id
+        );
+    }
+
+    // ── New profile: create with all available info ────────────────────
+    // Priority: sender.nickname > sender.card > get_stranger_info > "QQ用户{id}"
     let mut nickname = sender
         .and_then(|s| s.nickname.clone())
+        .filter(|n| !n.is_empty())
+        .or_else(|| card.map(|c| c.to_string()))
         .unwrap_or_else(|| format!("QQ用户{}", user_id));
 
     match call_api(
@@ -40,7 +88,9 @@ pub async fn ensure_people_profile(
         Ok(resp) => {
             if let Some(data) = resp.data {
                 if let Some(n) = data.get("nickname").and_then(|n| n.as_str()) {
-                    nickname = n.to_string();
+                    if !n.is_empty() {
+                        nickname = n.to_string();
+                    }
                 }
             }
         }
@@ -49,39 +99,299 @@ pub async fn ensure_people_profile(
         }
     }
 
-    // Use QQ ID as filename to avoid collisions when different users
-    // share the same nickname across groups.
-    let profile_path = state.config.people_dir.join(format!("{}.md", user_id));
+    // Initialize group_cards with current group (if any)
+    let mut group_cards: HashMap<String, GroupCardInfo> = HashMap::new();
+    if let (Some(card), Some(gid)) = (card, &group_id_str) {
+        group_cards.insert(
+            gid.clone(),
+            GroupCardInfo {
+                card: card.to_string(),
+            },
+        );
+    }
 
-    if !profile_path.exists() {
-        if let Err(e) = create_profile_file(&profile_path, user_id, &nickname) {
-            tracing::error!("Failed to create people profile: {}", e);
-            return;
-        }
+    if let Err(e) = create_profile_file(&profile_path, user_id, &nickname, &group_cards) {
+        tracing::error!("Failed to create people profile: {}", e);
+        return;
     }
 
     state.set_profile(user_id_str.clone(), user_id_str).await;
-    info!("People profile ensured: {} → {}.md", nickname, user_id);
+    info!(
+        "People profile created: {} → {}.md (group_cards: {})",
+        nickname,
+        user_id,
+        group_cards.len()
+    );
 }
 
-fn create_profile_file(path: &PathBuf, user_id: i64, nickname: &str) -> Result<(), std::io::Error> {
+fn create_profile_file(
+    path: &PathBuf,
+    user_id: i64,
+    nickname: &str,
+    group_cards: &HashMap<String, GroupCardInfo>,
+) -> Result<(), std::io::Error> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     let today = today_string();
-    let content = format!(
-        "---\ntelegram_id: \"{user_id}\"\nqq_id: \"{user_id}\"\nusername: \"{nickname}\"\n---\n\
-         # {nickname}\n\n\
-         - QQ 用户，ID: {user_id}\n\
-         - 昵称: {nickname}\n\
-         - 首次互动: {today}\n",
-    );
+    let frontmatter = vec![
+        format!("telegram_id: \"{}\"", user_id),
+        format!("qq_id: \"{}\"", user_id),
+        format!("username: \"{}\"", escape_frontmatter_value(nickname)),
+    ];
+    let body = build_default_body(nickname, &user_id.to_string(), &today, group_cards);
+    let content = render_profile_content(&frontmatter, &body);
 
     std::fs::write(path, content)?;
     info!("Created people profile: {:?}", path);
     Ok(())
+}
+
+/// Sync an existing profile file with bridge-managed metadata.
+///
+/// This keeps Alma-compatible frontmatter, preserves the user's freeform notes,
+/// and stores per-group cards in a structured markdown section so the LLM can
+/// distinguish the same person across different QQ groups.
+fn sync_profile_file(
+    path: &PathBuf,
+    user_id: i64,
+    preferred_name: Option<&str>,
+    group_id: Option<&str>,
+    card: Option<&str>,
+) -> Result<(), std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    let (mut frontmatter, body) = split_frontmatter(&content);
+
+    let qq_id = extract_frontmatter_field_from_lines(&frontmatter, "qq_id")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| user_id.to_string());
+    let username = extract_frontmatter_field_from_lines(&frontmatter, "username")
+        .filter(|v| !v.is_empty())
+        .or_else(|| preferred_name.map(|s| s.to_string()))
+        .unwrap_or_else(|| format!("QQ用户{}", qq_id));
+
+    upsert_frontmatter_field(&mut frontmatter, "telegram_id", &qq_id);
+    upsert_frontmatter_field(&mut frontmatter, "qq_id", &qq_id);
+    upsert_frontmatter_field(&mut frontmatter, "username", &username);
+
+    let mut group_cards = extract_group_cards_from_body(&body);
+    if let (Some(gid), Some(group_card)) = (group_id, card.filter(|c| !c.is_empty())) {
+        upsert_group_card(&mut group_cards, gid, group_card);
+    }
+
+    let mut cleaned_body = strip_group_cards_section(&body).trim().to_string();
+    if cleaned_body.is_empty() {
+        let first_interaction =
+            extract_body_line(&content, "首次互动:").unwrap_or_else(today_string);
+        cleaned_body = build_default_body(&username, &qq_id, &first_interaction, &group_cards);
+    } else if !group_cards.is_empty() {
+        cleaned_body.push_str("\n\n");
+        cleaned_body.push_str(&format_group_cards_section(&group_cards));
+    }
+
+    let new_content = render_profile_content(&frontmatter, &cleaned_body);
+    if new_content == content {
+        return Ok(());
+    }
+
+    std::fs::write(path, new_content)?;
+    info!(
+        "[People] Synced people profile for user {} (group cards: {})",
+        qq_id,
+        group_cards.len()
+    );
+    Ok(())
+}
+
+fn extract_group_cards_from_body(body: &str) -> HashMap<String, GroupCardInfo> {
+    let mut cards = HashMap::new();
+    let lines: Vec<&str> = body.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        if line == "- 群名片:" {
+            i += 1;
+            while i < lines.len() {
+                let nested_raw = lines[i];
+                let nested = nested_raw.trim();
+                if nested.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                if nested_raw.starts_with("  - ") {
+                    if let Some((gid, card)) = parse_group_card_entry(nested) {
+                        cards.insert(gid, GroupCardInfo { card });
+                    }
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    cards
+}
+
+fn parse_group_card_entry(entry: &str) -> Option<(String, String)> {
+    let entry = entry.trim().strip_prefix("- ").unwrap_or(entry.trim());
+    let (gid, card) = entry.split_once(':')?;
+    let gid = gid.trim();
+    let card = card.trim();
+    if gid.is_empty() || card.is_empty() {
+        return None;
+    }
+    Some((gid.to_string(), card.to_string()))
+}
+
+fn upsert_group_card(group_cards: &mut HashMap<String, GroupCardInfo>, group_id: &str, card: &str) {
+    let entry = group_cards
+        .entry(group_id.to_string())
+        .or_insert_with(|| GroupCardInfo {
+            card: card.to_string(),
+        });
+    entry.card = card.to_string();
+}
+
+/// Extract a single quoted field value from frontmatter lines, e.g.
+/// `qq_id: "123456"` → `Some("123456")`.
+fn extract_frontmatter_field_from_lines(lines: &[String], field: &str) -> Option<String> {
+    let prefix = format!("{}:", field);
+    let line = lines.iter().find(|l| l.starts_with(&prefix))?;
+    let val = line.trim_start_matches(&prefix).trim().trim_matches('"');
+    Some(val.to_string())
+}
+
+fn upsert_frontmatter_field(lines: &mut Vec<String>, field: &str, value: &str) {
+    let prefix = format!("{}:", field);
+    let rendered = format!("{}: \"{}\"", field, escape_frontmatter_value(value));
+    if let Some(line) = lines.iter_mut().find(|line| line.starts_with(&prefix)) {
+        *line = rendered;
+    } else {
+        lines.push(rendered);
+    }
+}
+
+/// Extract a value from a body bullet line like `- 首次互动: 2026-06-20`.
+fn extract_body_line(content: &str, label: &str) -> Option<String> {
+    let line = content.lines().find(|l| l.contains(label))?;
+    line.split(label).nth(1).map(|s| s.trim().to_string())
+}
+
+fn build_default_body(
+    nickname: &str,
+    qq_id: &str,
+    first_interaction: &str,
+    group_cards: &HashMap<String, GroupCardInfo>,
+) -> String {
+    let mut lines = vec![
+        format!("# {}", nickname),
+        String::new(),
+        format!("- QQ 用户，ID: {}", qq_id),
+        format!("- 昵称: {}", nickname),
+        format!("- 首次互动: {}", first_interaction),
+    ];
+    if !group_cards.is_empty() {
+        lines.push(String::new());
+        lines.push(format_group_cards_section(group_cards));
+    }
+    lines.join("\n")
+}
+
+fn format_group_cards_section(group_cards: &HashMap<String, GroupCardInfo>) -> String {
+    if group_cards.is_empty() {
+        return String::new();
+    }
+    let mut entries: Vec<_> = group_cards.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut lines = vec!["- 群名片:".to_string()];
+    for (gid, info) in entries {
+        lines.push(format!("  - {}: {}", gid, info.card));
+    }
+    lines.join("\n")
+}
+
+fn strip_group_cards_section(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut kept = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        if trimmed == "- 群名片:" {
+            i += 1;
+            while i < lines.len() {
+                let nested_raw = lines[i];
+                let nested = nested_raw.trim();
+                if nested_raw.starts_with("  - ") || nested.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+
+        kept.push(line);
+        i += 1;
+    }
+
+    kept.join("\n").trim().to_string()
+}
+
+fn split_frontmatter(content: &str) -> (Vec<String>, String) {
+    if !content.starts_with("---\n") {
+        return (Vec::new(), content.to_string());
+    }
+
+    let mut frontmatter = Vec::new();
+    let mut body_lines = Vec::new();
+    let mut in_frontmatter = true;
+
+    for (idx, line) in content.lines().enumerate() {
+        if idx == 0 {
+            continue;
+        }
+        if in_frontmatter && line == "---" {
+            in_frontmatter = false;
+            continue;
+        }
+        if in_frontmatter {
+            frontmatter.push(line.to_string());
+        } else {
+            body_lines.push(line);
+        }
+    }
+
+    (frontmatter, body_lines.join("\n"))
+}
+
+fn render_profile_content(frontmatter: &[String], body: &str) -> String {
+    let mut content = String::from("---\n");
+    if !frontmatter.is_empty() {
+        content.push_str(&frontmatter.join("\n"));
+        content.push('\n');
+    }
+    content.push_str("---\n");
+    let trimmed_body = body.trim();
+    if !trimmed_body.is_empty() {
+        content.push_str(trimmed_body);
+        content.push('\n');
+    }
+    content
+}
+
+fn escape_frontmatter_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Get today's date as YYYY-MM-DD string (UTC+8).
@@ -159,4 +469,131 @@ pub fn count_profiles(people_dir: &std::path::Path) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GroupCardInfo, build_default_body, create_profile_file, extract_group_cards_from_body,
+        format_group_cards_section, sync_profile_file,
+    };
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_profile_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("alma-onebot-bridge-{name}-{nonce}.md"))
+    }
+
+    #[test]
+    fn create_profile_file_writes_structured_group_cards_section() {
+        let path = temp_profile_path("create");
+        let mut group_cards = HashMap::new();
+        group_cards.insert(
+            "123".to_string(),
+            GroupCardInfo {
+                card: "群名片A".to_string(),
+            },
+        );
+
+        create_profile_file(&path, 42, "Alice", &group_cards).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert!(content.contains("telegram_id: \"42\""));
+        assert!(content.contains("qq_id: \"42\""));
+        assert!(!content.contains("group_cards:"));
+        assert!(content.contains("- 群名片:\n  - 123: 群名片A"));
+    }
+
+    #[test]
+    fn sync_profile_file_updates_structured_group_cards_section() {
+        let path = temp_profile_path("sync");
+        let existing = r#"---
+telegram_id: "42"
+qq_id: "42"
+username: "Alice"
+---
+# Alice
+
+- QQ 用户，ID: 42
+- 昵称: Alice
+- 首次互动: 2026-06-20
+- 备注: 已有内容
+- 群名片:
+  - 100: 一群名片
+"#;
+        fs::write(&path, existing).unwrap();
+
+        sync_profile_file(&path, 42, Some("Alice"), Some("200"), Some("二群名片")).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert!(content.contains("- 备注: 已有内容"));
+        assert!(content.contains("- 群名片:\n  - 100: 一群名片\n  - 200: 二群名片"));
+    }
+
+    #[test]
+    fn extract_group_cards_from_body_reads_structured_section() {
+        let body = r#"# Alice
+
+- QQ 用户，ID: 42
+- 群名片:
+  - 100: 旧名片
+  - 200: 新名片
+"#;
+
+        let cards = extract_group_cards_from_body(body);
+        assert_eq!(
+            cards.get("100").map(|info| info.card.as_str()),
+            Some("旧名片")
+        );
+        assert_eq!(
+            cards.get("200").map(|info| info.card.as_str()),
+            Some("新名片")
+        );
+    }
+
+    #[test]
+    fn format_group_cards_section_is_structured_and_stable() {
+        let mut group_cards = HashMap::new();
+        group_cards.insert(
+            "200".to_string(),
+            GroupCardInfo {
+                card: "B".to_string(),
+            },
+        );
+        group_cards.insert(
+            "100".to_string(),
+            GroupCardInfo {
+                card: "A".to_string(),
+            },
+        );
+
+        assert_eq!(
+            format_group_cards_section(&group_cards),
+            "- 群名片:\n  - 100: A\n  - 200: B"
+        );
+    }
+
+    #[test]
+    fn build_default_body_appends_group_cards_section() {
+        let mut group_cards = HashMap::new();
+        group_cards.insert(
+            "100".to_string(),
+            GroupCardInfo {
+                card: "A".to_string(),
+            },
+        );
+
+        let body = build_default_body("Alice", "42", "2026-06-20", &group_cards);
+        assert!(body.contains("# Alice"));
+        assert!(body.contains("- 首次互动: 2026-06-20"));
+        assert!(body.contains("- 群名片:\n  - 100: A"));
+    }
 }

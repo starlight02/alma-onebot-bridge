@@ -1,4 +1,5 @@
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
+use std::panic::AssertUnwindSafe;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -54,14 +55,38 @@ pub async fn handle_ws_connection(
         loop {
             match alma_event_rx.recv().await {
                 Ok(event) => {
-                    if let Err(e) =
-                        handle_alma_event(&event, &fwd_state, &fwd_tx, &fwd_pending).await
-                    {
-                        warn!("Alma event forwarding error: {}", e);
+                    // Wrap in catch_unwind so a single panic doesn't kill
+                    // the entire Alma→QQ forwarding channel (e.g. from
+                    // UTF-8 boundary issues in dedup logic on CJK text).
+                    let result = AssertUnwindSafe(handle_alma_event(
+                        &event,
+                        &fwd_state,
+                        &fwd_tx,
+                        &fwd_pending,
+                    ))
+                    .catch_unwind()
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!("[Alma→QQ] Forwarding error: {}", e);
+                        }
+                        Err(panic_info) => {
+                            let msg = panic_info
+                                .downcast_ref::<String>()
+                                .map(|s| s.as_str())
+                                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                                .unwrap_or("(non-string panic)");
+                            error!(
+                                "[Alma→QQ] handle_alma_event panicked (thread={}): {}. \
+                                 Forwarding task survives — next event will retry.",
+                                event.thread_id, msg
+                            );
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("Alma event receiver lagged {} events", n);
+                    warn!("[Alma→QQ] Event receiver lagged {} events", n);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

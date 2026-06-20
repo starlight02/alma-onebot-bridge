@@ -154,8 +154,8 @@ pub fn face_name(id: &str) -> Option<&'static str> {
 /// Reverse lookup: find a QQ face expression ID by its human-readable name.
 /// Returns `None` for unknown names.
 pub fn face_id(name: &str) -> Option<&'static str> {
-    use std::sync::OnceLock;
     use std::collections::HashMap;
+    use std::sync::OnceLock;
 
     static REVERSE: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
 

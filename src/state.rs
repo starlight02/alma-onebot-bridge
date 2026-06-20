@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use libsql::Builder;
 use reqwest::Client;
@@ -24,6 +25,12 @@ pub struct GroupMessage {
     pub timestamp: u64,
 }
 
+#[derive(Clone, Debug)]
+struct SentReply {
+    text: String,
+    sent_at: Instant,
+}
+
 /// Application-wide shared state.
 pub struct AppState {
     pub http_client: Client,
@@ -34,9 +41,11 @@ pub struct AppState {
     /// Reverse lookup: Alma thread_id → QQ session key (for bidirectional forwarding)
     pub session_reverse: RwLock<HashMap<String, String>>,
     /// Recent outgoing reply texts per thread (for dedup in bidirectional mode)
-    pub sent_replies: RwLock<HashMap<String, VecDeque<String>>>,
+    sent_replies: RwLock<HashMap<String, VecDeque<SentReply>>>,
     /// In-memory group chat history per session key (for ephemeral context injection)
     pub group_history: RwLock<HashMap<String, VecDeque<GroupMessage>>>,
+    /// Cached QQ group titles keyed by numeric group_id.
+    pub group_titles: RwLock<HashMap<i64, String>>,
     /// Broadcast channel: Alma GUI events → OneBot handler (for bidirectional forwarding)
     pub alma_event_tx: tokio::sync::broadcast::Sender<AlmaEvent>,
 }
@@ -101,6 +110,7 @@ impl SharedState {
             session_reverse: RwLock::new(HashMap::new()),
             sent_replies: RwLock::new(HashMap::new()),
             group_history: RwLock::new(HashMap::new()),
+            group_titles: RwLock::new(HashMap::new()),
             alma_event_tx,
         })))
     }
@@ -323,21 +333,34 @@ impl SharedState {
         let deque = map
             .entry(thread_id.to_string())
             .or_insert_with(VecDeque::new);
-        deque.push_back(text.to_string());
+        deque.push_back(SentReply {
+            text: text.to_string(),
+            sent_at: Instant::now(),
+        });
         while deque.len() > 20 {
             deque.pop_front();
         }
     }
 
     /// Check if a text was recently sent as a reply (for dedup).
+    /// Short identical replies are deduped within a narrow time window to avoid
+    /// double-sending the same Alma reply via both the direct send path and the
+    /// later `message_updated` event. Longer replies also allow prefix matching
+    /// to cover chunking differences.
     pub async fn was_sent_recently(&self, thread_id: &str, text: &str) -> bool {
-        let map = self.sent_replies.read().await;
-        if let Some(deque) = map.get(thread_id) {
-            let prefix = &text[..text.len().min(100)];
-            return deque.iter().any(|sent| {
-                let sent_prefix = &sent[..sent.len().min(100)];
-                sent.starts_with(prefix) || prefix.starts_with(sent_prefix)
-            });
+        let mut map = self.sent_replies.write().await;
+        if let Some(deque) = map.get_mut(thread_id) {
+            while let Some(front) = deque.front() {
+                if front.sent_at.elapsed() > Duration::from_secs(15) {
+                    deque.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            return deque
+                .iter()
+                .any(|sent| sent_reply_matches(&sent.text, text));
         }
         false
     }
@@ -369,5 +392,69 @@ impl SharedState {
         map.get(session_key)
             .map(|deque| deque.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub async fn set_group_title(&self, group_id: i64, title: String) {
+        self.group_titles.write().await.insert(group_id, title);
+    }
+
+    pub async fn get_group_title(&self, group_id: i64) -> Option<String> {
+        self.group_titles.read().await.get(&group_id).cloned()
+    }
+}
+
+/// Safely truncate a string prefix by bytes without panicking on UTF-8 boundaries.
+/// Walks backwards from `max_bytes` to the nearest char boundary.
+fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn sent_reply_matches(sent: &str, candidate: &str) -> bool {
+    if sent == candidate {
+        return true;
+    }
+
+    let sent_prefix = safe_prefix(sent, 100);
+    let candidate_prefix = safe_prefix(candidate, 100);
+    let min_match_len: usize = 30;
+
+    sent_prefix == candidate_prefix
+        && sent_prefix.len() >= min_match_len
+        && candidate_prefix.len() >= min_match_len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{safe_prefix, sent_reply_matches};
+
+    #[test]
+    fn safe_prefix_keeps_utf8_boundaries() {
+        let prefix = safe_prefix("你好世界你好世界", 7);
+        assert!(!prefix.contains('\u{fffd}'));
+        assert!(prefix.len() <= 7);
+    }
+
+    #[test]
+    fn sent_reply_matches_short_exact_cjk_reply() {
+        assert!(sent_reply_matches("萌依收到电报", "萌依收到电报"));
+    }
+
+    #[test]
+    fn sent_reply_matches_rejects_short_partial_match() {
+        assert!(!sent_reply_matches("萌依收到电报", "萌依收到"));
+    }
+
+    #[test]
+    fn sent_reply_matches_long_prefix_equivalent_chunks() {
+        let text = "这是一个足够长的回复，用来验证前缀匹配在长文本场景下仍然有效，而且不会被 UTF-8 截断搞坏。";
+        let prefix_equivalent = "这是一个足够长的回复，用来验证前缀匹配在长文本场景下仍然有效，而且不会被 UTF-8 截断搞坏。后续补充";
+        assert!(sent_reply_matches(text, prefix_equivalent));
     }
 }

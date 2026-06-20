@@ -30,6 +30,7 @@ pub struct AlmaEvent {
     pub thread_id: String,
     pub message_role: String, // "user" or "assistant"
     pub message_text: String,
+    pub thinking_text: Option<String>,
     #[allow(dead_code)]
     pub message_id: String,
 }
@@ -395,8 +396,14 @@ async fn dispatch_event(
                 let mut map = pending.lock().await;
                 if let Some(pg) = map.remove(thread_id) {
                     had_pending_generation = true;
-                    let (clean_text, thinking) = extract_think_blocks(&pg.text);
+                    let normalized = normalize_assistant_text(&pg.text);
+                    let visible_text =
+                        strip_tag_blocks(&normalized, "<system-reminder>", "</system-reminder>");
+                    let (clean_text, thinking) = extract_think_blocks(&visible_text);
                     let trimmed = clean_text.trim().to_string();
+                    let thinking = thinking
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty());
                     let user_msg_id = pg.user_message_id.clone();
 
                     if trimmed.is_empty() {
@@ -409,7 +416,10 @@ async fn dispatch_event(
                             thread_id,
                             trimmed.len(),
                             user_msg_id,
-                            thinking.as_ref().map(|t| format!("{} chars", t.len())).unwrap_or("none".into())
+                            thinking
+                                .as_ref()
+                                .map(|t| format!("{} chars", t.len()))
+                                .unwrap_or("none".into())
                         );
                         let _ = pg.result_tx.send(Ok((trimmed, user_msg_id, thinking)));
                     }
@@ -499,17 +509,28 @@ async fn dispatch_event(
                 .to_string();
 
             // Extract text from message parts (only type:"text", skip reasoning/step-start)
-            let text = extract_text_from_parts(msg_data);
+            let normalized_text = normalize_assistant_text(&extract_text_from_parts(msg_data));
+            let visible_text =
+                strip_tag_blocks(&normalized_text, "<system-reminder>", "</system-reminder>");
+            let (clean_text, thinking_text) = extract_think_blocks(&visible_text);
+            let text = clean_text.trim().to_string();
+            let thinking_text = thinking_text
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
 
             debug!(
-                "[AlmaWS] message_updated: thread={}, role={}, id={}, text_len={}",
+                "[AlmaWS] message_updated: thread={}, role={}, id={}, text_len={}, thinking={}",
                 thread_id,
                 role,
                 message_id,
-                text.len()
+                text.len(),
+                thinking_text
+                    .as_ref()
+                    .map(|t| format!("{} chars", t.len()))
+                    .unwrap_or_else(|| "none".to_string())
             );
 
-            if !text.is_empty() {
+            if !text.is_empty() || thinking_text.is_some() {
                 // Skip forwarding during active generation — the bridge pipeline
                 // sends replies directly to QQ. We only forward the final
                 // message_updated that fires AFTER generation completes
@@ -519,6 +540,7 @@ async fn dispatch_event(
                     thread_id: thread_id.clone(),
                     message_role: role.clone(),
                     message_text: text,
+                    thinking_text,
                     message_id,
                 };
 
@@ -635,7 +657,7 @@ fn extract_text_from_parts(msg_data: &Value) -> String {
 /// Strip `<think>...</think>` and `<thinking>...</thinking>` blocks from text.
 /// Returns `(clean_text, thinking_content)`.
 /// If multiple think blocks exist, their contents are joined with newlines.
-fn extract_think_blocks(text: &str) -> (String, Option<String>) {
+pub(crate) fn extract_think_blocks(text: &str) -> (String, Option<String>) {
     const THINK_OPEN: &str = "<th\x69nk>";
     const THINK_CLOSE: &str = "</th\x69nk>";
     const THINKING_OPEN: &str = "<th\x69nking>";
@@ -663,6 +685,10 @@ fn extract_think_blocks(text: &str) -> (String, Option<String>) {
             } else {
                 // Unclosed tag — treat rest as thinking
                 current_think.push_str(remaining);
+                let trimmed = current_think.trim().to_string();
+                if !trimmed.is_empty() {
+                    thinking_parts.push(trimmed);
+                }
                 break;
             }
         } else {
@@ -700,4 +726,82 @@ fn extract_think_blocks(text: &str) -> (String, Option<String>) {
     };
 
     (clean, thinking)
+}
+
+pub(crate) fn normalize_assistant_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n")
+}
+
+fn strip_tag_blocks(text: &str, start_tag: &str, end_tag: &str) -> String {
+    let mut out = String::new();
+    let mut remaining = text;
+
+    loop {
+        if let Some(start) = remaining.find(start_tag) {
+            out.push_str(&remaining[..start]);
+            let after_start = &remaining[start + start_tag.len()..];
+            if let Some(end) = after_start.find(end_tag) {
+                remaining = &after_start[end + end_tag.len()..];
+            } else {
+                break;
+            }
+        } else {
+            out.push_str(remaining);
+            break;
+        }
+    }
+
+    out
+}
+
+pub(crate) fn sanitize_visible_assistant_text(text: &str) -> String {
+    let normalized = normalize_assistant_text(text);
+    let without_system_reminders =
+        strip_tag_blocks(&normalized, "<system-reminder>", "</system-reminder>");
+    let (clean, _) = extract_think_blocks(&without_system_reminders);
+    clean.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_think_blocks, normalize_assistant_text, sanitize_visible_assistant_text};
+
+    #[test]
+    fn normalizes_html_breaks_and_separates_thinking() {
+        let normalized =
+            normalize_assistant_text("<think>step 1<br>step 2</think><br>hello<br/>world");
+        let (clean, thinking) = extract_think_blocks(&normalized);
+
+        assert_eq!(clean.trim(), "hello\nworld");
+        assert_eq!(thinking.as_deref(), Some("step 1\nstep 2"));
+    }
+
+    #[test]
+    fn strips_unclosed_think_block_from_visible_text() {
+        let normalized = normalize_assistant_text("visible<think>hidden");
+        let (clean, thinking) = extract_think_blocks(&normalized);
+
+        assert_eq!(clean, "visible");
+        assert_eq!(thinking.as_deref(), Some("hidden"));
+    }
+
+    #[test]
+    fn strips_system_reminder_block_from_visible_text() {
+        let text = "正常内容\n<system-reminder>\n内部提醒\n</system-reminder>\n更多内容";
+        let clean = sanitize_visible_assistant_text(text);
+
+        assert_eq!(clean, "正常内容\n\n更多内容");
+    }
+
+    #[test]
+    fn strips_system_reminder_and_think_together() {
+        let text = "<think>hidden</think>hello<system-reminder>internal</system-reminder>world";
+        let clean = sanitize_visible_assistant_text(text);
+
+        assert_eq!(clean, "helloworld");
+    }
 }

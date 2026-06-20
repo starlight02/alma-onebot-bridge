@@ -9,7 +9,7 @@ use crate::onebot::event::{
     extract_media_summary, extract_reply_id, extract_text, has_media_segments,
 };
 use crate::onebot::{
-    PendingCalls, get_forward_msg, get_msg, send_reply_message, send_text_message,
+    PendingCalls, get_forward_msg, get_group_name, get_msg, send_reply_message, send_text_message,
 };
 use crate::people::ensure_people_profile;
 use crate::state::SharedState;
@@ -84,6 +84,33 @@ pub async fn process_message_event(
         sender_nickname
     };
 
+    let group_title = if is_group {
+        if let Some(title) = state.get_group_title(group_id).await {
+            Some(title)
+        } else {
+            match get_group_name(
+                ws_tx,
+                pending,
+                group_id,
+                state.config.onebot_api_timeout_secs,
+            )
+            .await
+            {
+                Ok(Some(title)) => {
+                    state.set_group_title(group_id, title.clone()).await;
+                    Some(title)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    debug!("[GroupMeta] get_group_name failed for {}: {}", group_id, e);
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Record to group history (before @bot gate, so ALL messages are captured) ──
     if is_group && !text.is_empty() {
         let session_key = format!("group:{}", group_id);
@@ -103,11 +130,67 @@ pub async fn process_message_event(
         );
     }
 
-    // ── Group message: require @bot ──────────────────────────────────────
-    let cleaned_text = if is_group {
-        if !contains_at_bot(segments, bot_id) {
-            return Ok(());
+    // ── Message ID & Reply context ────────────────────────────────────────
+    // Use real OneBot message_id for [msg:N] (matches Telegram bridge pattern)
+    let message_id = event.message_id.unwrap_or(0);
+
+    // Handle reply/quoting: extract reply segment and fetch quoted message
+    let mut quoted_image_urls = Vec::new();
+    let mut is_reply_to_bot = false;
+    let reply_context = if let Some(reply_msg_id) = extract_reply_id(segments) {
+        match get_msg(
+            ws_tx,
+            pending,
+            &reply_msg_id,
+            state.config.onebot_api_timeout_secs,
+        )
+        .await
+        {
+            Ok(quoted) => {
+                is_reply_to_bot = quoted.sender_id == Some(bot_id);
+                quoted_image_urls = quoted.image_urls.clone();
+                let truncated = single_line_preview(&quoted.text, 200);
+                let reply_label = if is_reply_to_bot {
+                    "Alma".to_string()
+                } else {
+                    quoted.sender_name.clone()
+                };
+                info!(
+                    "[Reply] Quoting {}'s message: \"{}\"",
+                    reply_label, truncated
+                );
+                Some(if is_reply_to_bot {
+                    format!("[Replying to Alma's message: \"{}\"]", truncated)
+                } else {
+                    format!(
+                        "[Replying to {}'s message: \"{}\"]",
+                        quoted.sender_name, truncated
+                    )
+                })
+            }
+            Err(e) => {
+                tracing::debug!("get_msg failed for reply context: {}", e);
+                None
+            }
         }
+    } else {
+        None
+    };
+
+    // ── Group message: align trigger semantics with Telegram bridge ──────
+    let should_process = if is_group {
+        contains_at_bot(segments, bot_id)
+            || is_reply_to_bot
+            || text.to_lowercase().contains("alma")
+            || cleaned_command_for_group(&text)
+    } else {
+        true
+    };
+    if !should_process {
+        return Ok(());
+    }
+
+    let cleaned_text = if is_group {
         crate::onebot::event::clean_at_from_text(&text, bot_id)
     } else {
         text.clone()
@@ -119,44 +202,6 @@ pub async fn process_message_event(
         "私聊".to_string()
     };
     info!("[Message] {} {}: {}", source, display_name, cleaned_text);
-
-    // ── Message ID & Reply context ────────────────────────────────────────
-    // Use real OneBot message_id for [msg:N] (matches Telegram bridge pattern)
-    let message_id = event.message_id.unwrap_or(0);
-
-    // Handle reply/quoting: extract reply segment and fetch quoted message
-    let reply_context = if let Some(reply_msg_id) = extract_reply_id(segments) {
-        match get_msg(
-            ws_tx,
-            pending,
-            &reply_msg_id,
-            state.config.onebot_api_timeout_secs,
-        )
-        .await
-        {
-            Ok((sender_name, quoted_text)) => {
-                let truncated = if quoted_text.len() > 200 {
-                    format!("{}...", &quoted_text[..200])
-                } else {
-                    quoted_text
-                };
-                info!(
-                    "[Reply] Quoting {}'s message: \"{}\"",
-                    sender_name, truncated
-                );
-                Some(format!(
-                    "[Replying to {}'s message: \"{}\"]",
-                    sender_name, truncated
-                ))
-            }
-            Err(e) => {
-                tracing::debug!("get_msg failed for reply context: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     // ── Forwarded message content ─────────────────────────────────────────
     // If the message contains a forward segment, fetch the forwarded content
@@ -210,7 +255,17 @@ pub async fn process_message_event(
     };
 
     // ── Ensure People Profile ────────────────────────────────────────────
-    ensure_people_profile(user_id, event.sender.as_ref(), state, ws_tx, pending).await;
+    // Pass group_id so people.rs can record/update the group card (群名片).
+    let group_id_opt = if is_group { Some(group_id) } else { None };
+    ensure_people_profile(
+        user_id,
+        event.sender.as_ref(),
+        group_id_opt,
+        state,
+        ws_tx,
+        pending,
+    )
+    .await;
 
     // ── Session key & Alma thread ────────────────────────────────────────
     let session_key = if is_group {
@@ -290,22 +345,31 @@ pub async fn process_message_event(
     };
 
     // ── Telegram-style message format (for Alma channel protocol) ─────────
-    // Format: "[From: DisplayName | id:qq_id]\n\n[msg:N] message text"
-    // [msg:N] uses real OneBot message_id (matches Telegram bridge pattern)
-    // Forward context (if present) describes forwarded message content
-    // Reply context (if present) describes quoted message
-    // Media info (images, voice, video) appended as additional lines
-    let text_with_context = {
-        let mut parts = Vec::new();
-        if let Some(ref fwd) = forward_context {
-            parts.push(fwd.clone());
-        }
-        if let Some(ref ctx) = reply_context {
-            parts.push(ctx.clone());
-        }
-        parts.push(cleaned_text.clone());
-        parts.join("\n")
-    };
+    // Match Alma built-in Telegram behavior as closely as possible:
+    // - group text replying to Alma => [From: ... [msg:N]] ...
+    // - other text messages => [msg:N] ...
+    // - forward prefix is prepended inline
+    // - reply context is prepended inline
+    let text_with_context = build_telegram_like_message_text(
+        is_group,
+        is_reply_to_bot,
+        display_name,
+        event
+            .sender
+            .as_ref()
+            .and_then(|s| s.nickname.as_deref())
+            .filter(|n| !n.is_empty()),
+        event
+            .sender
+            .as_ref()
+            .and_then(|s| s.user_id)
+            .unwrap_or(user_id),
+        false,
+        message_id,
+        cleaned_text.trim(),
+        forward_context.as_deref(),
+        reply_context.as_deref(),
+    );
 
     // ── Download images and file attachments ───────────────────────────────
     let mut file_parts = Vec::new();
@@ -323,6 +387,25 @@ pub async fn process_message_event(
             }
             Err(e) => {
                 warn!("[Alma] Failed to download image {}: {}", url, e);
+            }
+        }
+    }
+
+    // Download quoted/replied images too, so Alma can see the referenced image
+    // instead of only a textual placeholder like "[Image]". This matches the
+    // built-in Telegram bridge behavior more closely.
+    for (idx, url) in quoted_image_urls.iter().enumerate() {
+        let default_filename = format!("quoted_image_{}.png", idx + 1);
+        match download_media_as_file_part(&state.http_client, url, &default_filename).await {
+            Ok(part) => {
+                info!(
+                    "[Alma] Successfully downloaded and prepared quoted image part: {}",
+                    url
+                );
+                file_parts.push(part);
+            }
+            Err(e) => {
+                warn!("[Alma] Failed to download quoted image {}: {}", url, e);
             }
         }
     }
@@ -363,10 +446,7 @@ pub async fn process_message_event(
         }
     };
 
-    let formatted_message = format!(
-        "[From: {} | id:{}]\n\n[msg:{}] {}{}",
-        display_name, user_id, message_id, text_with_context, media_suffix
-    );
+    let formatted_message = format!("{}{}", text_with_context, media_suffix);
 
     // ── Source: spoof as Telegram for Alma's server-side processing ────────
     // "telegram-group" gets group chat rules, privacy firewall, history stripping
@@ -379,6 +459,12 @@ pub async fn process_message_event(
 
     // ── Build ephemeralContext with SENDER PROFILE ─────────────────────────
     let mut ephemeral_ctx = String::new();
+    ephemeral_ctx.push_str(&build_telegram_like_channel_system_context(
+        is_group,
+        sender_nickname,
+        group_title.as_deref(),
+        if is_group { Some(group_id) } else { None },
+    ));
 
     // Scan people profiles for the sender's qq_id
     if let Some(profile_block) = crate::people::find_sender_profile(
@@ -511,14 +597,19 @@ pub async fn process_message_event(
         match result {
             Some(r) => (r, thinking_content),
             None => {
-                warn!(
-                    "[Alma] Generation failed: {}",
-                    last_err
-                );
+                warn!("[Alma] Generation failed: {}", last_err);
                 (ALMA_ERROR_REPLY.to_string(), None)
             }
         }
     };
+    let reply = crate::alma_ws::sanitize_visible_assistant_text(&reply);
+    let thinking = thinking
+        .map(|t| {
+            crate::alma_ws::normalize_assistant_text(&t)
+                .trim()
+                .to_string()
+        })
+        .filter(|t| !t.is_empty());
 
     // ── Send reply via OneBot ────────────────────────────────────────────
     if reply.is_empty() {
@@ -529,11 +620,19 @@ pub async fn process_message_event(
     let target_id = if is_group { group_id } else { user_id };
     let target_type = if is_group { "group" } else { "private" };
 
+    // Register the full normalized reply once so the later Alma
+    // `message_updated` event can be deduped even if QQ delivery was split
+    // into multiple chunks or paragraphs.
+    state.register_sent_reply(&thread_id, &reply).await;
+
     // ── Send thinking content as separate message (if enabled) ────────────
     if state.config.show_thinking {
         if let Some(ref think_text) = thinking {
             if !think_text.is_empty() {
-                info!("[Thinking] Sending thinking content ({} chars)", think_text.len());
+                info!(
+                    "[Thinking] Sending thinking content ({} chars)",
+                    think_text.len()
+                );
                 let think_chunks = split_text(think_text, QQ_MSG_LIMIT);
                 for chunk in &think_chunks {
                     match send_text_message(
@@ -650,8 +749,12 @@ pub async fn handle_alma_event(
     let target = match state.get_qq_target(&event.thread_id).await {
         Some(t) => t,
         None => {
-            tracing::debug!(
-                "[Alma→QQ] Thread {} not tracked (no QQ target in reverse map), skipping",
+            // Promoted to info: critical for diagnosing "Alma GUI reply not
+            // synced to QQ" — usually means session_reverse cache missed and
+            // DB lookup found no mapping (e.g. thread was never created via
+            // bridge, or DB was reset).
+            info!(
+                "[Alma→QQ] Thread {} has no QQ target mapping (not in session_reverse or DB), skipping",
                 event.thread_id
             );
             return Ok(());
@@ -663,17 +766,50 @@ pub async fn handle_alma_event(
         .was_sent_recently(&event.thread_id, &event.message_text)
         .await
     {
-        tracing::debug!(
-            "[Alma→QQ] Skipping duplicate reply in thread {} (text_len={})",
-            event.thread_id, event.message_text.len()
+        // Promoted to info: dedup hits are the second most common reason
+        // for "Alma GUI reply not synced" complaints.
+        info!(
+            "[Alma→QQ] Dedup hit for thread {} (prefix matches a sent reply, {} chars)",
+            event.thread_id,
+            event.message_text.len()
         );
         return Ok(());
     }
 
     info!(
         "[Alma→QQ] Forwarding assistant message to {} {} (thread={}, {} chars)",
-        target.target_type, target.target_id, event.thread_id, event.message_text.len()
+        target.target_type,
+        target.target_id,
+        event.thread_id,
+        event.message_text.len()
     );
+
+    if state.config.show_thinking {
+        if let Some(ref think_text) = event.thinking_text {
+            if !think_text.is_empty() {
+                let think_chunks = split_text(think_text, QQ_MSG_LIMIT);
+                for chunk in &think_chunks {
+                    match send_text_message(
+                        ws_tx,
+                        pending,
+                        &target.target_type,
+                        target.target_id,
+                        chunk,
+                        state.config.onebot_api_timeout_secs,
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!("[Alma→QQ] Failed to forward thinking: {}", e),
+                    }
+                }
+            }
+        }
+    }
+
+    if event.message_text.is_empty() {
+        return Ok(());
+    }
 
     // Forward the Alma GUI assistant message to QQ
     let chunks = split_text(&event.message_text, QQ_MSG_LIMIT);
@@ -751,6 +887,115 @@ fn split_text(text: &str, limit: usize) -> Vec<String> {
     chunks
 }
 
+fn single_line_preview(text: &str, limit: usize) -> String {
+    let compact = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    truncate_with_ellipsis(&compact, limit)
+}
+
+fn truncate_with_ellipsis(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+fn cleaned_command_for_group(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let cmd = trimmed.split_whitespace().next().unwrap_or("");
+    let cmd = cmd.trim_start_matches('/');
+    let cmd = cmd.split('@').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        cmd.as_str(),
+        "start" | "help" | "new" | "list" | "switch" | "status" | "settings"
+    )
+}
+
+fn build_telegram_like_message_text(
+    is_group: bool,
+    is_reply_to_bot: bool,
+    display_name: &str,
+    username: Option<&str>,
+    user_id: i64,
+    is_bot_sender: bool,
+    message_id: i64,
+    text: &str,
+    forward_context: Option<&str>,
+    reply_context: Option<&str>,
+) -> String {
+    let mut body = text.trim().to_string();
+    if let Some(prefix) = forward_context {
+        if !prefix.is_empty() {
+            body = if body.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{} {}", prefix, body)
+            };
+        }
+    }
+    if let Some(prefix) = reply_context {
+        if !prefix.is_empty() {
+            body = if body.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{} {}", prefix, body)
+            };
+        }
+    }
+
+    if is_group && is_reply_to_bot {
+        let username_part = username.map(|u| format!(" (@{})", u)).unwrap_or_default();
+        let bot_suffix = if is_bot_sender { " [BOT]" } else { "" };
+        format!(
+            "[From: {}{} [id:{}] [msg:{}]{}] {}",
+            display_name, username_part, user_id, message_id, bot_suffix, body
+        )
+    } else {
+        format!("[msg:{}] {}", message_id, body)
+    }
+}
+
+fn build_telegram_like_channel_system_context(
+    is_group: bool,
+    username: &str,
+    group_title: Option<&str>,
+    group_id: Option<i64>,
+) -> String {
+    let username = if username.trim().is_empty() {
+        "unknown"
+    } else {
+        username.trim()
+    };
+    let platform = std::env::consts::OS;
+
+    if is_group {
+        let title = group_title.unwrap_or("Unknown");
+        let chat_id = group_id.unwrap_or(0);
+        format!(
+            "[System: The user is chatting with you via Telegram (username: @{}) in a GROUP CHAT named \"{}\" (chatId: {}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]",
+            username, title, chat_id, platform
+        )
+    } else {
+        format!(
+            "[System: The user is chatting with you via Telegram (username: @{}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]",
+            username, platform
+        )
+    }
+}
+
 /// Download a media URL and encode it as a Base64 data URI in an Alma file part JSON object.
 async fn download_media_as_file_part(
     client: &reqwest::Client,
@@ -811,4 +1056,93 @@ async fn download_media_as_file_part(
         "url": format!("data:{};base64,{}", content_type, b64_data),
         "filename": filename
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_telegram_like_channel_system_context, build_telegram_like_message_text,
+        cleaned_command_for_group, single_line_preview,
+    };
+    use crate::alma_ws::normalize_assistant_text;
+
+    #[test]
+    fn single_line_preview_compacts_reply_context() {
+        assert_eq!(
+            single_line_preview("看看这个\n[Image]\n", 200),
+            "看看这个 [Image]"
+        );
+    }
+
+    #[test]
+    fn single_line_preview_truncates_on_char_boundary() {
+        let preview = single_line_preview("你好世界你好世界你好世界", 7);
+        assert!(preview.ends_with("..."));
+        assert!(!preview.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn normalized_short_reply_is_stable_for_dedup() {
+        let text = normalize_assistant_text("萌依收到电报");
+        assert_eq!(text.trim(), "萌依收到电报");
+    }
+
+    #[test]
+    fn group_reply_to_bot_uses_from_header_like_telegram() {
+        let text = build_telegram_like_message_text(
+            true,
+            true,
+            "群名片",
+            Some("alice"),
+            42,
+            false,
+            99,
+            "你好",
+            None,
+            Some("[Replying to Alma's message: \"前文\"]"),
+        );
+
+        assert_eq!(
+            text,
+            "[From: 群名片 (@alice) [id:42] [msg:99]] [Replying to Alma's message: \"前文\"] 你好"
+        );
+    }
+
+    #[test]
+    fn normal_group_message_uses_plain_msg_prefix_like_telegram() {
+        let text = build_telegram_like_message_text(
+            true,
+            false,
+            "Alice",
+            None,
+            42,
+            false,
+            100,
+            "你好",
+            Some("[Forwarded message]"),
+            None,
+        );
+
+        assert_eq!(text, "[msg:100] [Forwarded message] 你好");
+    }
+
+    #[test]
+    fn recognized_group_commands_match_telegram_trigger_set() {
+        assert!(cleaned_command_for_group("/start"));
+        assert!(cleaned_command_for_group("/help@alma_bot hi"));
+        assert!(cleaned_command_for_group("/settings"));
+        assert!(!cleaned_command_for_group("/unknown"));
+        assert!(!cleaned_command_for_group("hello"));
+    }
+
+    #[test]
+    fn group_system_context_matches_telegram_style_shape() {
+        let ctx =
+            build_telegram_like_channel_system_context(true, "alice", Some("测试群"), Some(123));
+
+        assert!(ctx.starts_with("[System: The user is chatting with you via Telegram"));
+        assert!(ctx.contains("username: @alice"));
+        assert!(ctx.contains("in a GROUP CHAT named \"测试群\" (chatId: 123)"));
+        assert!(ctx.ends_with("desktop AI agent can do.]"));
+    }
 }

@@ -97,6 +97,14 @@ pub struct ApiResponse {
 
 // ─── Helper functions ────────────────────────────────────────────────────────
 
+fn value_as_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// Extract plain text from a message segment array.
 pub fn extract_text(segments: &[MessageSegment]) -> String {
     segments
@@ -117,7 +125,7 @@ pub fn contains_at_bot(segments: &[MessageSegment], bot_id: i64) -> bool {
             && seg
                 .data
                 .get("qq")
-                .and_then(|q| q.as_str())
+                .and_then(value_as_string)
                 .map(|q| q == bot_id_str || q == "all")
                 .unwrap_or(false)
     })
@@ -142,10 +150,7 @@ pub fn clean_at_from_text(text: &str, bot_id: i64) -> String {
 pub fn extract_reply_id(segments: &[MessageSegment]) -> Option<String> {
     segments.first().and_then(|seg| {
         if seg.segment_type == "reply" {
-            seg.data
-                .get("id")
-                .and_then(|id| id.as_str())
-                .map(|s| s.to_string())
+            seg.data.get("id").and_then(value_as_string)
         } else {
             None
         }
@@ -159,12 +164,13 @@ pub fn convert_faces_to_text(segments: &[MessageSegment]) -> String {
         .iter()
         .filter(|seg| seg.segment_type == "face")
         .filter_map(|seg| {
-            seg.data.get("id").and_then(|id| id.as_str()).map(
-                |id| match crate::face_map::face_name(id) {
+            seg.data
+                .get("id")
+                .and_then(value_as_string)
+                .map(|id| match crate::face_map::face_name(&id) {
                     Some(name) => format!("[emoji:{}]", name),
                     None => format!("[emoji:face_{}]", id),
-                },
-            )
+                })
         })
         .collect();
 
@@ -240,10 +246,7 @@ pub fn has_media_segments(segments: &[MessageSegment]) -> bool {
 pub fn extract_forward_id(segments: &[MessageSegment]) -> Option<String> {
     segments.iter().find_map(|seg| {
         if seg.segment_type == "forward" {
-            seg.data
-                .get("id")
-                .and_then(|id| id.as_str())
-                .map(|s| s.to_string())
+            seg.data.get("id").and_then(value_as_string)
         } else {
             None
         }
@@ -298,9 +301,7 @@ pub fn text_to_segments(text: &str) -> Vec<MessageSegment> {
                 });
             } else {
                 // Unknown name — keep as-is
-                segments.push(MessageSegment::text(
-                    &remaining[start..start + end + 1],
-                ));
+                segments.push(MessageSegment::text(&remaining[start..start + end + 1]));
             }
 
             remaining = &remaining[start + end + 1..];
@@ -315,4 +316,52 @@ pub fn text_to_segments(text: &str) -> Vec<MessageSegment> {
     }
 
     segments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MessageSegment, contains_at_bot, convert_faces_to_text, extract_forward_id,
+        extract_reply_id,
+    };
+
+    #[test]
+    fn contains_at_bot_accepts_numeric_qq_field() {
+        let segments = vec![MessageSegment {
+            segment_type: "at".to_string(),
+            data: serde_json::json!({"qq": 123456}),
+        }];
+
+        assert!(contains_at_bot(&segments, 123456));
+    }
+
+    #[test]
+    fn extract_reply_id_accepts_numeric_id_field() {
+        let segments = vec![MessageSegment {
+            segment_type: "reply".to_string(),
+            data: serde_json::json!({"id": 67890}),
+        }];
+
+        assert_eq!(extract_reply_id(&segments).as_deref(), Some("67890"));
+    }
+
+    #[test]
+    fn extract_forward_id_accepts_numeric_id_field() {
+        let segments = vec![MessageSegment {
+            segment_type: "forward".to_string(),
+            data: serde_json::json!({"id": 13579}),
+        }];
+
+        assert_eq!(extract_forward_id(&segments).as_deref(), Some("13579"));
+    }
+
+    #[test]
+    fn convert_faces_to_text_accepts_numeric_face_id() {
+        let segments = vec![MessageSegment {
+            segment_type: "face".to_string(),
+            data: serde_json::json!({"id": 178}),
+        }];
+
+        assert_eq!(convert_faces_to_text(&segments), "[emoji:斜眼笑]");
+    }
 }
