@@ -19,11 +19,19 @@ A bridge service that connects [Alma](https://github.com/anthropics/alma) (local
 
 ## Architecture
 
-```
-QQ User ──► snowluma/NapCat ──WS──► Bridge (this service) ──WS──► Alma
-                     (OneBot v11)          │                        │
-                                           ├── REST: thread creation
-                                           └── WS:   generate_response
+```mermaid
+flowchart LR
+    qq["QQ User"]
+    onebot["snowluma / NapCat<br/>OneBot v11"]
+    bridge["Bridge<br/>alma-onebot-bridge"]
+    alma["Alma App<br/>WS: /ws/threads<br/>REST: thread operations / settings<br/>GUI: tracked thread"]
+
+    qq -->|"QQ message"| onebot
+    onebot -->|"Reverse WebSocket<br/>events + API replies"| bridge
+    bridge -->|"WS generate_response<br/>HTTP REST thread ops"| alma
+    alma -->|"message_updated<br/>GUI assistant message"| bridge
+    bridge -->|"OneBot send_msg"| onebot
+    onebot -->|"QQ delivery"| qq
 ```
 
 The bridge acts as a **WebSocket server** for the OneBot client and a **WebSocket client** for Alma's internal chat pipeline (`ws://localhost:23001/ws/threads`).

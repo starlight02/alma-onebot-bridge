@@ -19,12 +19,19 @@ Build a Rust service that bridges the Alma local AI assistant with QQ (or any On
 
 ## Architecture at a Glance
 
-```
-QQ User --> OneBot Client (snowluma/NapCat) --WS--> Bridge --WS--> Alma (ws://localhost:23001/ws/threads)
-                                                  |
-                                                  +--REST--> Alma REST API (thread creation, settings)
-                                                  |
-                                                  +--bidirectional--> Alma GUI <-> QQ forwarding
+```mermaid
+flowchart LR
+    qq["QQ User"]
+    onebot["OneBot Client<br/>snowluma / NapCat"]
+    bridge["Bridge<br/>alma-onebot-bridge"]
+    alma["Alma App<br/>WS: /ws/threads<br/>REST: thread operations / settings<br/>GUI: tracked thread"]
+
+    qq -->|"QQ message"| onebot
+    onebot -->|"Reverse WebSocket<br/>events + API replies"| bridge
+    bridge -->|"WS generate_response<br/>HTTP REST thread ops"| alma
+    alma -->|"message_updated<br/>GUI assistant message"| bridge
+    bridge -->|"OneBot send_msg"| onebot
+    onebot -->|"QQ delivery"| qq
 ```
 
 The bridge sits between two WebSocket connections: one from the OneBot client (reverse WS mode) and one to Alma's internal thread pipeline. It translates between the two protocols, correlates API calls via echo fields, and persists state across restarts.

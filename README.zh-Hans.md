@@ -19,11 +19,19 @@
 
 ## 架构
 
-```
-QQ 用户 ──► snowluma/NapCat ──WS──► 桥接服务 ──WS──► Alma
-                  (OneBot v11)          │               │
-                                        ├── REST: 创建线程
-                                        └── WS:   generate_response
+```mermaid
+flowchart LR
+    qq["QQ 用户"]
+    onebot["snowluma / NapCat<br/>OneBot v11"]
+    bridge["桥接服务<br/>alma-onebot-bridge"]
+    alma["Alma App<br/>WS：/ws/threads<br/>REST：线程操作 / 设置<br/>GUI：已跟踪线程"]
+
+    qq -->|"QQ 消息"| onebot
+    onebot -->|"反向 WebSocket<br/>事件 + API 响应"| bridge
+    bridge -->|"WS generate_response<br/>HTTP REST 线程操作"| alma
+    alma -->|"message_updated<br/>GUI 助手消息"| bridge
+    bridge -->|"OneBot send_msg"| onebot
+    onebot -->|"QQ 投递"| qq
 ```
 
 桥接服务同时作为 OneBot 客户端的 **WebSocket 服务器** 和 Alma 内部聊天管线的 **WebSocket 客户端**（`ws://localhost:23001/ws/threads`）。

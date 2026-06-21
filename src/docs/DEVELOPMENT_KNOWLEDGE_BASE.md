@@ -14,12 +14,19 @@ a **WebSocket Client** for Alma's internal chat pipeline. All AI generation goes
 the Alma WebSocket protocol, ensuring messages are persisted in threads and visible in
 the GUI, with full access to SOUL, Memory, People Profiles, and Skills.
 
-```
-QQ User ──► snowluma (OneBot) ──WS──► Bridge ──WS──► Alma (ws://localhost:23001/ws/threads)
-                                       │
-                                       ├──REST──► Alma REST API (thread creation, settings)
-                                       │
-                                       └──bidirectional──► Alma GUI ↔ QQ forwarding
+```mermaid
+flowchart LR
+    qq["QQ User"]
+    onebot["snowluma / NapCat<br/>OneBot v11"]
+    bridge["Bridge<br/>alma-onebot-bridge"]
+    alma["Alma App<br/>WS: /ws/threads<br/>REST: thread operations / settings<br/>GUI: tracked thread"]
+
+    qq -->|"QQ message"| onebot
+    onebot -->|"Reverse WebSocket<br/>events + API replies"| bridge
+    bridge -->|"WS generate_response<br/>HTTP REST thread ops"| alma
+    alma -->|"message_updated<br/>GUI assistant message"| bridge
+    bridge -->|"OneBot send_msg"| onebot
+    onebot -->|"QQ delivery"| qq
 ```
 
 ### Data Flow (QQ → Alma → QQ)
