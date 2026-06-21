@@ -7,7 +7,7 @@ Detailed explanations and fixes for the most time-consuming issues encountered d
 1. [Warp 0.4.x server Feature](#1-warp-04x-server-feature)
 2. [message_added Empty Assistant Text](#2-message_added-empty-assistant-text)
 3. [message_updated Fires Multiple Times](#3-message_updated-fires-multiple-times)
-4. [libsql Statement Takes self Reference](#4-libsql-statement-takes-self-reference)
+4. [Turso Statement Takes mutable self Reference](#4-turso-statement-takes-mutable-self-reference)
 5. [No REST Endpoint for Message Sending](#5-no-rest-endpoint-for-message-sending)
 6. [WebSocket Split Pattern](#6-websocket-split-pattern)
 7. [Per-Thread Generation Guards](#7-per-thread-generation-guards)
@@ -18,7 +18,8 @@ Detailed explanations and fixes for the most time-consuming issues encountered d
 12. [Port 8080 Often Occupied](#12-port-8080-often-occupied)
 13. [Container-to-Host Networking](#13-container-to-host-networking)
 14. [Dedup Comparison Precision](#14-dedup-comparison-precision)
-15. [Alma WS No Auto-Reconnect](#15-alma-ws-no-auto-reconnect)
+15. [Alma WS Reconnect](#15-alma-ws-reconnect)
+16. [Do Not Write Alma Database From the External Bridge](#16-do-not-write-alma-database-from-the-external-bridge)
 
 ## 1. Warp 0.4.x server Feature
 
@@ -64,13 +65,14 @@ if role == "assistant" && generating_threads.contains(&thread_id) {
 // safe to forward
 ```
 
-## 4. libsql Statement Takes self Reference
+## 4. Turso Statement Takes mutable self Reference
 
-The `libsql` v0.9 crate's `Statement::query()` and `Statement::execute()` take `&self`, not `&mut self`. Declaring `let mut stmt = ...` triggers unused-mut warnings.
+The `turso` crate's `Statement::query()` and `Statement::execute()` take `&mut self`.
+Declare prepared statements as mutable before calling either method.
 
 Correct usage:
 ```rust
-let stmt = conn.prepare("SELECT ...").await?;
+let mut stmt = conn.prepare("SELECT ...").await?;
 let rows = stmt.query(params).await?;
 ```
 
@@ -163,6 +165,20 @@ When the OneBot client (e.g., snowluma) runs in an OrbStack or Docker container,
 
 The dedup mechanism compares the first 100 characters of text using bidirectional prefix matching: `sent.starts_with(prefix) || prefix.starts_with(sent_prefix)`. The buffer keeps the last 20 entries per thread. This is sufficient for most messages but could theoretically miss duplicates that diverge after 100 characters.
 
-## 15. Alma WS No Auto-Reconnect
+## 15. Alma WS Reconnect
 
-If the Alma WebSocket connection drops, the bridge does not auto-reconnect. AI replies stop working until the bridge is restarted. This is a known limitation listed as a future enhancement. The bridge logs a warning if the Alma WS fails at startup but continues to accept OneBot connections.
+If the Alma WebSocket connection drops, the bridge should reconnect before the next
+generation attempt. A stale `mpsc::UnboundedSender` can remain in state after the reader
+task exits, so generation code must check `client.is_connected()` and replace the stored
+client when it is closed.
+
+## 16. Do Not Write Alma Database From the External Bridge
+
+Alma's built-in bridges may update `channel_mappings` because they run inside Alma's own
+process boundary. This external reverse-WS bridge must not open or write
+`chat_threads.db`; Alma commonly keeps that file locked while running, and cross-process
+access can fail with "File is locked by another process".
+
+Keep QQ session-to-thread mappings in the bridge's local Turso database. Use Alma REST for
+thread creation/existence checks, and use `source = "telegram"` / `"telegram-group"` plus
+Telegram-style text and `ephemeralContext` to get Telegram-like prompt behavior.

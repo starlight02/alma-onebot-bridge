@@ -32,7 +32,8 @@ When a Telegram user replies to a message:
 // msg.reply_to_message contains the quoted message
 const replyContext = buildReplyContext(msg.reply_to_message);
 const text = `${replyContext}\n${msg.text}`;
-// Sent as: [msg:message_id] [Replying to X: "..."]\nactual text
+// Private: [msg:message_id] [Replying to X: "..."] actual text
+// Group:   [From: ... [id:sender_id] [msg:message_id]] [Replying to X: "..."] actual text
 ```
 
 ### Discord Bridge

@@ -12,7 +12,7 @@
 - **回复 & @提及** — 完整的引用/回复协议（incoming 引用上下文 + outgoing 回复引用），群聊回复自动 @用户
 - **People Profiles** — 自动为每个 QQ 用户创建 Alma People Profile 文件，包含 `qq_id` 前置标识，支持跨平台身份匹配
 - **消息分段** — 长回复按段落和 QQ 的 4500 字限制自动拆分
-- **状态持久化** — 线程映射和用户资料存储在 Turso（libsql）数据库中
+- **状态持久化** — 线程映射和用户资料存储在 Turso 数据库中
 - **安全认证** — 可选的 WebSocket 访问令牌认证（`Bearer` 头）
 - **灵活配置** — TOML 配置文件 + 环境变量覆盖
 
@@ -151,11 +151,11 @@ RUST_LOG=debug ./target/release/alma-onebot-bridge
 
 消息格式遵循 Alma 渠道桥接协议（Telegram 风格）：
 
-- 群聊：`[From: Alice | id:12345678]\n\n[msg:12345] 消息内容`
-- 私聊：`[From: Bob | id:12345678]\n\n[msg:67890] 消息内容`
-- 引用回复：`[From: Alice | id:12345678]\n\n[msg:12346] [Replying to Bob's message: "之前的话"]\n这是回复`
+- 群聊：`[From: Alice [id:12345678] [msg:12345]] 消息内容`
+- 私聊：`[msg:67890] 消息内容`
+- 引用回复：`[From: Alice [id:12345678] [msg:12346]] [Replying to Bob's message: "之前的话"] 这是回复`
 
-`[msg:N]` 使用真实的 OneBot 消息 ID。QQ 表情会转换为文本（如 `[emoji:斜眼笑]`），图片/语音/视频以标签描述。QQ 号作为稳定标识（昵称经常变动）。
+群聊里 `[msg:N]` 位于 `[From: ...]` 发送者头部内，和 Alma 内置 Telegram/Discord 渠道格式一致；私聊不带 `[From: ...]` 头。`[msg:N]` 使用真实的 OneBot 消息 ID；群聊中的 `[id:N]` 使用发送者 QQ 号。QQ 表情会转换为文本（如 `[emoji:斜眼笑]`），图片/语音/视频以标签描述。
 
 ## WebSocket 路径
 

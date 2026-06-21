@@ -45,10 +45,18 @@ Send a `generate_response` message over the WebSocket:
     "userMessage": {
       "role": "user",
       "parts": [{"type": "text", "text": "user message here"}]
-    }
+    },
+    "ephemeralContext": "optional per-turn context",
+    "source": "telegram-group"
   }
 }
 ```
+
+For a QQ bridge spoofing Telegram, use `source: "telegram-group"` for OneBot group messages
+and `source: "telegram"` for private messages. The text prefix should match built-in
+Telegram: group messages use `[From: ... [id:N] [msg:N]]`, private messages use `[msg:N]`.
+`[msg:N]` is inside the `[From: ...]` header for group messages; do not split it into a
+separate second-line prefix.
 
 ## Event Sequence During Generation
 
@@ -178,6 +186,9 @@ The bridge and OneBot client share a single WS connection for both events and AP
 - Messages with `post_type` = Events (dispatched to event handlers)
 
 The echo value format is `bridge-{uuid}-{action}` using uuid v4 for uniqueness.
+
+Treat API responses with `retcode != 0` or `status != "ok"` as errors. Do not use the
+presence of `data.message_id` alone as success.
 
 ## Model Priority Chain
 

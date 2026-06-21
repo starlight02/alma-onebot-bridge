@@ -6,7 +6,7 @@ description: >-
   Use this skill whenever the user wants to: set up an OneBot reverse WS bridge in Rust,
   integrate Alma AI replies into an IM client via WebSocket, implement the echo-based
   API correlation pattern for OneBot v11, configure a Warp 0.4.x WebSocket server,
-  handle OneBot v11 event/message protocol in Rust, persist bridge state with Turso/libsql,
+  handle OneBot v11 event/message protocol in Rust, persist bridge state with Turso,
   or troubleshoot common pitfalls around Alma's WebSocket protocol and Warp feature flags.
   Also apply when the user mentions "onebot bridge", "alma qq", "onebot warp", or
   wants to extend the existing alma-onebot-bridge project.
@@ -56,7 +56,7 @@ tokio-stream = "0.1.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.23.3", features = ["v4"] }
-libsql = { version = "0.9", default-features = false, features = ["core"] }
+turso = { version = "0.7.0-pre.10", default-features = false }
 tokio-tungstenite = "0.26"
 warp = { version = "0.4.3", features = ["server", "websocket"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
@@ -73,7 +73,7 @@ Organize the codebase into focused modules:
 src/
   main.rs          -- entry point: tracing, config, state, routes, warp::serve
   config.rs        -- three-layer config: env vars > config.toml > defaults
-  state.rs         -- shared state with Turso (libsql) persistence
+  state.rs         -- shared state with Turso persistence
   onebot/
     mod.rs         -- re-exports api + event
     event.rs       -- OneBot v11 serde types, text extraction, @bot detection
@@ -189,7 +189,7 @@ Use the Alma WebSocket protocol directly (not `alma run` CLI) for the best integ
 Thread creation uses the REST API:
 ```
 POST http://localhost:23001/api/threads
-Body: {"title": "QQ Group 98765432"}
+Body: {"title": "QQ Group 100200300"}
 Response: {"id": "<thread_id>"}
 ```
 
@@ -212,6 +212,12 @@ Response collection: accumulate `message_delta` events (only `text_append` with 
 
 Per-thread generation guards (`HashMap<String, Arc<Mutex<()>>>`) serialize concurrent `generate()` calls for the same thread, preventing pending map corruption.
 
+Do not open or write Alma's `chat_threads.db` from this external bridge. Built-in bridges can
+maintain Alma's `channel_mappings` because they run inside Alma's own process boundary; an
+external reverse-WS bridge must avoid cross-process DB locks. Keep QQ session-to-thread
+state in the bridge's local Turso database, create threads through Alma REST, and spoof
+Telegram behavior through `source`, Telegram-style message text, and `ephemeralContext`.
+
 For full Alma WS protocol details and the event sequence, read `references/alma-ws-protocol.md`.
 
 ## Step 8: Message Pipeline
@@ -221,8 +227,11 @@ The end-to-end flow for each QQ message:
 1. Extract plain text from message segments
 2. Filter group messages (require @bot), strip @mention
 3. Ensure People Profile exists for the sender
-4. Look up or create an Alma Thread (REST `POST /api/threads`)
-5. Prefix message with sender identity: `[QQ群聊] [发送者: Alice(QQ:123)] msg` or `[发送者: Bob(QQ:123)] msg`
+4. Look up the Alma thread in the bridge's local `threads` table; if missing or stale, create/check it through Alma REST
+5. Format message like built-in Telegram:
+   - group: `[From: 萌依 [id:123] [msg:456]] msg`
+   - private: `[msg:456] msg`
+   - do not split `[msg:N]` into a separate line outside the group sender header
 6. Send via Alma WS (`generate_response`) and await reply
 7. Split reply by paragraphs (`\n\n`), then by QQ's ~4500 char limit
 8. Send each chunk via OneBot `send_msg` API
@@ -240,13 +249,13 @@ Critical: Use `message_updated` events (not `message_added`) for forwarding. `me
 
 Dedup compares the first 100 characters of text, keeping the last 20 entries per thread. This prevents echo loops when the bridge sends a reply and Alma also records it.
 
-## Step 10: State Persistence with Turso (libsql)
+## Step 10: State Persistence with Turso
 
 Use a local SQLite-compatible Turso database for persisting thread mappings and user profiles:
 
 ```sql
 CREATE TABLE threads (
-    session_key TEXT PRIMARY KEY,   -- "private:12345678" or "group:98765432"
+    session_key TEXT PRIMARY KEY,   -- "private:123456789" or "group:100200300"
     thread_id TEXT NOT NULL
 );
 CREATE TABLE profiles (
@@ -316,7 +325,7 @@ These are the issues that cost the most debugging time. Detailed explanations an
 1. **Warp 0.4.x `server` feature** - not default, must be explicit in Cargo.toml
 2. **`message_added` has empty assistant text** - use `message_updated` instead
 3. **`message_updated` fires multiple times** - filter by generation state
-4. **libsql `Statement` takes `&self`** - no `mut` needed, causes warnings
+4. **Turso `Statement` takes `&mut self`** - prepared statements must be mutable before `query()` or `execute()`
 5. **No REST endpoint for message sending** - must use Alma WS protocol
 6. **WebSocket split pattern** - cannot share `SplitSink` across tasks, use mpsc channel
 7. **Per-thread generation guards** - concurrent generate() for same thread corrupts pending map
@@ -326,10 +335,10 @@ These are the issues that cost the most debugging time. Detailed explanations an
 
 After building, verify the bridge works end-to-end:
 
-1. `cargo build --release` compiles with zero warnings
+1. `cargo build --release` compiles
 2. Start Alma, then the bridge, then the OneBot client (in that order)
 3. Check `GET http://localhost:8090/health` returns 200
 4. Send a private QQ message to the bot; receive an AI reply
 5. Send a group message with @bot; receive an AI reply
 6. Type in the Alma GUI for a tracked thread; verify forwarding to QQ
-7. Restart the bridge; verify thread mappings persist (no new threads created)
+7. Restart the bridge; verify local thread mappings persist (no new threads created)

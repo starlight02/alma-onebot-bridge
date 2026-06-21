@@ -93,16 +93,26 @@ stripping) for free. See [message-format.md](references/message-format.md) for f
 
 Messages in `userMessage.parts[0].text` follow a standardized format matching built-in bridges:
 
-### Standard Message (No Reply)
+### Telegram Private Message
+
+```
+[msg:42] actual message text
+```
+
+Built-in Telegram private chats do not include a `[From: ...]` header. They use only the
+real platform message ID prefix.
+
+### Telegram Group Message
 
 ```
 [From: DisplayName (@username) [id:123456789] [msg:42]] actual message text
 ```
 
-- `[msg:N]` uses the **real platform message_id** (not a counter). This lets Alma reference
-  messages in group history logs and enables reply threading.
-- For group chats, the format identifies the sender. For private chats, it's still included
-  for consistency.
+- `[msg:N]` uses the **real platform message_id** (not a counter).
+- In group messages, `[msg:N]` is part of the `[From: ...]` sender header; it is not a
+  separate second-line prefix.
+- Group chats always include `[From: ...]`, even when the message is not replying to Alma.
+- `(@username)` is omitted when the platform does not provide a username, such as QQ/OneBot.
 
 ### Message With Reply/Quote
 
@@ -241,8 +251,9 @@ CREATE TABLE channel_mappings (
 | QQ (custom) | Sender's QQ ID | `"group"` |
 
 **Outgoing routing** (`detectPlatformForChatId`): `discord` → Discord, `weixin` → WeChat,
-**everything else → Telegram (default fallback)**. This is why `platform = "telegram"` works
-for custom bridges.
+**everything else → Telegram (default fallback)**. This describes Alma's built-in process
+boundary; an external reverse-WS bridge should keep its own session-to-thread mapping
+instead of writing this table directly.
 
 ## Building a Custom Bridge — Checklist
 
@@ -251,7 +262,7 @@ for custom bridges.
 - Server-side ephemeral context stripping (old SENDER PROFILE blocks removed from history)
 - Telegram group chat system prompt (privacy firewall, people observation, frequency control)
 - People profile CLI integration (`alma people show/list/append`)
-- Thread management via `channel_mappings` with Telegram routing fallback
+- Telegram-style server prompt behavior through `source`, message text, and `ephemeralContext`
 
 ### What You Must Implement
 
@@ -265,9 +276,9 @@ for custom bridges.
 ### Implementation Steps
 
 1. **Connect** to `ws://127.0.0.1:23001/ws/threads`
-2. **Create channel mapping** with `platform = "telegram"` and your platform's chat/user IDs
+2. **Resolve or create Alma thread** through Alma REST and keep platform session mapping in the bridge's own database
 3. **Scan people profiles** for sender's platform ID → build SENDER PROFILE block
-4. **Format message** with `[From: ... [msg:N]]` prefix and optional reply context
+4. **Format message** with `[From: ... [id:N] [msg:N]]` for groups, `[msg:N]` for private chats, plus optional reply context
 5. **Send** `generate_response` with `source = "telegram-group"` (groups) or `"telegram"` (private)
 6. **Collect response** from `message_delta` events (only `partType: "text"` deltas)
 7. **Send to platform** with reply reference to the triggering message
@@ -295,8 +306,9 @@ the final text.
 ```
 1. Bridge connects to ws://127.0.0.1:23001/ws/threads
 2. Platform message arrives (e.g., QQ group message from user 123456789, message_id=42)
-3. Bridge gets or creates channel mapping:
-   platform="telegram", external_chat_id=<groupId>, external_user_id="group" → threadId
+3. External bridges resolve `session_key -> threadId` in their own local database, creating
+   Alma threads through REST when needed. Do not write Alma's internal `channel_mappings`
+   table from a separate process.
 4. Bridge scans ~/.config/alma/people/*.md for qq_id match → SENDER PROFILE block
 5. If message has reply/quote:
    - Fetch quoted message via platform API (e.g., OneBot get_msg)

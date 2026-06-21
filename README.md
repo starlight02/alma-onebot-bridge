@@ -12,7 +12,7 @@ A bridge service that connects [Alma](https://github.com/anthropics/alma) (local
 - **Reply & @mention** — Full reply/quoting protocol (incoming quotes and outgoing reply references), with automatic @mention in group replies
 - **People Profiles** — Automatically creates Alma People Profile files for each QQ user, with `qq_id` frontmatter for cross-platform identity matching
 - **Message splitting** — Long replies are split by paragraph and QQ's 4500-character limit
-- **Persistent state** — Thread mappings and user profiles stored in a Turso (libsql) database
+- **Persistent state** — Thread mappings and user profiles stored in a Turso database
 - **Security** — Optional WebSocket access token authentication (`Bearer` header)
 - **Configurable** — TOML config file with environment variable overrides
 
@@ -151,11 +151,11 @@ Messages typed in the Alma GUI for a tracked thread are forwarded to QQ. A dedup
 
 Messages are formatted to match Alma's channel bridge protocol (Telegram-style):
 
-- Group: `[From: Alice | id:12345678]\n\n[msg:12345] 消息内容`
-- Private: `[From: Bob | id:12345678]\n\n[msg:67890] 消息内容`
-- With quote: `[From: Alice | id:12345678]\n\n[msg:12346] [Replying to Bob's message: "之前的话"]\n这是回复`
+- Group: `[From: Alice [id:12345678] [msg:12345]] 消息内容`
+- Private: `[msg:67890] 消息内容`
+- With quote: `[From: Alice [id:12345678] [msg:12346]] [Replying to Bob's message: "之前的话"] 这是回复`
 
-The `[msg:N]` tag uses the real OneBot message ID. Face emojis are converted to text (e.g., `[emoji:斜眼笑]`), and images/voice/video are described with labels. The QQ ID is included as a stable identifier since nicknames change frequently.
+For group messages, `[msg:N]` is part of the `[From: ...]` sender header, matching Alma's built-in Telegram/Discord bridge format. Private messages do not include a `[From: ...]` header. The `[msg:N]` tag uses the real OneBot message ID; `[id:N]` uses the sender QQ ID in group messages. Face emojis are converted to text (e.g., `[emoji:斜眼笑]`), and images/voice/video are described with labels.
 
 ## WebSocket Paths
 

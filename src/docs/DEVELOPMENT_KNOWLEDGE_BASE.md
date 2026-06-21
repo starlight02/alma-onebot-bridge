@@ -50,7 +50,7 @@ QQ User ──► snowluma (OneBot) ──WS──► Bridge ──WS──► A
 | Module | Responsibility |
 |--------|---------------|
 | `config.rs` | Config from `config.toml` + env var overrides (priority: env > TOML > default) |
-| `state.rs` | Shared state with Turso (libsql) persistence + in-memory group chat history ring buffer |
+| `state.rs` | Shared state with Turso persistence + in-memory group chat history ring buffer |
 | `onebot/event.rs` | OneBot v11 event/message serde types + helpers for text, media, face, forward extraction |
 | `onebot/api.rs` | Echo-based WS API call mechanism + `send_text_message`, `send_reply_message`, `get_msg`, `get_forward_msg` helpers |
 | `handlers/ws.rs` | Reverse WS connection lifecycle + access token validation + recall event logging + bidirectional forwarding |
@@ -287,15 +287,17 @@ Messages sent to Alma use the same format as Alma's built-in bridges:
 
 | Chat Type | Format |
 |-----------|--------|
-| Group | `[From: Alice \| id:12345678]\n\n[msg:12345] 消息内容` |
-| Private | `[From: Bob \| id:12345678]\n\n[msg:67890] 消息内容` |
-| With Reply | `[From: Alice \| id:12345678]\n\n[msg:12345] [Replying to Bob's message: "引用的消息内容"]\n实际消息` |
-| With Forward | `[From: Alice \| id:12345678]\n\n[msg:12346] [Forwarded messages (3 total):Alice: "hello", Bob: "world", Charlie: "hi"]` |
-| With Media | `[From: Alice \| id:12345678]\n\n[msg:12347] 看看这个\n[Image: https://gchat.qpic.cn/...]\n[Voice message]` |
-| With Emoji | `[From: Alice \| id:12345678]\n\n[msg:12348] 哈哈哈 [emoji:斜眼笑] [emoji:doge]` |
+| Group | `[From: Alice [id:12345678] [msg:12345]] 消息内容` |
+| Private | `[msg:67890] 消息内容` |
+| With Reply | `[From: Alice [id:12345678] [msg:12345]] [Replying to Bob's message: "引用的消息内容"] 实际消息` |
+| With Forward | `[From: Alice [id:12345678] [msg:12346]] [Forwarded messages (3 total):Alice: "hello", Bob: "world", Charlie: "hi"]` |
+| With Media | `[From: Alice [id:12345678] [msg:12347]] 看看这个\n[Image: https://gchat.qpic.cn/...]\n[Voice message]` |
+| With Emoji | `[From: Alice [id:12345678] [msg:12348]] 哈哈哈 [emoji:斜眼笑] [emoji:doge]` |
 
-`[msg:N]` uses the real OneBot `message_id` from the event (same pattern as Telegram bridge's
-`message_id`). This lets Alma reference messages in group history logs.
+In group messages, `[msg:N]` is inside the `[From: ...]` sender header. This is the actual
+format used by Alma's bundled Telegram and Discord bridges. Private messages use only
+`[msg:N]` and no `[From: ...]` header. `[msg:N]` uses the real OneBot `message_id` from
+the event, not a generated counter.
 
 When a user replies to (quotes) a message, the bridge fetches the quoted message content
 via OneBot `get_msg` API and prepends a `[Replying to X's message: "..."]` line, matching
@@ -652,7 +654,7 @@ The AI model used for generation follows this priority:
 
 ## 4. State Persistence
 
-### Turso (libsql) Database
+### Turso Database
 
 The bridge uses a local Turso database file (`bridge-state.db` by default) with two tables:
 
@@ -706,14 +708,14 @@ A single assistant message generates multiple `message_updated` events:
 **Fix**: Track generating threads in a `HashSet<String>`. Only forward `message_updated`
 for assistant messages when the thread is NOT in the generating set.
 
-### 5.4 libsql `Statement` Methods Take `&self`
+### 5.4 Turso `Statement` Methods Take `&mut self`
 
-The `libsql` v0.9 crate's `Statement::query()` and `Statement::execute()` take `&self`,
-not `&mut self`. Declaring `let mut stmt = ...` triggers unused-mut warnings.
+The `turso` crate's `Statement::query()` and `Statement::execute()` take `&mut self`.
+Declare prepared statements as mutable before calling either method.
 
 ```rust
-// Correct — no mut needed:
-let stmt = conn.prepare("SELECT ...").await?;
+// Correct:
+let mut stmt = conn.prepare("SELECT ...").await?;
 let rows = stmt.query(params).await?;
 ```
 
@@ -997,9 +999,10 @@ The Alma server merges this with its own system prompt (SOUL.md, Memory, tools).
 For `"telegram-group"` source, the server strips stale `RECENT GROUP CHAT HISTORY` blocks
 from older messages in the conversation history, keeping only the last message's context.
 
-### 8.5 The `channel_mappings` Database Table
+### 8.5 Alma's Internal `channel_mappings` Database Table
 
-Maps platform conversations to Alma threads:
+Alma's built-in bridges map platform conversations to Alma threads through an internal
+`channel_mappings` table:
 
 ```sql
 CREATE TABLE channel_mappings (
@@ -1016,59 +1019,48 @@ CREATE TABLE channel_mappings (
 
 Lookup key: `(platform, external_chat_id, external_user_id)`.
 
-For QQ groups: `platform="telegram"`, `external_chat_id=qq_group_id`, `external_user_id="group"`.
-For QQ private: `platform="telegram"`, `external_chat_id=qq_user_id`, `external_user_id=qq_user_id`.
+External reverse-WS bridges must not open or write Alma's `chat_threads.db` directly. Alma
+owns that database while running, and cross-process access can fail with file locking errors.
+The QQ bridge keeps its own `session_key -> thread_id` table in the local bridge database,
+creates threads through Alma REST, and gets Telegram-like prompt behavior through
+`source`, Telegram-style message text, and `ephemeralContext`.
 
 ### 8.6 Telegram-Style Message Format
 
 Built-in bridges prefix messages with sender identification:
 
 ```
-[From: DisplayName (@username) | id:123456789]
-
-[msg:42] actual message text
+[From: DisplayName (@username) [id:123456789] [msg:42]] actual message text
 ```
 
 `[msg:N]` uses the actual platform `message_id` (not a counter). When replying:
 
 ```
-[From: DisplayName (@username) | id:123456789]
-
-[msg:43] [Replying to Someone's message: "quoted text up to 200 chars"]
-actual reply text
+[From: DisplayName (@username) [id:123456789] [msg:43]] [Replying to Someone's message: "quoted text up to 200 chars"] actual reply text
 ```
 
 Our QQ bridge adopts this format, with additional support for media, forwards, and face emojis:
 
 ```
-[From: Alice | id:12345678]
-
-[msg:12345] 你好世界 [emoji:斜眼笑]
+[From: Alice [id:12345678] [msg:12345]] 你好世界 [emoji:斜眼笑]
 ```
 
 With reply context:
 
 ```
-[From: Alice | id:12345678]
-
-[msg:12346] [Replying to Bob's message: "之前说的话"]
-这是回复
+[From: Alice [id:12345678] [msg:12346]] [Replying to Bob's message: "之前说的话"] 这是回复
 ```
 
 With forwarded content:
 
 ```
-[From: Alice | id:12345678]
-
-[msg:12347] [Forwarded messages (3 total):Alice: "hello", Bob: "world", Charlie: "hi"]
+[From: Alice [id:12345678] [msg:12347]] [Forwarded messages (3 total):Alice: "hello", Bob: "world", Charlie: "hi"]
 ```
 
 With media:
 
 ```
-[From: Alice | id:12345678]
-
-[msg:12348] 看看这个
+[From: Alice [id:12345678] [msg:12348]] 看看这个
 [Image: https://gchat.qpic.cn/...]
 [Voice message]
 ```
@@ -1089,15 +1081,17 @@ triggering user, ensuring they receive a notification. Private chats omit the `a
 Only the first chunk of the first paragraph includes the reply reference (and @mention).
 Subsequent chunks are sent as plain messages.
 
-### 8.8 `detectPlatformForChatId` Routing
+### 8.8 Outgoing Routing and Local Bridge Mapping
 
-When Alma sends a reply back to a platform, it looks up the `channel_mappings` table:
+For Alma's built-in channels, outgoing platform routing uses the internal
+`channel_mappings` table:
 - If `platform = "discord"` → Discord routing
 - If `platform = "weixin"` → WeChat routing
 - **Everything else → Telegram routing (default fallback)**
 
-This is why `platform = "telegram"` works for our QQ bridge — Alma treats unrecognized
-platforms as Telegram by default.
+The external QQ bridge does not rely on Alma to route messages back to QQ. It listens to
+Alma WebSocket `message_updated` events, maps `thread_id -> QQ session` through its local
+Turso database, and sends replies through OneBot itself.
 
 ### 8.9 What We Get by Spoofing "telegram-group"
 
@@ -1105,12 +1099,12 @@ platforms as Telegram by default.
 - Telegram group chat system prompt (group rules, privacy, people observation)
 - History stripping of stale `[SENDER PROFILE]` and `RECENT GROUP CHAT HISTORY` blocks
 - People Profiles CLI integration (`alma people show/list/append`)
-- Thread management via `channel_mappings`
 
 **Must implement ourselves**:
+- Local thread management (`session_key -> thread_id`) without touching Alma's DB
 - SENDER PROFILE scanning and injection (server doesn't do matching)
 - `ephemeralContext` construction with profile + people summary + group chat history
-- Telegram-style `[From: ... | id:...]` message format with media/forward/reply context
+- Telegram-style `[From: ... [id:N] [msg:N]]` group message format with media/forward/reply context
 - Response delivery back to QQ (with reply segment + @mention for groups)
 
 - **Image/voice message forwarding**: Convert Alma image outputs to OneBot image segments
