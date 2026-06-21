@@ -24,6 +24,17 @@ impl PendingCalls {
     }
 }
 
+/// Active OneBot reverse-WS API path.
+///
+/// OneBot v11 has no separate HTTP client in reverse-WS mode: API requests must
+/// be sent back through the currently connected WebSocket and correlated by echo.
+#[derive(Clone)]
+pub struct OneBotApiHandle {
+    pub ws_tx: mpsc::UnboundedSender<Message>,
+    pub pending: PendingCalls,
+    pub connection_id: u64,
+}
+
 /// Send an API action through the WebSocket and wait for the correlated response.
 ///
 /// Uses the `echo` field to match request → response.

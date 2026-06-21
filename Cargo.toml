@@ -18,6 +18,6 @@ uuid = { version = "1.23.3", features = ["v4"] }
 turso = { version = "0.7.0-pre.10", default-features = false }
 tokio-tungstenite = "0.26"
 warp = { version = "0.4.3", features = ["server", "websocket"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
 toml = "0.8"
 base64 = "0.22.1"

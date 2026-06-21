@@ -1,7 +1,9 @@
 mod alma;
 mod alma_ws;
+mod auth;
 mod config;
 mod face_map;
+mod group_log;
 mod handlers;
 mod onebot;
 mod people;
@@ -98,6 +100,39 @@ async fn main() {
         .and(warp::get())
         .and_then(handlers::http::health_handler);
 
+    let state_filter = {
+        let state = state.clone();
+        warp::any().map(move || state.clone())
+    };
+
+    let qq_groups = warp::path!("qq" / "groups")
+        .and(warp::get())
+        .and(state_filter.clone())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
+        .and(warp::addr::remote())
+        .and_then(handlers::http::list_groups_handler);
+
+    let qq_group_send = warp::path!("qq" / "group" / i64 / "send")
+        .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(state_filter.clone())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
+        .and(warp::addr::remote())
+        .and_then(handlers::http::send_group_message_handler);
+
+    let qq_private_send = warp::path!("qq" / "private" / i64 / "send")
+        .and(warp::post())
+        .and(warp::body::content_length_limit(64 * 1024))
+        .and(warp::body::json())
+        .and(state_filter)
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
+        .and(warp::addr::remote())
+        .and_then(handlers::http::send_private_message_handler);
+
     // WS endpoint — accepts connections at /, /ws, and /onebot/v11/ws
     // Different OneBot implementations use different default paths
     // Extracts optional Authorization header for token validation
@@ -139,7 +174,13 @@ async fn main() {
         .and(warp::ws())
         .map(ws_handler);
 
-    let routes = health.or(ws_root).or(ws_path).or(ws_onebot);
+    let routes = health
+        .or(qq_groups)
+        .or(qq_group_send)
+        .or(qq_private_send)
+        .or(ws_root)
+        .or(ws_path)
+        .or(ws_onebot);
 
     tracing::info!(
         "Listening on 0.0.0.0:{} — waiting for OneBot reverse WS connection...",

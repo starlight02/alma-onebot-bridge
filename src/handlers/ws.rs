@@ -6,7 +6,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 use warp::ws::{Message, WebSocket};
 
-use crate::onebot::{PendingCalls, try_resolve_api_response};
+use crate::auth::is_ws_authorized;
+use crate::onebot::{OneBotApiHandle, PendingCalls, try_resolve_api_response};
 use crate::pipeline::{handle_alma_event, process_message_event};
 use crate::state::SharedState;
 
@@ -22,7 +23,7 @@ pub async fn handle_ws_connection(
     expected_token: Option<String>,
 ) {
     // ── Access token validation ──────────────────────────────────────────
-    if !is_authorized(expected_token.as_deref(), auth_header.as_deref(), &query) {
+    if !is_ws_authorized(expected_token.as_deref(), auth_header.as_deref(), &query) {
         warn!("WebSocket connection rejected: invalid or missing access token");
         return;
     }
@@ -41,6 +42,13 @@ pub async fn handle_ws_connection(
 
     // Pending API call correlation map
     let pending_calls = PendingCalls::new();
+    state
+        .set_onebot_api_handle(OneBotApiHandle {
+            ws_tx: ws_tx.clone(),
+            pending: pending_calls.clone(),
+            connection_id,
+        })
+        .await;
 
     // ── Bidirectional: subscribe to Alma events → forward to QQ ──────────
     let mut alma_event_rx = state.alma_event_tx.subscribe();
@@ -291,77 +299,7 @@ pub async fn handle_ws_connection(
             .map(|id| format!(" (QQ: {})", id))
             .unwrap_or_default()
     );
+    state.clear_onebot_api_handle(connection_id).await;
     forwarding.abort();
     writer.abort();
-}
-
-fn is_authorized(
-    expected_token: Option<&str>,
-    auth_header: Option<&str>,
-    query: &HashMap<String, String>,
-) -> bool {
-    let Some(expected) = expected_token.map(str::trim).filter(|t| !t.is_empty()) else {
-        return true;
-    };
-
-    auth_header
-        .and_then(extract_authorization_token)
-        .or_else(|| {
-            query
-                .get("access_token")
-                .or_else(|| query.get("token"))
-                .map(String::as_str)
-        })
-        .map(|token| token.trim() == expected)
-        .unwrap_or(false)
-}
-
-fn extract_authorization_token(header: &str) -> Option<&str> {
-    let trimmed = header.trim();
-    trimmed
-        .strip_prefix("Bearer ")
-        .or_else(|| trimmed.strip_prefix("bearer "))
-        .or_else(|| trimmed.strip_prefix("Token "))
-        .or_else(|| trimmed.strip_prefix("token "))
-        .or_else(|| {
-            if trimmed.contains(' ') {
-                None
-            } else {
-                Some(trimmed)
-            }
-        })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_authorized;
-    use std::collections::HashMap;
-
-    #[test]
-    fn auth_allows_when_token_not_configured_or_blank() {
-        assert!(is_authorized(None, None, &HashMap::new()));
-        assert!(is_authorized(Some("   "), None, &HashMap::new()));
-    }
-
-    #[test]
-    fn auth_accepts_bearer_and_query_tokens() {
-        let mut query = HashMap::new();
-        query.insert("access_token".to_string(), "secret".to_string());
-
-        assert!(is_authorized(
-            Some("secret"),
-            Some("Bearer secret"),
-            &HashMap::new()
-        ));
-        assert!(is_authorized(Some("secret"), None, &query));
-    }
-
-    #[test]
-    fn auth_rejects_invalid_token() {
-        let mut query = HashMap::new();
-        query.insert("access_token".to_string(), "wrong".to_string());
-
-        assert!(!is_authorized(Some("secret"), Some("Bearer wrong"), &query));
-        assert!(!is_authorized(Some("secret"), None, &HashMap::new()));
-    }
 }

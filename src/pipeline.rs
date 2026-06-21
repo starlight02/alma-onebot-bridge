@@ -1,11 +1,10 @@
-use std::io::Write;
-
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use warp::ws::Message;
 
 use crate::alma;
 use crate::alma_ws::{AlmaEvent, AlmaWsClient};
+use crate::group_log;
 use crate::onebot::event::{
     OneBotEvent, contains_at_bot, convert_faces_to_text, extract_forward_id, extract_images,
     extract_media_summary, extract_reply_id, extract_text, has_media_segments,
@@ -17,7 +16,7 @@ use crate::people::ensure_people_profile;
 use crate::state::SharedState;
 use serde_json;
 
-const QQ_MSG_LIMIT: usize = 4500;
+pub(crate) const QQ_MSG_LIMIT: usize = 4500;
 const ALMA_ERROR_REPLY: &str = "抱歉，我暂时无法回复 >_<";
 const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 
@@ -115,33 +114,52 @@ pub async fn process_message_event(
     };
 
     // ── Record to group history (before @bot gate, so ALL messages are captured) ──
-    if is_group && !text.is_empty() {
+    let observed_text = observed_message_text(&text, &media_lines);
+    if is_group && !observed_text.is_empty() {
         let session_key = format!("group:{}", group_id);
         let message_id = event.message_id;
+        if let Err(e) = state
+            .touch_group(group_id, group_title.as_deref(), event.time.unwrap_or(0))
+            .await
+        {
+            debug!("[GroupDirectory] Failed to touch group {}: {}", group_id, e);
+        }
+        if user_id != 0 {
+            if let Err(e) = state
+                .record_group_member(group_id, user_id, display_name, event.time.unwrap_or(0))
+                .await
+            {
+                debug!(
+                    "[GroupDirectory] Failed to record member {} in group {}: {}",
+                    user_id, group_id, e
+                );
+            }
+        }
         state
             .record_group_message(
                 &session_key,
                 crate::state::GroupMessage {
                     display_name: display_name.to_string(),
-                    text: text.clone(),
+                    text: observed_text.clone(),
                     timestamp: event.time.unwrap_or(0),
                     message_id,
                     is_bot: false,
                 },
             )
             .await;
-        if let Err(e) = append_to_alma_chat_log(
+        if let Err(e) = group_log::append_alma_group_log(
             group_id,
             display_name,
-            &text,
+            &observed_text,
             false,
             event.time.unwrap_or(0),
             message_id,
             Some(user_id),
             None,
         ) {
-            debug!("[GroupHistory] Failed to append Alma chat log: {}", e);
+            debug!("[GroupHistory] Failed to append Alma group log: {}", e);
         }
+        refresh_alma_group_directory_readme(state).await;
         debug!(
             "[GroupHistory] Recorded message from {} in {}",
             display_name, session_key
@@ -464,6 +482,7 @@ pub async fn process_message_event(
         sender_nickname,
         group_title.as_deref(),
         if is_group { Some(group_id) } else { None },
+        state.config.bridge_port,
     ));
 
     // Scan people profiles for the sender's qq_id
@@ -704,31 +723,14 @@ pub async fn process_message_event(
                         .and_then(|d| d.get("message_id"))
                         .and_then(|m| m.as_i64());
                     if is_group {
-                        let history_session_key = format!("group:{}", group_id);
-                        state
-                            .record_group_message(
-                                &history_session_key,
-                                crate::state::GroupMessage {
-                                    display_name: "Alma".to_string(),
-                                    text: chunk.to_string(),
-                                    timestamp: current_unix_timestamp(),
-                                    message_id: msg_id,
-                                    is_bot: true,
-                                },
-                            )
-                            .await;
-                        if let Err(e) = append_to_alma_chat_log(
+                        record_alma_group_output(
+                            state,
                             group_id,
-                            "Alma",
                             chunk,
-                            true,
-                            current_unix_timestamp(),
                             msg_id,
-                            None,
-                            None,
-                        ) {
-                            debug!("[GroupHistory] Failed to append Alma chat log: {}", e);
-                        }
+                            current_unix_timestamp(),
+                        )
+                        .await;
                     }
                     info!(
                         "[Reply] Sent to {} {}, msg_id={:?}",
@@ -851,31 +853,14 @@ pub async fn handle_alma_event(
                     .and_then(|d| d.get("message_id"))
                     .and_then(|m| m.as_i64());
                 if target.target_type == "group" {
-                    let history_session_key = format!("group:{}", target.target_id);
-                    state
-                        .record_group_message(
-                            &history_session_key,
-                            crate::state::GroupMessage {
-                                display_name: "Alma".to_string(),
-                                text: chunk.to_string(),
-                                timestamp: current_unix_timestamp(),
-                                message_id: msg_id,
-                                is_bot: true,
-                            },
-                        )
-                        .await;
-                    if let Err(e) = append_to_alma_chat_log(
+                    record_alma_group_output(
+                        state,
                         target.target_id,
-                        "Alma",
                         chunk,
-                        true,
-                        current_unix_timestamp(),
                         msg_id,
-                        None,
-                        None,
-                    ) {
-                        debug!("[GroupHistory] Failed to append Alma chat log: {}", e);
-                    }
+                        current_unix_timestamp(),
+                    )
+                    .await;
                 }
                 info!(
                     "[Alma→QQ] Forwarded to {} {} ({} chars, msg_id={:?})",
@@ -965,58 +950,70 @@ fn build_recent_chat_history_context(history: &[crate::state::GroupMessage]) -> 
     lines.join("\n")
 }
 
-fn append_to_alma_chat_log(
-    chat_id: i64,
-    display_name: &str,
+pub(crate) async fn record_alma_group_output(
+    state: &SharedState,
+    group_id: i64,
     text: &str,
-    is_alma: bool,
-    timestamp_secs: u64,
     message_id: Option<i64>,
-    user_id: Option<i64>,
-    username: Option<&str>,
-) -> Result<(), std::io::Error> {
-    let Some(home) = dirs::home_dir() else {
-        return Ok(());
-    };
-    let dir = home.join(".config/alma/chats");
-    std::fs::create_dir_all(&dir)?;
+    timestamp_secs: u64,
+) {
+    let history_session_key = format!("group:{}", group_id);
+    state
+        .record_group_message(
+            &history_session_key,
+            crate::state::GroupMessage {
+                display_name: "Alma".to_string(),
+                text: text.to_string(),
+                timestamp: timestamp_secs,
+                message_id,
+                is_bot: true,
+            },
+        )
+        .await;
+    if let Err(e) = state.touch_group(group_id, None, timestamp_secs).await {
+        debug!("[GroupDirectory] Failed to touch group {}: {}", group_id, e);
+    }
+    if let Err(e) = group_log::append_alma_group_log(
+        group_id,
+        "Alma",
+        text,
+        true,
+        timestamp_secs,
+        message_id,
+        None,
+        None,
+    ) {
+        debug!("[GroupHistory] Failed to append Alma group log: {}", e);
+    }
+    refresh_alma_group_directory_readme(state).await;
+}
 
-    let instant = timestamp_or_now(timestamp_secs);
-    let date = format!(
-        "{:04}-{:02}-{:02}",
-        instant.year(),
-        u8::from(instant.month()),
-        instant.day()
-    );
-    let clock = format!(
-        "{:02}:{:02}:{:02}",
-        instant.hour(),
-        instant.minute(),
-        instant.second()
-    );
-    let path = dir.join(format!("{}_{}.log", chat_id, date));
-    let msg = message_id
-        .map(|id| format!(" [msg:{}]", id))
-        .unwrap_or_default();
-    let sender = if is_alma {
-        "[Alma]".to_string()
-    } else if let Some(uid) = user_id {
-        match username {
-            Some(name) if !name.is_empty() => {
-                format!("[{} (@{}) [id:{}]]", display_name, name, uid)
+pub(crate) async fn refresh_alma_group_directory_readme(state: &SharedState) {
+    match state.group_directory_snapshot().await {
+        Ok(entries) => {
+            if let Err(e) = group_log::write_group_readme(&entries, state.config.bridge_port) {
+                debug!("[GroupDirectory] Failed to write README: {}", e);
             }
-            _ => format!("[{} [id:{}]]", display_name, uid),
         }
-    } else {
-        format!("[{}]", display_name)
-    };
-    let one_line = text.replace('\n', " ");
-    let line = format!("[{}]{} {}: {}\n", clock, msg, sender, one_line);
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?
-        .write_all(line.as_bytes())
+        Err(e) => debug!("[GroupDirectory] Failed to snapshot groups: {}", e),
+    }
+}
+
+fn observed_message_text(text: &str, media_lines: &[String]) -> String {
+    let text = text.trim();
+    let media = media_lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    match (text.is_empty(), media.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => text.to_string(),
+        (true, false) => media,
+        (false, false) => format!("{} {}", text, media),
+    }
 }
 
 fn format_history_time(timestamp_secs: u64) -> String {
@@ -1047,7 +1044,7 @@ fn split_paragraphs(text: &str) -> Vec<String> {
 }
 
 /// Split text into chunks that fit within QQ's message length limit.
-fn split_text(text: &str, limit: usize) -> Vec<String> {
+pub(crate) fn split_text(text: &str, limit: usize) -> Vec<String> {
     if text.len() <= limit {
         return vec![text.to_string()];
     }
@@ -1180,6 +1177,7 @@ fn build_telegram_like_channel_system_context(
     username: &str,
     group_title: Option<&str>,
     group_id: Option<i64>,
+    bridge_port: u16,
 ) -> String {
     let username = if username.trim().is_empty() {
         "unknown"
@@ -1192,13 +1190,13 @@ fn build_telegram_like_channel_system_context(
         let title = group_title.unwrap_or("Unknown");
         let chat_id = group_id.unwrap_or(0);
         format!(
-            "[System: The user is chatting with you via Telegram (username: @{}) in a GROUP CHAT named \"{}\" (chatId: {}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]",
-            username, title, chat_id, platform
+            "[System: The user is chatting with you via Telegram (username: @{}) in a GROUP CHAT named \"{}\" (chatId: {}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]\n\n[QQ BRIDGE: This Telegram-compatible channel is actually QQ / OneBot. For QQ group reading, `alma group list`, `alma group history {} 100`, `alma group search <keyword>`, and `cat ~/.config/alma/groups/README.md` work because alma-onebot-bridge writes QQ logs in Alma's native group-log format. `alma group context {}` can read local logs, but Telegram-only API details may be unavailable for QQ. For active QQ group sending, do not use `alma group send`; that command targets Telegram. Use `curl -s -X POST http://127.0.0.1:{}/qq/group/{}/send -H 'Content-Type: application/json' -d '{{\"message\":\"...\"}}'`.]",
+            username, title, chat_id, platform, chat_id, chat_id, bridge_port, chat_id
         )
     } else {
         format!(
-            "[System: The user is chatting with you via Telegram (username: @{}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]",
-            username, platform
+            "[System: The user is chatting with you via Telegram (username: @{}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]\n\n[QQ BRIDGE: This Telegram-compatible private chat is actually QQ / OneBot. For active QQ private sending, use `curl -s -X POST http://127.0.0.1:{}/qq/private/<userId>/send -H 'Content-Type: application/json' -d '{{\"message\":\"...\"}}'`. Do not use Telegram-specific send commands for QQ.]",
+            username, platform, bridge_port
         )
     }
 }
@@ -1521,12 +1519,19 @@ mod tests {
 
     #[test]
     fn group_system_context_matches_telegram_style_shape() {
-        let ctx =
-            build_telegram_like_channel_system_context(true, "alice", Some("测试群"), Some(123));
+        let ctx = build_telegram_like_channel_system_context(
+            true,
+            "alice",
+            Some("测试群"),
+            Some(123),
+            8090,
+        );
 
         assert!(ctx.starts_with("[System: The user is chatting with you via Telegram"));
         assert!(ctx.contains("username: @alice"));
         assert!(ctx.contains("in a GROUP CHAT named \"测试群\" (chatId: 123)"));
-        assert!(ctx.ends_with("desktop AI agent can do.]"));
+        assert!(ctx.contains("alma group history 123 100"));
+        assert!(ctx.contains("http://127.0.0.1:8090/qq/group/123/send"));
+        assert!(ctx.contains("do not use `alma group send`"));
     }
 }

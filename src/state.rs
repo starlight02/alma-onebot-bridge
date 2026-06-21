@@ -1,15 +1,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
+use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 use turso::Builder;
 
 use crate::alma_ws::{AlmaEvent, AlmaWsClient};
 use crate::config::Config;
+use crate::onebot::OneBotApiHandle;
 
 /// Identifies a QQ chat target for bidirectional forwarding.
 #[derive(Clone, Debug)]
@@ -26,6 +28,33 @@ pub struct GroupMessage {
     pub timestamp: u64,
     pub message_id: Option<i64>,
     pub is_bot: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GroupMember {
+    pub group_id: i64,
+    pub user_id: i64,
+    pub display_name: String,
+    pub last_seen: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GroupDirectoryEntry {
+    pub group_id: i64,
+    pub title: Option<String>,
+    pub last_active: u64,
+    pub members: Vec<GroupMember>,
+}
+
+impl GroupDirectoryEntry {
+    pub fn unknown(group_id: i64) -> Self {
+        Self {
+            group_id,
+            title: None,
+            last_active: 0,
+            members: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +78,8 @@ pub struct AppState {
     pub group_history: RwLock<HashMap<String, VecDeque<GroupMessage>>>,
     /// Cached QQ group titles keyed by numeric group_id.
     pub group_titles: RwLock<HashMap<i64, String>>,
+    /// Active OneBot reverse-WS API path for HTTP command endpoints.
+    onebot_api: RwLock<Option<OneBotApiHandle>>,
     /// Broadcast channel: Alma GUI events → OneBot handler (for bidirectional forwarding)
     pub alma_event_tx: tokio::sync::broadcast::Sender<AlmaEvent>,
     /// Monotonic generation for active OneBot reverse WS connections.
@@ -102,6 +133,30 @@ impl SharedState {
         .await
         .map_err(|e| format!("Failed to create profiles table: {}", e))?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS groups (
+                group_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                last_active TEXT NOT NULL DEFAULT '0'
+            )",
+            (),
+        )
+        .await
+        .map_err(|e| format!("Failed to create groups table: {}", e))?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                last_seen TEXT NOT NULL DEFAULT '0',
+                PRIMARY KEY (group_id, user_id)
+            )",
+            (),
+        )
+        .await
+        .map_err(|e| format!("Failed to create group_members table: {}", e))?;
+
         let (alma_event_tx, _) = tokio::sync::broadcast::channel(64);
 
         Ok(SharedState(Arc::new(AppState {
@@ -117,6 +172,7 @@ impl SharedState {
             sent_replies: RwLock::new(HashMap::new()),
             group_history: RwLock::new(HashMap::new()),
             group_titles: RwLock::new(HashMap::new()),
+            onebot_api: RwLock::new(None),
             alma_event_tx,
             onebot_connection_epoch: AtomicU64::new(0),
         })))
@@ -409,6 +465,207 @@ impl SharedState {
         self.group_titles.read().await.get(&group_id).cloned()
     }
 
+    pub async fn touch_group(
+        &self,
+        group_id: i64,
+        title: Option<&str>,
+        timestamp_secs: u64,
+    ) -> Result<(), String> {
+        let timestamp = normalize_timestamp(timestamp_secs).to_string();
+        let title = title.map(str::trim).filter(|t| !t.is_empty()).unwrap_or("");
+        if !title.is_empty() {
+            self.group_titles
+                .write()
+                .await
+                .insert(group_id, title.to_string());
+        }
+
+        let conn = self
+            .db
+            .connect()
+            .map_err(|e| format!("DB connect error: {}", e))?;
+        let group_id = group_id.to_string();
+
+        let mut insert = conn
+            .prepare(
+                "INSERT OR IGNORE INTO groups (group_id, title, last_active)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .await
+            .map_err(|e| format!("DB prepare error: {}", e))?;
+        insert
+            .execute([group_id.as_str(), title, timestamp.as_str()])
+            .await
+            .map_err(|e| format!("DB insert error: {}", e))?;
+
+        let mut update = conn
+            .prepare(
+                "UPDATE groups
+                 SET title = CASE WHEN ?2 <> '' THEN ?2 ELSE title END,
+                     last_active = ?3
+                 WHERE group_id = ?1",
+            )
+            .await
+            .map_err(|e| format!("DB prepare error: {}", e))?;
+        update
+            .execute([group_id.as_str(), title, timestamp.as_str()])
+            .await
+            .map_err(|e| format!("DB update error: {}", e))?;
+
+        Ok(())
+    }
+
+    pub async fn record_group_member(
+        &self,
+        group_id: i64,
+        user_id: i64,
+        display_name: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), String> {
+        let timestamp = normalize_timestamp(timestamp_secs).to_string();
+        let display_name = display_name.trim();
+        let display_name = if display_name.is_empty() {
+            format!("QQ user {}", user_id)
+        } else {
+            display_name.to_string()
+        };
+
+        let conn = self
+            .db
+            .connect()
+            .map_err(|e| format!("DB connect error: {}", e))?;
+        let group_id = group_id.to_string();
+        let user_id = user_id.to_string();
+
+        let mut insert = conn
+            .prepare(
+                "INSERT OR REPLACE INTO group_members
+                 (group_id, user_id, display_name, last_seen)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .await
+            .map_err(|e| format!("DB prepare error: {}", e))?;
+        insert
+            .execute([
+                group_id.as_str(),
+                user_id.as_str(),
+                display_name.as_str(),
+                timestamp.as_str(),
+            ])
+            .await
+            .map_err(|e| format!("DB insert error: {}", e))?;
+
+        Ok(())
+    }
+
+    pub async fn group_directory_snapshot(&self) -> Result<Vec<GroupDirectoryEntry>, String> {
+        let conn = self
+            .db
+            .connect()
+            .map_err(|e| format!("DB connect error: {}", e))?;
+        let mut groups = HashMap::<i64, GroupDirectoryEntry>::new();
+
+        let mut stmt = conn
+            .prepare("SELECT group_id, title, last_active FROM groups")
+            .await
+            .map_err(|e| format!("DB prepare error: {}", e))?;
+        let mut rows = stmt
+            .query(())
+            .await
+            .map_err(|e| format!("DB query error: {}", e))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("DB row error: {}", e))?
+        {
+            let group_id = row
+                .get::<String>(0)
+                .map_err(|e| format!("DB get group_id error: {}", e))?
+                .parse::<i64>()
+                .map_err(|e| format!("Invalid group_id in DB: {}", e))?;
+            let title = row
+                .get::<String>(1)
+                .map_err(|e| format!("DB get title error: {}", e))?;
+            let last_active = row
+                .get::<String>(2)
+                .map_err(|e| format!("DB get last_active error: {}", e))?
+                .parse::<u64>()
+                .unwrap_or(0);
+            groups.insert(
+                group_id,
+                GroupDirectoryEntry {
+                    group_id,
+                    title: if title.trim().is_empty() {
+                        None
+                    } else {
+                        Some(title)
+                    },
+                    last_active,
+                    members: Vec::new(),
+                },
+            );
+        }
+
+        let mut member_stmt = conn
+            .prepare(
+                "SELECT group_id, user_id, display_name, last_seen
+                 FROM group_members
+                 ORDER BY group_id ASC, last_seen DESC",
+            )
+            .await
+            .map_err(|e| format!("DB prepare error: {}", e))?;
+        let mut member_rows = member_stmt
+            .query(())
+            .await
+            .map_err(|e| format!("DB query error: {}", e))?;
+        while let Some(row) = member_rows
+            .next()
+            .await
+            .map_err(|e| format!("DB row error: {}", e))?
+        {
+            let group_id = row
+                .get::<String>(0)
+                .map_err(|e| format!("DB get member group_id error: {}", e))?
+                .parse::<i64>()
+                .map_err(|e| format!("Invalid member group_id in DB: {}", e))?;
+            let user_id = row
+                .get::<String>(1)
+                .map_err(|e| format!("DB get member user_id error: {}", e))?
+                .parse::<i64>()
+                .map_err(|e| format!("Invalid member user_id in DB: {}", e))?;
+            let display_name = row
+                .get::<String>(2)
+                .map_err(|e| format!("DB get display_name error: {}", e))?;
+            let last_seen = row
+                .get::<String>(3)
+                .map_err(|e| format!("DB get last_seen error: {}", e))?
+                .parse::<u64>()
+                .unwrap_or(0);
+
+            groups
+                .entry(group_id)
+                .or_insert_with(|| GroupDirectoryEntry::unknown(group_id))
+                .members
+                .push(GroupMember {
+                    group_id,
+                    user_id,
+                    display_name,
+                    last_seen,
+                });
+        }
+
+        for (group_id, title) in self.group_titles.read().await.iter() {
+            groups
+                .entry(*group_id)
+                .or_insert_with(|| GroupDirectoryEntry::unknown(*group_id))
+                .title = Some(title.clone());
+        }
+
+        let mut entries: Vec<_> = groups.into_values().collect();
+        entries.sort_by_key(|entry| entry.group_id);
+        Ok(entries)
+    }
+
     // ── OneBot connection ownership ─────────────────────────────────────
 
     pub fn register_onebot_connection(&self) -> u64 {
@@ -418,6 +675,44 @@ impl SharedState {
     pub fn is_current_onebot_connection(&self, connection_id: u64) -> bool {
         self.onebot_connection_epoch.load(Ordering::Acquire) == connection_id
     }
+
+    pub async fn set_onebot_api_handle(&self, handle: OneBotApiHandle) {
+        *self.onebot_api.write().await = Some(handle);
+    }
+
+    pub async fn get_onebot_api_handle(&self) -> Option<OneBotApiHandle> {
+        let handle = self.onebot_api.read().await.clone()?;
+        if self.is_current_onebot_connection(handle.connection_id) {
+            Some(handle)
+        } else {
+            None
+        }
+    }
+
+    pub async fn clear_onebot_api_handle(&self, connection_id: u64) {
+        let mut handle = self.onebot_api.write().await;
+        if handle
+            .as_ref()
+            .map(|current| current.connection_id == connection_id)
+            .unwrap_or(false)
+        {
+            *handle = None;
+        }
+    }
+
+    pub async fn has_onebot_api_handle(&self) -> bool {
+        self.get_onebot_api_handle().await.is_some()
+    }
+}
+
+fn normalize_timestamp(timestamp_secs: u64) -> u64 {
+    if timestamp_secs != 0 {
+        return timestamp_secs;
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 /// Safely truncate a string prefix by bytes without panicking on UTF-8 boundaries.
