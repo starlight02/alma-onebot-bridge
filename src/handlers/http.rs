@@ -159,7 +159,18 @@ async fn send_message_handler(
 
     let chunks = split_text(message, QQ_MSG_LIMIT);
     let session_key = format!("{}:{}", target_type, target_id);
-    let thread_id = state.get_thread_id(&session_key).await;
+    let thread_id = match state.get_thread_id(&session_key).await {
+        Ok(thread_id) => thread_id,
+        Err(e) => {
+            return Ok(json_status(
+                &ErrorResponse {
+                    status: "error",
+                    error: format!("failed to resolve bridge thread mapping: {}", e),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+    };
     let mut message_ids = Vec::new();
 
     for (idx, chunk) in chunks.iter().enumerate() {

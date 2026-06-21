@@ -35,7 +35,7 @@ pub async fn ensure_people_profile(
         .filter(|c| !c.is_empty());
     let group_id_str = group_id.map(|g| g.to_string());
 
-    let profile_path = resolve_profile_path_for_user(&state.config.people_dir, user_id);
+    let profile_path = resolve_profile_path_for_user(state, user_id).await;
     let preferred_name = sender
         .and_then(|s| s.nickname.as_deref())
         .filter(|n| !n.is_empty())
@@ -43,34 +43,53 @@ pub async fn ensure_people_profile(
 
     // ── Existing profile on disk: update group card if applicable ──────
     if profile_path.exists() {
-        if let Err(e) = sync_profile_file(
-            &profile_path,
+        match sync_profile_file_async(
+            profile_path.clone(),
             user_id,
-            preferred_name,
-            group_id_str.as_deref(),
-            card,
-        ) {
-            warn!(
-                "[People] Failed to sync people profile for user {}: {}",
-                user_id, e
-            );
-        } else {
-            let profile_name = profile_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&user_id_str)
-                .to_string();
-            state.set_profile(user_id_str.clone(), profile_name).await;
+            preferred_name.map(str::to_string),
+            group_id_str.clone(),
+            card.map(str::to_string),
+        )
+        .await
+        {
+            Err(e) => {
+                warn!(
+                    "[People] Failed to sync people profile for user {}: {}",
+                    user_id, e
+                );
+            }
+            Ok(()) => {
+                state
+                    .people_profile_paths
+                    .write()
+                    .await
+                    .insert(user_id_str.clone(), profile_path.clone());
+                let profile_name = profile_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&user_id_str)
+                    .to_string();
+                if let Err(e) = state.set_profile(user_id_str.clone(), profile_name).await {
+                    warn!("[People] Failed to persist profile cache: {}", e);
+                }
+            }
         }
         return;
     }
 
     // Cached DB mapping can be stale after manual cleanup or migration.
-    if state.has_profile(&user_id_str).await {
-        warn!(
-            "[People] Profile cache exists for user {}, but file is missing; recreating",
-            user_id
-        );
+    match state.has_profile(&user_id_str).await {
+        Ok(true) => {
+            warn!(
+                "[People] Profile cache exists for user {}, but file is missing; recreating",
+                user_id
+            );
+        }
+        Ok(false) => {}
+        Err(e) => warn!(
+            "[People] Failed to query profile cache for user {}: {}",
+            user_id, e
+        ),
     }
 
     // ── New profile: create with all available info ────────────────────
@@ -91,12 +110,11 @@ pub async fn ensure_people_profile(
     .await
     {
         Ok(resp) => {
-            if let Some(data) = resp.data {
-                if let Some(n) = data.get("nickname").and_then(|n| n.as_str()) {
-                    if !n.is_empty() {
-                        nickname = n.to_string();
-                    }
-                }
+            if let Some(data) = resp.data
+                && let Some(n) = data.get("nickname").and_then(|n| n.as_str())
+                && !n.is_empty()
+            {
+                nickname = n.to_string();
             }
         }
         Err(e) => {
@@ -115,24 +133,60 @@ pub async fn ensure_people_profile(
         );
     }
 
-    if let Err(e) = create_profile_file(&profile_path, user_id, &nickname, &group_cards) {
+    let group_cards_len = group_cards.len();
+    if let Err(e) =
+        create_profile_file_async(profile_path.clone(), user_id, nickname.clone(), group_cards)
+            .await
+    {
         tracing::error!("Failed to create people profile: {}", e);
         return;
     }
 
-    state.set_profile(user_id_str.clone(), user_id_str).await;
+    state
+        .people_profile_paths
+        .write()
+        .await
+        .insert(user_id_str.clone(), profile_path.clone());
+    if let Err(e) = state.set_profile(user_id_str.clone(), user_id_str).await {
+        warn!("[People] Failed to persist profile cache: {}", e);
+    }
     info!(
         "People profile created: {} → {}.md (group_cards: {})",
-        nickname,
-        user_id,
-        group_cards.len()
+        nickname, user_id, group_cards_len
     );
 }
 
-fn resolve_profile_path_for_user(people_dir: &Path, user_id: i64) -> PathBuf {
+async fn resolve_profile_path_for_user(state: &SharedState, user_id: i64) -> PathBuf {
     let user_id = user_id.to_string();
-    find_profile_path_by_qq_id(people_dir, &user_id)
-        .unwrap_or_else(|| people_dir.join(format!("{}.md", user_id)))
+    if let Some(path) = state
+        .people_profile_paths
+        .read()
+        .await
+        .get(&user_id)
+        .cloned()
+        && path.exists()
+    {
+        return path;
+    }
+
+    let people_dir = state.config.people_dir.clone();
+    let fallback = people_dir.join(format!("{}.md", user_id));
+    let user_id_for_scan = user_id.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        find_profile_path_by_qq_id(&people_dir, &user_id_for_scan).unwrap_or(fallback)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!("[People] Profile path scan task failed: {}", e);
+        state.config.people_dir.join(format!("{}.md", user_id))
+    });
+
+    state
+        .people_profile_paths
+        .write()
+        .await
+        .insert(user_id, path.clone());
+    path
 }
 
 fn find_profile_path_by_qq_id(people_dir: &Path, qq_id: &str) -> Option<PathBuf> {
@@ -184,6 +238,19 @@ fn create_profile_file(
     std::fs::write(path, content)?;
     info!("Created people profile: {:?}", path);
     Ok(())
+}
+
+async fn create_profile_file_async(
+    path: PathBuf,
+    user_id: i64,
+    nickname: String,
+    group_cards: HashMap<String, GroupCardInfo>,
+) -> Result<(), std::io::Error> {
+    tokio::task::spawn_blocking(move || {
+        create_profile_file(&path, user_id, &nickname, &group_cards)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Sync an existing profile file with bridge-managed metadata.
@@ -240,6 +307,26 @@ fn sync_profile_file(
         group_cards.len()
     );
     Ok(())
+}
+
+async fn sync_profile_file_async(
+    path: PathBuf,
+    user_id: i64,
+    preferred_name: Option<String>,
+    group_id: Option<String>,
+    card: Option<String>,
+) -> Result<(), std::io::Error> {
+    tokio::task::spawn_blocking(move || {
+        sync_profile_file(
+            &path,
+            user_id,
+            preferred_name.as_deref(),
+            group_id.as_deref(),
+            card.as_deref(),
+        )
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 fn extract_group_cards_from_body(body: &str) -> HashMap<String, GroupCardInfo> {
@@ -445,18 +532,53 @@ fn today_string() -> String {
 ///
 /// Matches by `qq_id` in YAML frontmatter, falls back to filename matching.
 /// Returns `None` if no profile found or profile exceeds 500 chars.
-pub fn find_sender_profile(
-    people_dir: &std::path::Path,
+pub async fn find_sender_profile(
+    state: &SharedState,
     qq_id: &str,
     display_name: &str,
 ) -> Option<String> {
+    let people_dir = state.config.people_dir.clone();
+    let qq_id = qq_id.to_string();
+    let display_name = display_name.to_string();
+    let cached_path = state.people_profile_paths.read().await.get(&qq_id).cloned();
+    let qq_id_for_scan = qq_id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        find_sender_profile_block(
+            &people_dir,
+            &qq_id_for_scan,
+            &display_name,
+            cached_path.as_deref(),
+        )
+    })
+    .await
+    .ok()
+    .flatten();
+
+    if let Some((path, block)) = result {
+        state.people_profile_paths.write().await.insert(qq_id, path);
+        Some(block)
+    } else {
+        None
+    }
+}
+
+fn find_sender_profile_block(
+    people_dir: &std::path::Path,
+    qq_id: &str,
+    display_name: &str,
+    cached_path: Option<&Path>,
+) -> Option<(PathBuf, String)> {
+    if let Some(path) = cached_path
+        && let Some(block) = profile_block_from_path(path, qq_id, display_name)
+    {
+        return Some((path.to_path_buf(), block));
+    }
+
     let entries = match std::fs::read_dir(people_dir) {
         Ok(e) => e,
         Err(_) => return None,
     };
-
-    let qq_id_quoted = format!("qq_id: \"{}\"", qq_id);
-    let qq_id_plain = format!("qq_id: {}", qq_id);
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -464,40 +586,54 @@ pub fn find_sender_profile(
             continue;
         }
 
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Some(block) = profile_block_from_path(&path, qq_id, display_name) else {
+            continue;
         };
+        return Some((path, block));
+    }
 
-        // Match by qq_id in frontmatter
-        let matched = content.contains(&qq_id_quoted) || content.contains(&qq_id_plain);
+    None
+}
 
-        // Fallback: match by filename == display_name (case-insensitive)
-        let matched = matched || {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|stem| stem.eq_ignore_ascii_case(display_name))
-                .unwrap_or(false)
-        };
+fn profile_block_from_path(path: &Path, qq_id: &str, display_name: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let (frontmatter, _) = split_frontmatter(&content);
+    let matched = extract_frontmatter_field_from_lines(&frontmatter, "qq_id")
+        .map(|value| value == qq_id)
+        .unwrap_or(false);
 
-        if matched && content.len() < 500 {
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(display_name);
+    // Fallback: match by filename == display_name (case-insensitive)
+    let matched = matched || {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|stem| stem.eq_ignore_ascii_case(display_name))
+            .unwrap_or(false)
+    };
 
-            return Some(format!(
-                "\n\n[SENDER PROFILE — {}]:\n{}\n[/SENDER PROFILE]",
-                name, content
-            ));
-        }
+    if matched && content.len() < 500 {
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(display_name);
+
+        return Some(format!(
+            "\n\n[SENDER PROFILE — {}]:\n{}\n[/SENDER PROFILE]",
+            name, content
+        ));
     }
 
     None
 }
 
 /// Count total .md profile files in the people directory.
-pub fn count_profiles(people_dir: &std::path::Path) -> usize {
+pub async fn count_profiles(state: &SharedState) -> usize {
+    let people_dir = state.config.people_dir.clone();
+    tokio::task::spawn_blocking(move || count_profiles_in_dir(&people_dir))
+        .await
+        .unwrap_or(0)
+}
+
+fn count_profiles_in_dir(people_dir: &std::path::Path) -> usize {
     std::fs::read_dir(people_dir)
         .map(|entries| {
             entries
@@ -512,7 +648,8 @@ pub fn count_profiles(people_dir: &std::path::Path) -> usize {
 mod tests {
     use super::{
         GroupCardInfo, build_default_body, create_profile_file, extract_group_cards_from_body,
-        format_group_cards_section, resolve_profile_path_for_user, sync_profile_file,
+        find_profile_path_by_qq_id, find_sender_profile_block, format_group_cards_section,
+        sync_profile_file,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -572,12 +709,44 @@ username: "Alice"
         )
         .unwrap();
 
-        let resolved = resolve_profile_path_for_user(&dir, 42);
+        let resolved = find_profile_path_by_qq_id(&dir, "42").unwrap_or_else(|| dir.join("42.md"));
         let fallback = dir.join("42.md");
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(resolved, existing);
         assert_ne!(resolved, fallback);
+    }
+
+    #[test]
+    fn find_sender_profile_matches_qq_id_exactly() {
+        let dir = temp_profile_dir("sender-profile");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("Wrong.md"),
+            r#"---
+qq_id: "12345"
+username: "Wrong"
+---
+# Wrong
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("Right.md"),
+            r#"---
+qq_id: "123"
+username: "Right"
+---
+# Right
+"#,
+        )
+        .unwrap();
+
+        let (_path, profile) = find_sender_profile_block(&dir, "123", "Someone", None).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(profile.contains("SENDER PROFILE — Right"));
+        assert!(!profile.contains("SENDER PROFILE — Wrong"));
     }
 
     #[test]

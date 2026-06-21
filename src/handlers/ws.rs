@@ -1,7 +1,7 @@
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::panic::AssertUnwindSafe;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 use warp::ws::{Message, WebSocket};
@@ -67,34 +67,10 @@ pub async fn handle_ws_connection(
 
             match alma_event_rx.recv().await {
                 Ok(event) => {
-                    // Wrap in catch_unwind so a single panic doesn't kill
-                    // the entire Alma→QQ forwarding channel (e.g. from
-                    // UTF-8 boundary issues in dedup logic on CJK text).
-                    let result = AssertUnwindSafe(handle_alma_event(
-                        &event,
-                        &fwd_state,
-                        &fwd_tx,
-                        &fwd_pending,
-                    ))
-                    .catch_unwind()
-                    .await;
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            warn!("[Alma→QQ] Forwarding error: {}", e);
-                        }
-                        Err(panic_info) => {
-                            let msg = panic_info
-                                .downcast_ref::<String>()
-                                .map(|s| s.as_str())
-                                .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                                .unwrap_or("(non-string panic)");
-                            error!(
-                                "[Alma→QQ] handle_alma_event panicked (thread={}): {}. \
-                                 Forwarding task survives — next event will retry.",
-                                event.thread_id, msg
-                            );
-                        }
+                    if let Err(e) =
+                        handle_alma_event(&event, &fwd_state, &fwd_tx, &fwd_pending).await
+                    {
+                        warn!("[Alma→QQ] Forwarding error: {}", e);
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -179,11 +155,11 @@ pub async fn handle_ws_connection(
         // ── Event (has post_type field) ──────────────────────────────
         if let Some(post_type) = json.get("post_type").and_then(|p| p.as_str()) {
             // Capture self_id from first event
-            if self_id.is_none() {
-                if let Some(sid) = json.get("self_id").and_then(|s| s.as_i64()) {
-                    self_id = Some(sid);
-                    info!("OneBot bot QQ ID: {}", sid);
-                }
+            if self_id.is_none()
+                && let Some(sid) = json.get("self_id").and_then(|s| s.as_i64())
+            {
+                self_id = Some(sid);
+                info!("OneBot bot QQ ID: {}", sid);
             }
 
             match post_type {
@@ -201,23 +177,8 @@ pub async fn handle_ws_connection(
                     let tx = ws_tx.clone();
                     let pc = pending_calls.clone();
                     tokio::spawn(async move {
-                        let result = AssertUnwindSafe(process_message_event(&event, &st, &tx, &pc))
-                            .catch_unwind()
-                            .await;
-                        match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => error!("Message processing error: {}", e),
-                            Err(panic_info) => {
-                                let msg = panic_info
-                                    .downcast_ref::<String>()
-                                    .map(|s| s.as_str())
-                                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                                    .unwrap_or("(non-string panic)");
-                                error!(
-                                    "process_message_event panicked for message_id={:?}: {}",
-                                    event.message_id, msg
-                                );
-                            }
+                        if let Err(e) = process_message_event(&event, &st, &tx, &pc).await {
+                            error!("Message processing error: {}", e);
                         }
                     });
                 }
@@ -245,35 +206,10 @@ pub async fn handle_ws_connection(
                         .unwrap_or("unknown");
                     match notice_type {
                         "group_recall" => {
-                            let group_id =
-                                json.get("group_id").and_then(|g| g.as_i64()).unwrap_or(0);
-                            let user_id = json.get("user_id").and_then(|u| u.as_i64()).unwrap_or(0);
-                            let operator_id = json
-                                .get("operator_id")
-                                .and_then(|o| o.as_i64())
-                                .unwrap_or(0);
-                            let msg_id =
-                                json.get("message_id").and_then(|m| m.as_i64()).unwrap_or(0);
-                            if user_id == operator_id {
-                                info!(
-                                    "[Recall] User {} recalled message {} in group {}",
-                                    user_id, msg_id, group_id
-                                );
-                            } else {
-                                info!(
-                                    "[Recall] Admin {} recalled message {} from user {} in group {}",
-                                    operator_id, msg_id, user_id, group_id
-                                );
-                            }
+                            log_group_recall(&json);
                         }
                         "friend_recall" => {
-                            let user_id = json.get("user_id").and_then(|u| u.as_i64()).unwrap_or(0);
-                            let msg_id =
-                                json.get("message_id").and_then(|m| m.as_i64()).unwrap_or(0);
-                            info!(
-                                "[Recall] User {} recalled private message {}",
-                                user_id, msg_id
-                            );
+                            log_friend_recall(&json);
                         }
                         _ => {
                             debug!("Notice event: {}", notice_type);
@@ -300,6 +236,75 @@ pub async fn handle_ws_connection(
             .unwrap_or_default()
     );
     state.clear_onebot_api_handle(connection_id).await;
+    let _ = ws_tx.send(Message::close());
+    drop(ws_tx);
     forwarding.abort();
-    writer.abort();
+    if timeout(Duration::from_secs(2), writer).await.is_err() {
+        warn!(
+            "WS writer did not finish after close frame for connection {}; aborting",
+            connection_id
+        );
+    }
+}
+
+fn json_i64(json: &serde_json::Value, key: &str) -> Option<i64> {
+    json.get(key).and_then(|v| v.as_i64())
+}
+
+fn log_group_recall(json: &serde_json::Value) {
+    let Some(group_id) = json_i64(json, "group_id") else {
+        warn!("[Recall] group_recall missing group_id");
+        return;
+    };
+    let Some(user_id) = json_i64(json, "user_id") else {
+        warn!(
+            "[Recall] group_recall missing user_id in group {}",
+            group_id
+        );
+        return;
+    };
+    let Some(operator_id) = json_i64(json, "operator_id") else {
+        warn!(
+            "[Recall] group_recall missing operator_id for user {} in group {}",
+            user_id, group_id
+        );
+        return;
+    };
+    let Some(msg_id) = json_i64(json, "message_id") else {
+        warn!(
+            "[Recall] group_recall missing message_id for user {} in group {}",
+            user_id, group_id
+        );
+        return;
+    };
+
+    if user_id == operator_id {
+        info!(
+            "[Recall] User {} recalled message {} in group {}",
+            user_id, msg_id, group_id
+        );
+    } else {
+        info!(
+            "[Recall] Admin {} recalled message {} from user {} in group {}",
+            operator_id, msg_id, user_id, group_id
+        );
+    }
+}
+
+fn log_friend_recall(json: &serde_json::Value) {
+    let Some(user_id) = json_i64(json, "user_id") else {
+        warn!("[Recall] friend_recall missing user_id");
+        return;
+    };
+    let Some(msg_id) = json_i64(json, "message_id") else {
+        warn!(
+            "[Recall] friend_recall missing message_id for user {}",
+            user_id
+        );
+        return;
+    };
+    info!(
+        "[Recall] User {} recalled private message {}",
+        user_id, msg_id
+    );
 }

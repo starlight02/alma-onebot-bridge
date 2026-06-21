@@ -157,6 +157,7 @@ pub async fn send_text_message(
 /// Convenience: send a text message as a reply via OneBot send_msg API.
 /// Prepends a reply segment to the message array so QQ clients show the quoted message.
 /// If `at_user_id` is Some and message_type is "group", also adds an @mention segment.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_reply_message(
     ws_tx: &mpsc::UnboundedSender<Message>,
     pending: &PendingCalls,
@@ -170,10 +171,10 @@ pub async fn send_reply_message(
     let mut segments = vec![MessageSegment::reply(reply_to_id)];
 
     // Add @mention for group messages
-    if message_type == "group" {
-        if let Some(uid) = at_user_id {
-            segments.push(MessageSegment::at(uid));
-        }
+    if message_type == "group"
+        && let Some(uid) = at_user_id
+    {
+        segments.push(MessageSegment::at(uid));
     }
 
     segments.extend(text_to_segments(text));

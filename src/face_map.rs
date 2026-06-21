@@ -1,8 +1,8 @@
-/// QQ face expression ID → human-readable name mapping.
-///
-/// Covers the most commonly used QQ "super expressions" (超级表情).
-/// Source: go-onebot-agent / NapCat face table.
-/// IDs not in this table fall back to `[emoji:face_X]`.
+//! QQ face expression ID → human-readable name mapping.
+//!
+//! Covers the most commonly used QQ "super expressions" (超级表情).
+//! Source: go-onebot-agent / NapCat face table.
+//! IDs not in this table fall back to `[emoji:face_X]`.
 
 /// Look up a QQ face expression name by its numeric ID.
 /// Returns `None` for unknown IDs.
@@ -165,11 +165,23 @@ pub fn face_id(name: &str) -> Option<&'static str> {
         for id in 0..=500 {
             let id_str = Box::leak(id.to_string().into_boxed_str());
             if let Some(n) = face_name(id_str) {
-                m.insert(n, &*id_str);
+                m.entry(n).or_insert(&*id_str);
             }
         }
         m
     });
 
     map.get(name).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{face_id, face_name};
+
+    #[test]
+    fn duplicate_face_names_keep_first_known_id() {
+        assert_eq!(face_name("264"), Some("捂脸"));
+        assert_eq!(face_name("319"), Some("捂脸"));
+        assert_eq!(face_id("捂脸"), Some("264"));
+    }
 }

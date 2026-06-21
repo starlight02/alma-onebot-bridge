@@ -136,15 +136,42 @@ pub fn contains_at_bot(segments: &[MessageSegment], bot_id: i64) -> bool {
 /// Remove @bot mentions from text content, returning cleaned text.
 pub fn clean_at_from_text(text: &str, bot_id: i64) -> String {
     let bot_id_str = bot_id.to_string();
-    let patterns = [
-        format!("[CQ:at,qq={}]", bot_id_str),
-        format!("[CQ:at,qq={},name=.*?]", bot_id_str),
-    ];
-    let mut result = text.to_string();
-    for pat in &patterns {
-        result = result.replace(pat, "");
+
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find("[CQ:at") {
+        result.push_str(&remaining[..start]);
+        let cq_start = &remaining[start..];
+        let Some(end) = cq_start.find(']') else {
+            result.push_str(cq_start);
+            return result.trim().to_string();
+        };
+
+        let tag = &cq_start[..=end];
+        if !cq_at_mentions_bot(tag, &bot_id_str) {
+            result.push_str(tag);
+        }
+        remaining = &cq_start[end + 1..];
     }
+    result.push_str(remaining);
     result.trim().to_string()
+}
+
+fn cq_at_mentions_bot(tag: &str, bot_id: &str) -> bool {
+    let Some(inner) = tag.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    let mut parts = inner.split(',');
+    if parts.next() != Some("CQ:at") {
+        return false;
+    }
+
+    parts.any(|part| {
+        part.split_once('=')
+            .map(|(key, value)| key == "qq" && (value == bot_id || value == "all"))
+            .unwrap_or(false)
+    })
 }
 
 /// Extract the message ID from a reply segment (first element in the array).
@@ -323,8 +350,8 @@ pub fn text_to_segments(text: &str) -> Vec<MessageSegment> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageSegment, contains_at_bot, convert_faces_to_text, extract_forward_id,
-        extract_reply_id,
+        MessageSegment, clean_at_from_text, contains_at_bot, convert_faces_to_text,
+        extract_forward_id, extract_reply_id,
     };
 
     #[test]
@@ -335,6 +362,22 @@ mod tests {
         }];
 
         assert!(contains_at_bot(&segments, 123456));
+    }
+
+    #[test]
+    fn clean_at_from_text_removes_named_cq_at_tag() {
+        assert_eq!(
+            clean_at_from_text("[CQ:at,qq=123456,name=Alma] 你好", 123456),
+            "你好"
+        );
+    }
+
+    #[test]
+    fn clean_at_from_text_preserves_other_cq_at_tags() {
+        assert_eq!(
+            clean_at_from_text("[CQ:at,qq=654321,name=Alice] 你好", 123456),
+            "[CQ:at,qq=654321,name=Alice] 你好"
+        );
     }
 
     #[test]

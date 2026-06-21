@@ -14,7 +14,6 @@ use crate::onebot::{
 };
 use crate::people::ensure_people_profile;
 use crate::state::SharedState;
-use serde_json;
 
 pub(crate) const QQ_MSG_LIMIT: usize = 4500;
 const ALMA_ERROR_REPLY: &str = "抱歉，我暂时无法回复 >_<";
@@ -66,8 +65,21 @@ pub async fn process_message_event(
     // ── Identify sender and chat context ─────────────────────────────────
     let bot_id = event.self_id;
     let is_group = message_type == "group";
-    let user_id = event.user_id.unwrap_or(0);
-    let group_id = event.group_id.unwrap_or(0);
+    let event_time = event.time.unwrap_or_else(current_unix_timestamp);
+    let user_id = event
+        .user_id
+        .ok_or_else(|| "OneBot message event missing user_id".to_string())?;
+    let group_id = if is_group {
+        Some(
+            event
+                .group_id
+                .filter(|id| *id > 0)
+                .ok_or_else(|| "OneBot group message event missing group_id".to_string())?,
+        )
+    } else {
+        None
+    };
+    let group_id_value = group_id.unwrap_or_default();
     let sender_nickname = event
         .sender
         .as_ref()
@@ -87,24 +99,27 @@ pub async fn process_message_event(
     };
 
     let group_title = if is_group {
-        if let Some(title) = state.get_group_title(group_id).await {
+        if let Some(title) = state.get_group_title(group_id_value).await {
             Some(title)
         } else {
             match get_group_name(
                 ws_tx,
                 pending,
-                group_id,
+                group_id_value,
                 state.config.onebot_api_timeout_secs,
             )
             .await
             {
                 Ok(Some(title)) => {
-                    state.set_group_title(group_id, title.clone()).await;
+                    state.set_group_title(group_id_value, title.clone()).await;
                     Some(title)
                 }
                 Ok(None) => None,
                 Err(e) => {
-                    debug!("[GroupMeta] get_group_name failed for {}: {}", group_id, e);
+                    debug!(
+                        "[GroupMeta] get_group_name failed for {}: {}",
+                        group_id_value, e
+                    );
                     None
                 }
             }
@@ -116,24 +131,26 @@ pub async fn process_message_event(
     // ── Record to group history (before @bot gate, so ALL messages are captured) ──
     let observed_text = observed_message_text(&text, &media_lines);
     if is_group && !observed_text.is_empty() {
-        let session_key = format!("group:{}", group_id);
+        let session_key = format!("group:{}", group_id_value);
         let message_id = event.message_id;
         if let Err(e) = state
-            .touch_group(group_id, group_title.as_deref(), event.time.unwrap_or(0))
+            .touch_group(group_id_value, group_title.as_deref(), event_time)
             .await
         {
-            debug!("[GroupDirectory] Failed to touch group {}: {}", group_id, e);
+            debug!(
+                "[GroupDirectory] Failed to touch group {}: {}",
+                group_id_value, e
+            );
         }
-        if user_id != 0 {
-            if let Err(e) = state
-                .record_group_member(group_id, user_id, display_name, event.time.unwrap_or(0))
+        if user_id != 0
+            && let Err(e) = state
+                .record_group_member(group_id_value, user_id, display_name, event_time)
                 .await
-            {
-                debug!(
-                    "[GroupDirectory] Failed to record member {} in group {}: {}",
-                    user_id, group_id, e
-                );
-            }
+        {
+            debug!(
+                "[GroupDirectory] Failed to record member {} in group {}: {}",
+                user_id, group_id_value, e
+            );
         }
         state
             .record_group_message(
@@ -141,18 +158,18 @@ pub async fn process_message_event(
                 crate::state::GroupMessage {
                     display_name: display_name.to_string(),
                     text: observed_text.clone(),
-                    timestamp: event.time.unwrap_or(0),
+                    timestamp: event_time,
                     message_id,
                     is_bot: false,
                 },
             )
             .await;
         if let Err(e) = group_log::append_alma_group_log(
-            group_id,
+            group_id_value,
             display_name,
             &observed_text,
             false,
-            event.time.unwrap_or(0),
+            event_time,
             message_id,
             Some(user_id),
             None,
@@ -168,7 +185,9 @@ pub async fn process_message_event(
 
     // ── Message ID & Reply context ────────────────────────────────────────
     // Use real OneBot message_id for [msg:N] (matches Telegram bridge pattern)
-    let message_id = event.message_id.unwrap_or(0);
+    let message_id = event
+        .message_id
+        .ok_or_else(|| "OneBot message event missing message_id".to_string())?;
 
     // Handle reply/quoting: extract reply segment and fetch quoted message
     let mut quoted_image_urls = Vec::new();
@@ -233,7 +252,7 @@ pub async fn process_message_event(
     };
 
     let source = if is_group {
-        format!("群{}", group_id)
+        format!("群{}", group_id_value)
     } else {
         "私聊".to_string()
     };
@@ -255,11 +274,7 @@ pub async fn process_message_event(
                     .iter()
                     .take(20) // Limit to first 20 nodes to avoid huge messages
                     .map(|(name, text)| {
-                        let truncated = if text.len() > 100 {
-                            format!("{}...", &text[..100])
-                        } else {
-                            text.clone()
-                        };
+                        let truncated = truncate_with_ellipsis(text, 100);
                         format!("{}: \"{}\"", name, truncated)
                     })
                     .collect();
@@ -292,7 +307,7 @@ pub async fn process_message_event(
 
     // ── Ensure People Profile ────────────────────────────────────────────
     // Pass group_id so people.rs can record/update the group card (群名片).
-    let group_id_opt = if is_group { Some(group_id) } else { None };
+    let group_id_opt = group_id;
     ensure_people_profile(
         user_id,
         event.sender.as_ref(),
@@ -305,19 +320,24 @@ pub async fn process_message_event(
 
     // ── Session key & Alma thread ────────────────────────────────────────
     let session_key = if is_group {
-        format!("group:{}", group_id)
+        format!("group:{}", group_id_value)
     } else {
         format!("private:{}", user_id)
     };
 
-    let (thread_id, has_existing_thread) =
-        resolve_thread_for_session(state, &session_key, is_group, group_id, sender_nickname)
-            .await?;
+    let (thread_id, has_existing_thread) = resolve_thread_for_session(
+        state,
+        &session_key,
+        is_group,
+        group_id_value,
+        sender_nickname,
+    )
+    .await?;
 
     // ── Call Alma AI via WebSocket (full chat pipeline) ──────────────────
     if let Err(e) = ensure_alma_ws_client(state).await {
         warn!("[Alma] WebSocket client not connected: {}", e);
-        let target_id = if is_group { group_id } else { user_id };
+        let target_id = if is_group { group_id_value } else { user_id };
         let target_type = if is_group { "group" } else { "private" };
         let _ = send_text_message(
             ws_tx,
@@ -390,63 +410,7 @@ pub async fn process_message_event(
     );
 
     // ── Download images and file attachments ───────────────────────────────
-    let mut file_parts = Vec::new();
-
-    // Download images
-    for (idx, url) in image_urls.iter().enumerate() {
-        let default_filename = format!("image_{}.png", idx + 1);
-        match download_media_as_file_part(&state.http_client, url, &default_filename).await {
-            Ok(part) => {
-                info!(
-                    "[Alma] Successfully downloaded and prepared image part: {}",
-                    url
-                );
-                file_parts.push(part);
-            }
-            Err(e) => {
-                warn!("[Alma] Failed to download image {}: {}", url, e);
-            }
-        }
-    }
-
-    // Download quoted/replied images too, so Alma can see the referenced image
-    // instead of only a textual placeholder like "[Image]". This matches the
-    // built-in Telegram bridge behavior more closely.
-    for (idx, url) in quoted_image_urls.iter().enumerate() {
-        let default_filename = format!("quoted_image_{}.png", idx + 1);
-        match download_media_as_file_part(&state.http_client, url, &default_filename).await {
-            Ok(part) => {
-                info!(
-                    "[Alma] Successfully downloaded and prepared quoted image part: {}",
-                    url
-                );
-                file_parts.push(part);
-            }
-            Err(e) => {
-                warn!("[Alma] Failed to download quoted image {}: {}", url, e);
-            }
-        }
-    }
-
-    // Download file attachments
-    let file_attachments = crate::onebot::event::extract_files(segments);
-    for (filename, url) in &file_attachments {
-        match download_media_as_file_part(&state.http_client, url, filename).await {
-            Ok(part) => {
-                info!(
-                    "[Alma] Successfully downloaded and prepared file part: {} ({})",
-                    filename, url
-                );
-                file_parts.push(part);
-            }
-            Err(e) => {
-                warn!(
-                    "[Alma] Failed to download file {} from {}: {}",
-                    filename, url, e
-                );
-            }
-        }
-    }
+    let file_parts = build_file_parts(state, &image_urls, &quoted_image_urls, segments).await;
 
     // Build media suffix: only keep other media type indicators (like Voice/Video)
     // since images/files are attached natively as file parts.
@@ -476,47 +440,19 @@ pub async fn process_message_event(
     };
 
     // ── Build ephemeralContext with SENDER PROFILE ─────────────────────────
-    let mut ephemeral_ctx = String::new();
-    ephemeral_ctx.push_str(&build_telegram_like_channel_system_context(
-        is_group,
-        sender_nickname,
-        group_title.as_deref(),
-        if is_group { Some(group_id) } else { None },
-        state.config.bridge_port,
-    ));
-
-    // Scan people profiles for the sender's qq_id
-    if let Some(profile_block) = crate::people::find_sender_profile(
-        &state.config.people_dir,
-        &user_id.to_string(),
-        display_name,
-    ) {
-        ephemeral_ctx.push_str(&profile_block);
-    }
-
-    // Add PEOPLE PROFILES summary line
-    let profile_count = crate::people::count_profiles(&state.config.people_dir);
-    if profile_count > 0 {
-        ephemeral_ctx.push_str(&format!(
-            "\n\nPEOPLE PROFILES — You know {} people. Use `alma people list` or `alma people show <name>` to look up profiles on demand.",
-            profile_count
-        ));
-    }
-
-    // Add group chat history (if available and in group context)
-    if is_group {
-        let history_session_key = format!("group:{}", group_id);
-        let history = state.get_group_history(&history_session_key).await;
-        if !history.is_empty() {
-            info!(
-                "[GroupHistory] Injecting {} messages into ephemeralContext for {}",
-                history.len(),
-                history_session_key
-            );
-            ephemeral_ctx.push_str("\n\n");
-            ephemeral_ctx.push_str(&build_recent_chat_history_context(&history));
-        }
-    }
+    let ephemeral_ctx = build_ephemeral_context(
+        state,
+        EphemeralContextInput {
+            is_group,
+            sender_nickname,
+            group_title: group_title.as_deref(),
+            group_id,
+            group_id_value,
+            user_id,
+            display_name,
+        },
+    )
+    .await;
 
     // Log ephemeral context for debugging
     if ephemeral_ctx.is_empty() {
@@ -533,7 +469,7 @@ pub async fn process_message_event(
     // If configured, sends a brief placeholder message before generation starts,
     // so users see activity while Alma is processing. OneBot v11 has no typing API.
     if let Some(ref thinking_msg) = state.config.thinking_message {
-        let target_id = if is_group { group_id } else { user_id };
+        let target_id = if is_group { group_id_value } else { user_id };
         let target_type = if is_group { "group" } else { "private" };
         match send_text_message(
             ws_tx,
@@ -562,7 +498,7 @@ pub async fn process_message_event(
         let mut thinking_content = None;
         for attempt in 0..=max_retries {
             if attempt > 0 {
-                let delay = base_delay_ms * (1 << (attempt - 1)); // exponential backoff
+                let delay = retry_delay_ms(base_delay_ms, attempt); // exponential backoff
                 info!(
                     "[Alma] Retry {}/{} for thread {} in {}ms",
                     attempt, max_retries, thread_id, delay
@@ -626,38 +562,32 @@ pub async fn process_message_event(
         return Ok(());
     }
 
-    let target_id = if is_group { group_id } else { user_id };
+    let target_id = if is_group { group_id_value } else { user_id };
     let target_type = if is_group { "group" } else { "private" };
 
-    // Register the full normalized reply once so the later Alma
-    // `message_updated` event can be deduped even if QQ delivery was split
-    // into multiple chunks or paragraphs.
-    state.register_sent_reply(&thread_id, &reply).await;
-
     // ── Send thinking content as separate message (if enabled) ────────────
-    if state.config.show_thinking {
-        if let Some(ref think_text) = thinking {
-            if !think_text.is_empty() {
-                info!(
-                    "[Thinking] Sending thinking content ({} chars)",
-                    think_text.len()
-                );
-                let think_chunks = split_text(think_text, QQ_MSG_LIMIT);
-                for chunk in &think_chunks {
-                    match send_text_message(
-                        ws_tx,
-                        pending,
-                        target_type,
-                        target_id,
-                        chunk,
-                        state.config.onebot_api_timeout_secs,
-                    )
-                    .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => tracing::debug!("[Thinking] Failed to send thinking: {}", e),
-                    }
-                }
+    if state.config.show_thinking
+        && let Some(ref think_text) = thinking
+        && !think_text.is_empty()
+    {
+        info!(
+            "[Thinking] Sending thinking content ({} chars)",
+            think_text.len()
+        );
+        let think_chunks = split_text(think_text, QQ_MSG_LIMIT);
+        for chunk in &think_chunks {
+            match send_text_message(
+                ws_tx,
+                pending,
+                target_type,
+                target_id,
+                chunk,
+                state.config.onebot_api_timeout_secs,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => tracing::debug!("[Thinking] Failed to send thinking: {}", e),
             }
         }
     }
@@ -674,9 +604,6 @@ pub async fn process_message_event(
     for para in &paragraphs {
         let chunks = split_text(para, QQ_MSG_LIMIT);
         for chunk in &chunks {
-            // Register this reply for dedup (bidirectional)
-            state.register_sent_reply(&thread_id, chunk).await;
-
             // Reply to user's triggering message (first chunk only, groups + private)
             let result = if is_first {
                 is_first = false;
@@ -717,6 +644,7 @@ pub async fn process_message_event(
 
             match result {
                 Ok(resp) => {
+                    state.register_sent_reply(&thread_id, chunk).await;
                     let msg_id = resp
                         .data
                         .as_ref()
@@ -725,7 +653,7 @@ pub async fn process_message_event(
                     if is_group {
                         record_alma_group_output(
                             state,
-                            group_id,
+                            group_id_value,
                             chunk,
                             msg_id,
                             current_unix_timestamp(),
@@ -750,6 +678,114 @@ pub async fn process_message_event(
     Ok(())
 }
 
+async fn build_file_parts(
+    state: &SharedState,
+    image_urls: &[String],
+    quoted_image_urls: &[String],
+    segments: &[crate::onebot::event::MessageSegment],
+) -> Vec<serde_json::Value> {
+    let mut file_parts = Vec::new();
+
+    for (idx, url) in image_urls.iter().enumerate() {
+        let default_filename = format!("image_{}.png", idx + 1);
+        match download_media_as_file_part(&state.http_client, url, &default_filename).await {
+            Ok(part) => {
+                info!(
+                    "[Alma] Successfully downloaded and prepared image part: {}",
+                    url
+                );
+                file_parts.push(part);
+            }
+            Err(e) => warn!("[Alma] Failed to download image {}: {}", url, e),
+        }
+    }
+
+    // Download quoted/replied images too, so Alma can see the referenced image
+    // instead of only a textual placeholder like "[Image]".
+    for (idx, url) in quoted_image_urls.iter().enumerate() {
+        let default_filename = format!("quoted_image_{}.png", idx + 1);
+        match download_media_as_file_part(&state.http_client, url, &default_filename).await {
+            Ok(part) => {
+                info!(
+                    "[Alma] Successfully downloaded and prepared quoted image part: {}",
+                    url
+                );
+                file_parts.push(part);
+            }
+            Err(e) => warn!("[Alma] Failed to download quoted image {}: {}", url, e),
+        }
+    }
+
+    for (filename, url) in &crate::onebot::event::extract_files(segments) {
+        match download_media_as_file_part(&state.http_client, url, filename).await {
+            Ok(part) => {
+                info!(
+                    "[Alma] Successfully downloaded and prepared file part: {} ({})",
+                    filename, url
+                );
+                file_parts.push(part);
+            }
+            Err(e) => warn!(
+                "[Alma] Failed to download file {} from {}: {}",
+                filename, url, e
+            ),
+        }
+    }
+
+    file_parts
+}
+
+struct EphemeralContextInput<'a> {
+    is_group: bool,
+    sender_nickname: &'a str,
+    group_title: Option<&'a str>,
+    group_id: Option<i64>,
+    group_id_value: i64,
+    user_id: i64,
+    display_name: &'a str,
+}
+
+async fn build_ephemeral_context(state: &SharedState, input: EphemeralContextInput<'_>) -> String {
+    let mut ephemeral_ctx = build_telegram_like_channel_system_context(
+        input.is_group,
+        input.sender_nickname,
+        input.group_title,
+        input.group_id,
+        state.config.bridge_port,
+    );
+
+    if let Some(profile_block) =
+        crate::people::find_sender_profile(state, &input.user_id.to_string(), input.display_name)
+            .await
+    {
+        ephemeral_ctx.push_str(&profile_block);
+    }
+
+    let profile_count = crate::people::count_profiles(state).await;
+    if profile_count > 0 {
+        ephemeral_ctx.push_str(&format!(
+            "\n\nPEOPLE PROFILES — You know {} people. Use `alma people list` or `alma people show <name>` to look up profiles on demand.",
+            profile_count
+        ));
+    }
+
+    if input.is_group {
+        let history_session_key = format!("group:{}", input.group_id_value);
+        let history = state.get_group_history(&history_session_key).await;
+        if !history.is_empty() {
+            info!(
+                "[GroupHistory] Injecting {} messages into ephemeralContext for {}",
+                history.len(),
+                history_session_key
+            );
+            ephemeral_ctx.push_str("\n\n");
+            ephemeral_ctx.push_str(&build_recent_chat_history_context(&history));
+        }
+    }
+
+    ephemeral_ctx
+}
+
 /// Handle an Alma event for bidirectional forwarding (Alma GUI → QQ).
 ///
 /// When someone types in the Alma GUI and the assistant responds,
@@ -765,7 +801,7 @@ pub async fn handle_alma_event(
     }
 
     // Only forward assistant messages from threads we're tracking
-    let target = match state.get_qq_target(&event.thread_id).await {
+    let target = match state.get_qq_target(&event.thread_id).await? {
         Some(t) => t,
         None => {
             // Promoted to info: critical for diagnosing "Alma GUI reply not
@@ -803,25 +839,24 @@ pub async fn handle_alma_event(
         event.message_text.len()
     );
 
-    if state.config.show_thinking {
-        if let Some(ref think_text) = event.thinking_text {
-            if !think_text.is_empty() {
-                let think_chunks = split_text(think_text, QQ_MSG_LIMIT);
-                for chunk in &think_chunks {
-                    match send_text_message(
-                        ws_tx,
-                        pending,
-                        &target.target_type,
-                        target.target_id,
-                        chunk,
-                        state.config.onebot_api_timeout_secs,
-                    )
-                    .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => tracing::debug!("[Alma→QQ] Failed to forward thinking: {}", e),
-                    }
-                }
+    if state.config.show_thinking
+        && let Some(ref think_text) = event.thinking_text
+        && !think_text.is_empty()
+    {
+        let think_chunks = split_text(think_text, QQ_MSG_LIMIT);
+        for chunk in &think_chunks {
+            match send_text_message(
+                ws_tx,
+                pending,
+                &target.target_type,
+                target.target_id,
+                chunk,
+                state.config.onebot_api_timeout_secs,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => tracing::debug!("[Alma→QQ] Failed to forward thinking: {}", e),
             }
         }
     }
@@ -886,7 +921,7 @@ async fn resolve_thread_for_session(
     group_id: i64,
     sender_nickname: &str,
 ) -> Result<(String, bool), String> {
-    if let Some(thread_id) = state.get_thread_id(session_key).await {
+    if let Some(thread_id) = state.get_thread_id(session_key).await? {
         match alma::thread_exists(state, &thread_id).await {
             Ok(true) => return Ok((thread_id, true)),
             Ok(false) => warn!(
@@ -906,16 +941,16 @@ async fn resolve_thread_for_session(
     info!("[Thread] Created: '{}' → {}", title, thread_id);
     state
         .set_thread_id(session_key.to_string(), thread_id.clone())
-        .await;
+        .await?;
     Ok((thread_id, false))
 }
 
 async fn ensure_alma_ws_client(state: &SharedState) -> Result<AlmaWsClient, String> {
     if let Some(client) = state.get_alma_ws().await {
-        if client.is_connected() {
-            return Ok(client);
+        if !client.is_connected() {
+            warn!("[Alma] Existing WebSocket is reconnecting");
         }
-        warn!("[Alma] Existing WebSocket is closed; reconnecting");
+        return Ok(client);
     }
 
     let client = AlmaWsClient::connect(&state.config.alma_api).await?;
@@ -1102,6 +1137,16 @@ fn truncate_with_ellipsis(text: &str, limit: usize) -> String {
     format!("{}...", &text[..end])
 }
 
+fn retry_delay_ms(base_delay_ms: u64, attempt: u32) -> u64 {
+    const MAX_RETRY_DELAY_MS: u64 = 60_000;
+
+    let exponent = attempt.saturating_sub(1).min(20);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    base_delay_ms
+        .saturating_mul(multiplier)
+        .min(MAX_RETRY_DELAY_MS)
+}
+
 fn floor_char_boundary(text: &str, max_bytes: usize) -> usize {
     if text.len() <= max_bytes {
         return text.len();
@@ -1128,6 +1173,7 @@ fn cleaned_command_for_group(text: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_telegram_like_message_text(
     is_group: bool,
     _is_reply_to_bot: bool,
@@ -1141,23 +1187,23 @@ fn build_telegram_like_message_text(
     reply_context: Option<&str>,
 ) -> String {
     let mut body = text.trim().to_string();
-    if let Some(prefix) = forward_context {
-        if !prefix.is_empty() {
-            body = if body.is_empty() {
-                prefix.to_string()
-            } else {
-                format!("{} {}", prefix, body)
-            };
-        }
+    if let Some(prefix) = forward_context
+        && !prefix.is_empty()
+    {
+        body = if body.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{} {}", prefix, body)
+        };
     }
-    if let Some(prefix) = reply_context {
-        if !prefix.is_empty() {
-            body = if body.is_empty() {
-                prefix.to_string()
-            } else {
-                format!("{} {}", prefix, body)
-            };
-        }
+    if let Some(prefix) = reply_context
+        && !prefix.is_empty()
+    {
+        body = if body.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{} {}", prefix, body)
+        };
     }
 
     if is_group {
@@ -1188,11 +1234,17 @@ fn build_telegram_like_channel_system_context(
 
     if is_group {
         let title = group_title.unwrap_or("Unknown");
-        let chat_id = group_id.unwrap_or(0);
-        format!(
-            "[System: The user is chatting with you via Telegram (username: @{}) in a GROUP CHAT named \"{}\" (chatId: {}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]\n\n[QQ BRIDGE: This Telegram-compatible channel is actually QQ / OneBot. For QQ group reading, `alma group list`, `alma group history {} 100`, `alma group search <keyword>`, and `cat ~/.config/alma/groups/README.md` work because alma-onebot-bridge writes QQ logs in Alma's native group-log format. `alma group context {}` can read local logs, but Telegram-only API details may be unavailable for QQ. For active QQ group sending, do not use `alma group send`; that command targets Telegram. Use `curl -s -X POST http://127.0.0.1:{}/qq/group/{}/send -H 'Content-Type: application/json' -d '{{\"message\":\"...\"}}'`.]",
-            username, title, chat_id, platform, chat_id, chat_id, bridge_port, chat_id
-        )
+        if let Some(chat_id) = group_id {
+            format!(
+                "[System: The user is chatting with you via Telegram (username: @{}) in a GROUP CHAT named \"{}\" (chatId: {}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]\n\n[QQ BRIDGE: This Telegram-compatible channel is actually QQ / OneBot. For QQ group reading, `alma group list`, `alma group history {} 100`, `alma group search <keyword>`, and `cat ~/.config/alma/groups/README.md` work because alma-onebot-bridge writes QQ logs in Alma's native group-log format. `alma group context {}` can read local logs, but Telegram-only API details may be unavailable for QQ. For active QQ group sending, do not use `alma group send`; that command targets Telegram. Use `curl -s -X POST http://127.0.0.1:{}/qq/group/{}/send -H 'Content-Type: application/json' -d '{{\"message\":\"...\"}}'`.]",
+                username, title, chat_id, platform, chat_id, chat_id, bridge_port, chat_id
+            )
+        } else {
+            format!(
+                "[System: The user is chatting with you via Telegram (username: @{}) in a GROUP CHAT named \"{}\". But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]\n\n[QQ BRIDGE: This Telegram-compatible channel is actually QQ / OneBot, but this message did not include a valid QQ group id. Do not invent chatId 0 or use group-send commands for this turn.]",
+                username, title, platform
+            )
+        }
     } else {
         format!(
             "[System: The user is chatting with you via Telegram (username: @{}). But remember — you live on the user's {} computer, not inside Telegram. Telegram is just the communication channel. You have full access to the operating system: you can take screenshots, run commands, read/write files, browse the web, and do anything a desktop AI agent can do.]\n\n[QQ BRIDGE: This Telegram-compatible private chat is actually QQ / OneBot. For active QQ private sending, use `curl -s -X POST http://127.0.0.1:{}/qq/private/<userId>/send -H 'Content-Type: application/json' -d '{{\"message\":\"...\"}}'`. Do not use Telegram-specific send commands for QQ.]",
@@ -1216,23 +1268,25 @@ async fn download_media_as_file_part(
     }
 
     debug!("[Alma] Downloading media from URL: {}", url);
-    let resp = client
-        .get(parsed_url.clone())
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+    let resp = tokio::time::timeout(
+        tokio::time::Duration::from_secs(30),
+        client.get(parsed_url.clone()).send(),
+    )
+    .await
+    .map_err(|_| "Timed out fetching media URL".to_string())?
+    .map_err(|e| format!("Failed to fetch URL: {}", e))?;
 
     if !resp.status().is_success() {
         return Err(format!("HTTP status error: {}", resp.status()));
     }
 
-    if let Some(len) = resp.content_length() {
-        if len > MAX_MEDIA_BYTES {
-            return Err(format!(
-                "Media too large: {} bytes exceeds {} byte limit",
-                len, MAX_MEDIA_BYTES
-            ));
-        }
+    if let Some(len) = resp.content_length()
+        && len > MAX_MEDIA_BYTES
+    {
+        return Err(format!(
+            "Media too large: {} bytes exceeds {} byte limit",
+            len, MAX_MEDIA_BYTES
+        ));
     }
 
     let content_type = resp
@@ -1255,9 +1309,9 @@ async fn download_media_as_file_part(
 
     let mut bytes = Vec::new();
     let mut resp = resp;
-    while let Some(chunk) = resp
-        .chunk()
+    while let Some(chunk) = tokio::time::timeout(tokio::time::Duration::from_secs(30), resp.chunk())
         .await
+        .map_err(|_| "Timed out reading media response".to_string())?
         .map_err(|e| format!("Failed to read response bytes: {}", e))?
     {
         if bytes.len() as u64 + chunk.len() as u64 > MAX_MEDIA_BYTES {
@@ -1299,7 +1353,8 @@ mod tests {
     use super::{
         build_recent_chat_history_context, build_telegram_like_channel_system_context,
         build_telegram_like_message_text, cleaned_command_for_group, download_media_as_file_part,
-        resolve_thread_for_session, single_line_preview, split_text,
+        resolve_thread_for_session, retry_delay_ms, single_line_preview, split_text,
+        truncate_with_ellipsis,
     };
     use crate::alma_ws::normalize_assistant_text;
     use crate::config::Config;
@@ -1356,6 +1411,22 @@ mod tests {
         let preview = single_line_preview("你好世界你好世界你好世界", 7);
         assert!(preview.ends_with("..."));
         assert!(!preview.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_cjk_char_boundaries() {
+        let preview = truncate_with_ellipsis("你好世界你好世界你好世界", 100);
+        assert_eq!(preview, "你好世界你好世界你好世界");
+
+        let preview = truncate_with_ellipsis("你好世界你好世界你好世界", 7);
+        assert_eq!(preview, "你好...");
+    }
+
+    #[test]
+    fn retry_delay_saturates_instead_of_overflowing() {
+        assert_eq!(retry_delay_ms(3_000, 1), 3_000);
+        assert_eq!(retry_delay_ms(3_000, 2), 6_000);
+        assert_eq!(retry_delay_ms(u64::MAX, 64), 60_000);
     }
 
     #[test]
@@ -1493,7 +1564,11 @@ mod tests {
         assert_eq!(thread_id, "thread-from-rest");
         assert!(!existed);
         assert_eq!(
-            state.get_thread_id("group:706968284").await.as_deref(),
+            state
+                .get_thread_id("group:706968284")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("thread-from-rest")
         );
         assert!(
@@ -1533,5 +1608,14 @@ mod tests {
         assert!(ctx.contains("alma group history 123 100"));
         assert!(ctx.contains("http://127.0.0.1:8090/qq/group/123/send"));
         assert!(ctx.contains("do not use `alma group send`"));
+    }
+
+    #[test]
+    fn group_system_context_does_not_invent_zero_chat_id() {
+        let ctx =
+            build_telegram_like_channel_system_context(true, "alice", Some("测试群"), None, 8090);
+
+        assert!(!ctx.contains("chatId: 0"));
+        assert!(ctx.contains("did not include a valid QQ group id"));
     }
 }

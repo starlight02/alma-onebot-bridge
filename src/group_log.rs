@@ -21,6 +21,7 @@ pub fn alma_groups_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| alma_groups_dir_at(&home))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn append_alma_group_log(
     chat_id: i64,
     display_name: &str,
@@ -47,6 +48,7 @@ pub fn append_alma_group_log(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn append_alma_group_log_at(
     home: &Path,
     chat_id: i64,
@@ -91,7 +93,7 @@ pub fn append_alma_group_log_at(
     } else {
         format!("[{}]", display_name)
     };
-    let one_line = text.replace('\r', " ").replace('\n', " ");
+    let one_line = text.replace(['\r', '\n'], " ");
     let line = format!("[{}]{} {}: {}\n", clock, msg, sender, one_line);
 
     std::fs::OpenOptions::new()

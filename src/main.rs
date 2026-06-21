@@ -188,6 +188,30 @@ async fn main() {
     );
 
     warp::serve(routes)
-        .run(([0, 0, 0, 0], config.bridge_port))
+        .bind(([0, 0, 0, 0], config.bridge_port))
+        .await
+        .graceful(shutdown_signal())
+        .run()
         .await;
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    tracing::info!("Shutdown signal received; stopping HTTP/WebSocket server");
 }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +13,8 @@ use turso::Builder;
 use crate::alma_ws::{AlmaEvent, AlmaWsClient};
 use crate::config::Config;
 use crate::onebot::OneBotApiHandle;
+
+const SESSION_REVERSE_LIMIT: usize = 4096;
 
 /// Identifies a QQ chat target for bidirectional forwarding.
 #[derive(Clone, Debug)]
@@ -78,6 +81,8 @@ pub struct AppState {
     pub group_history: RwLock<HashMap<String, VecDeque<GroupMessage>>>,
     /// Cached QQ group titles keyed by numeric group_id.
     pub group_titles: RwLock<HashMap<i64, String>>,
+    /// Cached People Profile paths keyed by QQ user_id string.
+    pub people_profile_paths: RwLock<HashMap<String, PathBuf>>,
     /// Active OneBot reverse-WS API path for HTTP command endpoints.
     onebot_api: RwLock<Option<OneBotApiHandle>>,
     /// Broadcast channel: Alma GUI events → OneBot handler (for bidirectional forwarding)
@@ -172,6 +177,7 @@ impl SharedState {
             sent_replies: RwLock::new(HashMap::new()),
             group_history: RwLock::new(HashMap::new()),
             group_titles: RwLock::new(HashMap::new()),
+            people_profile_paths: RwLock::new(HashMap::new()),
             onebot_api: RwLock::new(None),
             alma_event_tx,
             onebot_connection_epoch: AtomicU64::new(0),
@@ -180,12 +186,12 @@ impl SharedState {
 
     // ── Thread map ───────────────────────────────────────────────────────
 
-    pub async fn get_thread_id(&self, session_key: &str) -> Option<String> {
+    pub async fn get_thread_id(&self, session_key: &str) -> Result<Option<String>, String> {
         let conn = match self.db.connect() {
             Ok(c) => c,
             Err(e) => {
                 error!("DB connect error: {}", e);
-                return None;
+                return Err(format!("DB connect error: {}", e));
             }
         };
 
@@ -196,7 +202,7 @@ impl SharedState {
             Ok(s) => s,
             Err(e) => {
                 error!("DB prepare error: {}", e);
-                return None;
+                return Err(format!("DB prepare error: {}", e));
             }
         };
 
@@ -204,36 +210,37 @@ impl SharedState {
             Ok(r) => r,
             Err(e) => {
                 error!("DB query error: {}", e);
-                return None;
+                return Err(format!("DB query error: {}", e));
             }
         };
 
         match rows.next().await {
             Ok(Some(row)) => {
-                let tid = row.get::<String>(0).ok()?;
-                // Update reverse map inline (fast RwLock write, no spawn needed)
-                self.session_reverse
-                    .write()
-                    .await
-                    .insert(tid.clone(), session_key.to_string());
-                Some(tid)
+                let tid = row
+                    .get::<String>(0)
+                    .map_err(|e| format!("DB row decode error: {}", e))?;
+                self.cache_thread_mapping(tid.clone(), session_key.to_string())
+                    .await;
+                Ok(Some(tid))
             }
-            _ => None,
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("DB row error: {}", e)),
         }
     }
 
-    pub async fn set_thread_id(&self, session_key: String, thread_id: String) {
-        // Populate reverse map
-        self.session_reverse
-            .write()
-            .await
-            .insert(thread_id.clone(), session_key.clone());
+    pub async fn set_thread_id(
+        &self,
+        session_key: String,
+        thread_id: String,
+    ) -> Result<(), String> {
+        self.cache_thread_mapping(thread_id.clone(), session_key.clone())
+            .await;
 
         let conn = match self.db.connect() {
             Ok(c) => c,
             Err(e) => {
                 error!("DB connect error: {}", e);
-                return;
+                return Err(format!("DB connect error: {}", e));
             }
         };
 
@@ -247,16 +254,21 @@ impl SharedState {
                     .await
                 {
                     error!("DB insert error: {}", e);
+                    return Err(format!("DB insert error: {}", e));
                 } else {
                     debug!("Thread saved: {} → {}", session_key, thread_id);
                 }
             }
-            Err(e) => error!("DB prepare error: {}", e),
+            Err(e) => {
+                error!("DB prepare error: {}", e);
+                return Err(format!("DB prepare error: {}", e));
+            }
         }
+        Ok(())
     }
 
     /// Look up the QQ target for a given Alma thread ID (for bidirectional forwarding).
-    pub async fn get_qq_target(&self, thread_id: &str) -> Option<QqTarget> {
+    pub async fn get_qq_target(&self, thread_id: &str) -> Result<Option<QqTarget>, String> {
         let session_key =
             if let Some(session_key) = self.session_reverse.read().await.get(thread_id).cloned() {
                 session_key
@@ -265,7 +277,7 @@ impl SharedState {
                     Ok(c) => c,
                     Err(e) => {
                         error!("DB connect error: {}", e);
-                        return None;
+                        return Err(format!("DB connect error: {}", e));
                     }
                 };
 
@@ -276,7 +288,7 @@ impl SharedState {
                     Ok(s) => s,
                     Err(e) => {
                         error!("DB prepare error: {}", e);
-                        return None;
+                        return Err(format!("DB prepare error: {}", e));
                     }
                 };
 
@@ -284,43 +296,61 @@ impl SharedState {
                     Ok(r) => r,
                     Err(e) => {
                         error!("DB query error: {}", e);
-                        return None;
+                        return Err(format!("DB query error: {}", e));
                     }
                 };
 
                 let session_key = match rows.next().await {
-                    Ok(Some(row)) => row.get::<String>(0).ok()?,
-                    _ => return None,
+                    Ok(Some(row)) => row
+                        .get::<String>(0)
+                        .map_err(|e| format!("DB row decode error: {}", e))?,
+                    Ok(None) => return Ok(None),
+                    Err(e) => return Err(format!("DB row error: {}", e)),
                 };
 
-                self.session_reverse
-                    .write()
-                    .await
-                    .insert(thread_id.to_string(), session_key.clone());
+                self.cache_thread_mapping(thread_id.to_string(), session_key.clone())
+                    .await;
 
                 session_key
             };
 
         let parts: Vec<&str> = session_key.splitn(2, ':').collect();
         if parts.len() != 2 {
-            return None;
+            return Ok(None);
         }
 
         let target_type = parts[0].to_string();
-        let target_id: i64 = parts[1].parse().ok()?;
+        let target_id: i64 = match parts[1].parse() {
+            Ok(id) => id,
+            Err(e) => return Err(format!("Invalid session target id '{}': {}", parts[1], e)),
+        };
 
-        Some(QqTarget {
+        Ok(Some(QqTarget {
             target_type,
             target_id,
-        })
+        }))
+    }
+
+    async fn cache_thread_mapping(&self, thread_id: String, session_key: String) {
+        let mut reverse = self.session_reverse.write().await;
+        reverse.insert(thread_id, session_key);
+        if reverse.len() <= SESSION_REVERSE_LIMIT {
+            return;
+        }
+
+        let excess = reverse.len().saturating_sub(SESSION_REVERSE_LIMIT);
+        let keys: Vec<String> = reverse.keys().take(excess).cloned().collect();
+        for key in keys {
+            reverse.remove(&key);
+        }
     }
 
     // ── Profile map ──────────────────────────────────────────────────────
 
-    pub async fn has_profile(&self, user_id: &str) -> bool {
+    pub async fn has_profile(&self, user_id: &str) -> Result<bool, String> {
         let conn = match self.db.connect() {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(e) => return Err(format!("DB connect error: {}", e)),
         };
 
         let mut stmt = match conn
@@ -328,21 +358,25 @@ impl SharedState {
             .await
         {
             Ok(s) => s,
-            Err(_) => return false,
+            Err(e) => return Err(format!("DB prepare error: {}", e)),
         };
 
         match stmt.query([user_id]).await {
-            Ok(mut rows) => rows.next().await.ok().flatten().is_some(),
-            Err(_) => false,
+            Ok(mut rows) => rows
+                .next()
+                .await
+                .map(|row| row.is_some())
+                .map_err(|e| format!("DB row error: {}", e)),
+            Err(e) => Err(format!("DB query error: {}", e)),
         }
     }
 
-    pub async fn set_profile(&self, user_id: String, profile_name: String) {
+    pub async fn set_profile(&self, user_id: String, profile_name: String) -> Result<(), String> {
         let conn = match self.db.connect() {
             Ok(c) => c,
             Err(e) => {
                 error!("DB connect error: {}", e);
-                return;
+                return Err(format!("DB connect error: {}", e));
             }
         };
 
@@ -356,12 +390,17 @@ impl SharedState {
                     .await
                 {
                     error!("DB insert error: {}", e);
+                    return Err(format!("DB insert error: {}", e));
                 } else {
                     debug!("Profile saved: {} → {}", user_id, profile_name);
                 }
             }
-            Err(e) => error!("DB prepare error: {}", e),
+            Err(e) => {
+                error!("DB prepare error: {}", e);
+                return Err(format!("DB prepare error: {}", e));
+            }
         }
+        Ok(())
     }
 
     // ── Alma WS client ───────────────────────────────────────────────────
@@ -590,7 +629,7 @@ impl SharedState {
                 .get::<String>(2)
                 .map_err(|e| format!("DB get last_active error: {}", e))?
                 .parse::<u64>()
-                .unwrap_or(0);
+                .map_err(|e| format!("Invalid last_active in DB: {}", e))?;
             groups.insert(
                 group_id,
                 GroupDirectoryEntry {
@@ -640,7 +679,7 @@ impl SharedState {
                 .get::<String>(3)
                 .map_err(|e| format!("DB get last_seen error: {}", e))?
                 .parse::<u64>()
-                .unwrap_or(0);
+                .map_err(|e| format!("Invalid last_seen in DB: {}", e))?;
 
             groups
                 .entry(group_id)

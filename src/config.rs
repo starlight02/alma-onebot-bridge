@@ -1,5 +1,6 @@
 use std::env;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::Deserialize;
 
@@ -77,6 +78,51 @@ pub struct Config {
     pub show_thinking: bool,
 }
 
+fn get_env_or<T>(env_key: &str, toml_val: Option<T>, default: T) -> T
+where
+    T: FromStr,
+{
+    match env::var(env_key) {
+        Ok(value) => match value.trim().parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                tracing::warn!(
+                    "Invalid {}='{}'; falling back to config/default",
+                    env_key,
+                    value
+                );
+                toml_val.unwrap_or(default)
+            }
+        },
+        Err(_) => toml_val.unwrap_or(default),
+    }
+}
+
+fn get_env_or_bool(env_key: &str, toml_val: Option<bool>, default: bool) -> bool {
+    match env::var(env_key) {
+        Ok(value) => match parse_bool_value(&value) {
+            Some(parsed) => parsed,
+            None => {
+                tracing::warn!(
+                    "Invalid {}='{}'; expected true/false/1/0/on/off/yes/no, falling back to config/default",
+                    env_key,
+                    value
+                );
+                toml_val.unwrap_or(default)
+            }
+        },
+        Err(_) => toml_val.unwrap_or(default),
+    }
+}
+
+fn parse_bool_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" | "on" => Some(true),
+        "false" | "0" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -84,53 +130,12 @@ impl Config {
         // Try to load config.toml
         let file_config = Self::load_config_file();
 
-        // Helper: env var > TOML field > default
-        let get_u16 = |env_key: &str, toml_val: Option<u16>, default: u16| -> u16 {
-            env::var(env_key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(toml_val)
-                .unwrap_or(default)
-        };
-
-        let get_u32 = |env_key: &str, toml_val: Option<u32>, default: u32| -> u32 {
-            env::var(env_key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(toml_val)
-                .unwrap_or(default)
-        };
-
-        let get_u64 = |env_key: &str, toml_val: Option<u64>, default: u64| -> u64 {
-            env::var(env_key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(toml_val)
-                .unwrap_or(default)
-        };
-
-        let get_usize = |env_key: &str, toml_val: Option<usize>, default: usize| -> usize {
-            env::var(env_key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(toml_val)
-                .unwrap_or(default)
-        };
-
         let get_string = |env_key: &str, toml_val: Option<String>, default: String| -> String {
             env::var(env_key).ok().or(toml_val).unwrap_or(default)
         };
 
         let get_opt_string = |env_key: &str, toml_val: Option<String>| -> Option<String> {
             env::var(env_key).ok().or(toml_val)
-        };
-
-        let get_bool = |env_key: &str, toml_val: Option<bool>, default: bool| -> bool {
-            env::var(env_key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or(toml_val)
-                .unwrap_or(default)
         };
 
         // Extract TOML section values
@@ -142,7 +147,7 @@ impl Config {
         let chat = file_config.chat.unwrap_or_default();
 
         Config {
-            bridge_port: get_u16("BRIDGE_PORT", bridge.port, 8090),
+            bridge_port: get_env_or("BRIDGE_PORT", bridge.port, 8090),
             alma_api: get_string("ALMA_API", alma.api, "http://localhost:23001".to_string()),
             people_dir: get_string(
                 "PEOPLE_DIR",
@@ -154,16 +159,16 @@ impl Config {
             .into(),
             db_path: get_string("DB_PATH", database.path, "bridge-state.db".to_string()).into(),
             alma_model: get_opt_string("ALMA_MODEL", alma.model),
-            alma_run_timeout_secs: get_u64("ALMA_TIMEOUT", alma.timeout, 120),
-            alma_max_retries: get_u32("ALMA_MAX_RETRIES", alma.max_retries, 2),
-            alma_retry_delay_ms: get_u64("ALMA_RETRY_DELAY", alma.retry_delay_ms, 3000),
-            onebot_api_timeout_secs: get_u64("ONEBOT_API_TIMEOUT", onebot.api_timeout, 30),
+            alma_run_timeout_secs: get_env_or("ALMA_TIMEOUT", alma.timeout, 120),
+            alma_max_retries: get_env_or("ALMA_MAX_RETRIES", alma.max_retries, 2),
+            alma_retry_delay_ms: get_env_or("ALMA_RETRY_DELAY", alma.retry_delay_ms, 3000),
+            onebot_api_timeout_secs: get_env_or("ONEBOT_API_TIMEOUT", onebot.api_timeout, 30),
             access_token: get_opt_string("ACCESS_TOKEN", onebot.access_token)
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty()),
-            group_history_size: get_usize("GROUP_HISTORY_SIZE", chat.group_history_size, 30),
+            group_history_size: get_env_or("GROUP_HISTORY_SIZE", chat.group_history_size, 30),
             thinking_message: get_opt_string("THINKING_MESSAGE", chat.thinking_message),
-            show_thinking: get_bool("SHOW_THINKING", chat.show_thinking, false),
+            show_thinking: get_env_or_bool("SHOW_THINKING", chat.show_thinking, false),
         }
     }
 
@@ -187,5 +192,21 @@ impl Config {
 
         tracing::info!("No config.toml found, using defaults + env vars");
         FileConfig::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool_value;
+
+    #[test]
+    fn parse_bool_value_accepts_common_env_forms() {
+        assert_eq!(parse_bool_value("true"), Some(true));
+        assert_eq!(parse_bool_value("1"), Some(true));
+        assert_eq!(parse_bool_value("ON"), Some(true));
+        assert_eq!(parse_bool_value("false"), Some(false));
+        assert_eq!(parse_bool_value("0"), Some(false));
+        assert_eq!(parse_bool_value("off"), Some(false));
+        assert_eq!(parse_bool_value("maybe"), None);
     }
 }
