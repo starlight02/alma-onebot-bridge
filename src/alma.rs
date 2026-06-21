@@ -108,3 +108,29 @@ pub async fn fetch_default_model(state: &SharedState) -> Result<String, String> 
     info!("Alma default model: {}", model);
     Ok(model)
 }
+
+/// Check whether a thread ID exists through Alma's public REST API.
+pub async fn thread_exists(state: &SharedState, thread_id: &str) -> Result<bool, String> {
+    let url = format!("{}/api/threads/{}", state.config.alma_api, thread_id);
+
+    let resp = state
+        .http_client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch thread {}: {}", thread_id, e))?;
+
+    if resp.status().is_success() {
+        return Ok(true);
+    }
+
+    if resp.status().as_u16() == 404 {
+        return Ok(false);
+    }
+
+    Err(format!(
+        "Thread API returned status {} for {}",
+        resp.status().as_u16(),
+        thread_id
+    ))
+}

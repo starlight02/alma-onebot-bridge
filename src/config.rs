@@ -158,7 +158,9 @@ impl Config {
             alma_max_retries: get_u32("ALMA_MAX_RETRIES", alma.max_retries, 2),
             alma_retry_delay_ms: get_u64("ALMA_RETRY_DELAY", alma.retry_delay_ms, 3000),
             onebot_api_timeout_secs: get_u64("ONEBOT_API_TIMEOUT", onebot.api_timeout, 30),
-            access_token: get_opt_string("ACCESS_TOKEN", onebot.access_token),
+            access_token: get_opt_string("ACCESS_TOKEN", onebot.access_token)
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty()),
             group_history_size: get_usize("GROUP_HISTORY_SIZE", chat.group_history_size, 30),
             thinking_message: get_opt_string("THINKING_MESSAGE", chat.thinking_message),
             show_thinking: get_bool("SHOW_THINKING", chat.show_thinking, false),

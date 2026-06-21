@@ -64,10 +64,27 @@ pub async fn call_api(
     pending.0.lock().await.remove(&echo);
 
     match result {
-        Ok(Ok(resp)) => Ok(resp),
+        Ok(Ok(resp)) => validate_api_response(action, resp),
         Ok(Err(_)) => Err("response channel closed".to_string()),
         Err(_) => Err(format!("API call timeout: {} ({}s)", action, timeout_secs)),
     }
+}
+
+fn validate_api_response(action: &str, resp: ApiResponse) -> Result<ApiResponse, String> {
+    if resp.status == "ok" && resp.retcode == 0 {
+        return Ok(resp);
+    }
+
+    let detail = resp
+        .message
+        .as_deref()
+        .or(resp.wording.as_deref())
+        .unwrap_or("no error message");
+
+    Err(format!(
+        "OneBot API {} failed: status={}, retcode={}, {}",
+        action, resp.status, resp.retcode, detail
+    ))
 }
 
 /// Route an incoming WS message: either an API response (has echo) or return None (event).
@@ -383,7 +400,8 @@ fn value_as_i64(value: &serde_json::Value) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_quoted_message;
+    use super::{parse_quoted_message, validate_api_response};
+    use crate::onebot::event::ApiResponse;
     use serde_json::json;
 
     #[test]
@@ -440,5 +458,25 @@ mod tests {
         assert_eq!(quoted.sender_name, "一群名片");
         assert_eq!(quoted.sender_id, Some(123456));
         assert_eq!(quoted.text, "收到");
+    }
+
+    #[test]
+    fn api_response_nonzero_retcode_is_error() {
+        let err = validate_api_response(
+            "send_msg",
+            ApiResponse {
+                status: "failed".to_string(),
+                retcode: 1400,
+                data: None,
+                echo: Some("echo".to_string()),
+                message: Some("bad request".to_string()),
+                wording: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("send_msg"));
+        assert!(err.contains("retcode=1400"));
+        assert!(err.contains("bad request"));
     }
 }

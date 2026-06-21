@@ -8,6 +8,8 @@ mod people;
 mod pipeline;
 mod state;
 
+use std::collections::HashMap;
+
 use warp::Filter;
 
 use crate::alma_ws::AlmaWsClient;
@@ -103,11 +105,11 @@ async fn main() {
     let ws_handler = {
         let state = state.clone();
         let expected_token = expected_token.clone();
-        move |auth: Option<String>, ws: warp::ws::Ws| {
+        move |auth: Option<String>, query: HashMap<String, String>, ws: warp::ws::Ws| {
             let state = state.clone();
             let expected = expected_token.clone();
             ws.on_upgrade(move |socket| {
-                handlers::ws::handle_ws_connection(socket, state, auth, expected)
+                handlers::ws::handle_ws_connection(socket, state, auth, query, expected)
             })
         }
     };
@@ -115,6 +117,7 @@ async fn main() {
     // Match root path: ws://host:port/
     let ws_root = warp::path::end()
         .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
         .and(warp::ws())
         .map(ws_handler.clone());
 
@@ -122,6 +125,7 @@ async fn main() {
     let ws_path = warp::path("ws")
         .and(warp::path::end())
         .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
         .and(warp::ws())
         .map(ws_handler.clone());
 
@@ -131,6 +135,7 @@ async fn main() {
         .and(warp::path("ws"))
         .and(warp::path::end())
         .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
         .and(warp::ws())
         .map(ws_handler);
 

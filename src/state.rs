@@ -1,11 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use libsql::Builder;
 use reqwest::Client;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
+use turso::Builder;
 
 use crate::alma_ws::{AlmaEvent, AlmaWsClient};
 use crate::config::Config;
@@ -23,6 +24,8 @@ pub struct GroupMessage {
     pub display_name: String,
     pub text: String,
     pub timestamp: u64,
+    pub message_id: Option<i64>,
+    pub is_bot: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -35,7 +38,7 @@ struct SentReply {
 pub struct AppState {
     pub http_client: Client,
     pub config: Config,
-    pub db: libsql::Database,
+    pub db: turso::Database,
     pub default_model: RwLock<Option<String>>,
     pub alma_ws: RwLock<Option<AlmaWsClient>>,
     /// Reverse lookup: Alma thread_id → QQ session key (for bidirectional forwarding)
@@ -48,6 +51,9 @@ pub struct AppState {
     pub group_titles: RwLock<HashMap<i64, String>>,
     /// Broadcast channel: Alma GUI events → OneBot handler (for bidirectional forwarding)
     pub alma_event_tx: tokio::sync::broadcast::Sender<AlmaEvent>,
+    /// Monotonic generation for active OneBot reverse WS connections.
+    /// Only the newest connection may forward Alma GUI events to QQ.
+    onebot_connection_epoch: AtomicU64,
 }
 
 /// Cheap-to-clone wrapper around `Arc<AppState>`.
@@ -112,6 +118,7 @@ impl SharedState {
             group_history: RwLock::new(HashMap::new()),
             group_titles: RwLock::new(HashMap::new()),
             alma_event_tx,
+            onebot_connection_epoch: AtomicU64::new(0),
         })))
     }
 
@@ -126,7 +133,7 @@ impl SharedState {
             }
         };
 
-        let stmt = match conn
+        let mut stmt = match conn
             .prepare("SELECT thread_id FROM threads WHERE session_key = ?1")
             .await
         {
@@ -178,7 +185,7 @@ impl SharedState {
             .prepare("INSERT OR REPLACE INTO threads (session_key, thread_id) VALUES (?1, ?2)")
             .await
         {
-            Ok(stmt) => {
+            Ok(mut stmt) => {
                 if let Err(e) = stmt
                     .execute([session_key.as_str(), thread_id.as_str()])
                     .await
@@ -206,7 +213,7 @@ impl SharedState {
                     }
                 };
 
-                let stmt = match conn
+                let mut stmt = match conn
                     .prepare("SELECT session_key FROM threads WHERE thread_id = ?1")
                     .await
                 {
@@ -260,7 +267,7 @@ impl SharedState {
             Err(_) => return false,
         };
 
-        let stmt = match conn
+        let mut stmt = match conn
             .prepare("SELECT 1 FROM profiles WHERE user_id = ?1")
             .await
         {
@@ -287,7 +294,7 @@ impl SharedState {
             .prepare("INSERT OR REPLACE INTO profiles (user_id, profile_name) VALUES (?1, ?2)")
             .await
         {
-            Ok(stmt) => {
+            Ok(mut stmt) => {
                 if let Err(e) = stmt
                     .execute([user_id.as_str(), profile_name.as_str()])
                     .await
@@ -401,6 +408,16 @@ impl SharedState {
     pub async fn get_group_title(&self, group_id: i64) -> Option<String> {
         self.group_titles.read().await.get(&group_id).cloned()
     }
+
+    // ── OneBot connection ownership ─────────────────────────────────────
+
+    pub fn register_onebot_connection(&self) -> u64 {
+        self.onebot_connection_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn is_current_onebot_connection(&self, connection_id: u64) -> bool {
+        self.onebot_connection_epoch.load(Ordering::Acquire) == connection_id
+    }
 }
 
 /// Safely truncate a string prefix by bytes without panicking on UTF-8 boundaries.
@@ -432,7 +449,18 @@ fn sent_reply_matches(sent: &str, candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_prefix, sent_reply_matches};
+    use super::{SharedState, safe_prefix, sent_reply_matches};
+    use crate::config::Config;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("alma-onebot-bridge-{name}-{nonce}.db"))
+    }
 
     #[test]
     fn safe_prefix_keeps_utf8_boundaries() {
@@ -456,5 +484,21 @@ mod tests {
         let text = "这是一个足够长的回复，用来验证前缀匹配在长文本场景下仍然有效，而且不会被 UTF-8 截断搞坏。";
         let prefix_equivalent = "这是一个足够长的回复，用来验证前缀匹配在长文本场景下仍然有效，而且不会被 UTF-8 截断搞坏。后续补充";
         assert!(sent_reply_matches(text, prefix_equivalent));
+    }
+
+    #[tokio::test]
+    async fn onebot_connection_epoch_keeps_only_latest_current() {
+        let db_path = temp_db_path("connection-epoch");
+        let mut config = Config::from_env();
+        config.db_path = db_path.clone();
+        let state = SharedState::new(config).await.unwrap();
+
+        let first = state.register_onebot_connection();
+        let second = state.register_onebot_connection();
+
+        assert!(!state.is_current_onebot_connection(first));
+        assert!(state.is_current_onebot_connection(second));
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

@@ -15,7 +15,7 @@ tokio-stream = "0.1.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.23.3", features = ["v4"] }
-libsql = { version = "0.9", default-features = false, features = ["core"] }
+turso = { version = "0.7.0-pre.10", default-features = false }
 tokio-tungstenite = "0.26"
 warp = { version = "0.4.3", features = ["server", "websocket"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }

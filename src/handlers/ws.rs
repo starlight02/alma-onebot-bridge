@@ -1,4 +1,5 @@
 use futures_util::{FutureExt, SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -9,33 +10,28 @@ use crate::onebot::{PendingCalls, try_resolve_api_response};
 use crate::pipeline::{handle_alma_event, process_message_event};
 use crate::state::SharedState;
 
+const MAX_INCOMING_TEXT_BYTES: usize = 1_000_000;
+
 /// Handle a new reverse WebSocket connection from the OneBot client.
 /// Validates access token if configured (expected_token is Some).
 pub async fn handle_ws_connection(
     ws: WebSocket,
     state: SharedState,
     auth_header: Option<String>,
+    query: HashMap<String, String>,
     expected_token: Option<String>,
 ) {
     // ── Access token validation ──────────────────────────────────────────
-    if let Some(ref expected) = expected_token {
-        let valid = auth_header
-            .as_deref()
-            .map(|h| {
-                h.strip_prefix("Bearer ")
-                    .or_else(|| h.strip_prefix("bearer "))
-                    .map(|t| t == expected.as_str())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-
-        if !valid {
-            warn!("WebSocket connection rejected: invalid or missing access token");
-            return;
-        }
+    if !is_authorized(expected_token.as_deref(), auth_header.as_deref(), &query) {
+        warn!("WebSocket connection rejected: invalid or missing access token");
+        return;
     }
 
-    info!("OneBot client connected via WebSocket");
+    let connection_id = state.register_onebot_connection();
+    info!(
+        "OneBot client connected via WebSocket (connection_id={})",
+        connection_id
+    );
 
     let (ws_sink, ws_stream) = ws.split();
 
@@ -53,6 +49,14 @@ pub async fn handle_ws_connection(
     let fwd_pending = pending_calls.clone();
     let forwarding = tokio::spawn(async move {
         loop {
+            if !fwd_state.is_current_onebot_connection(connection_id) {
+                info!(
+                    "[Alma→QQ] Connection {} superseded; stopping forwarding task",
+                    connection_id
+                );
+                break;
+            }
+
             match alma_event_rx.recv().await {
                 Ok(event) => {
                     // Wrap in catch_unwind so a single panic doesn't kill
@@ -110,6 +114,14 @@ pub async fn handle_ws_connection(
     let mut self_id: Option<i64> = None;
 
     while let Some(result) = stream.next().await {
+        if !state.is_current_onebot_connection(connection_id) {
+            info!(
+                "OneBot connection {} superseded by a newer connection; closing reader",
+                connection_id
+            );
+            break;
+        }
+
         let msg = match result {
             Ok(msg) => msg,
             Err(e) => {
@@ -131,6 +143,16 @@ pub async fn handle_ws_connection(
             Ok(t) => t,
             Err(_) => continue,
         };
+
+        if text.len() > MAX_INCOMING_TEXT_BYTES {
+            warn!(
+                "WS text frame too large ({} bytes > {}), closing connection {}",
+                text.len(),
+                MAX_INCOMING_TEXT_BYTES,
+                connection_id
+            );
+            break;
+        }
 
         let json: serde_json::Value = match serde_json::from_str(text) {
             Ok(j) => j,
@@ -171,8 +193,23 @@ pub async fn handle_ws_connection(
                     let tx = ws_tx.clone();
                     let pc = pending_calls.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = process_message_event(&event, &st, &tx, &pc).await {
-                            error!("Message processing error: {}", e);
+                        let result = AssertUnwindSafe(process_message_event(&event, &st, &tx, &pc))
+                            .catch_unwind()
+                            .await;
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => error!("Message processing error: {}", e),
+                            Err(panic_info) => {
+                                let msg = panic_info
+                                    .downcast_ref::<String>()
+                                    .map(|s| s.as_str())
+                                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                                    .unwrap_or("(non-string panic)");
+                                error!(
+                                    "process_message_event panicked for message_id={:?}: {}",
+                                    event.message_id, msg
+                                );
+                            }
                         }
                     });
                 }
@@ -256,4 +293,75 @@ pub async fn handle_ws_connection(
     );
     forwarding.abort();
     writer.abort();
+}
+
+fn is_authorized(
+    expected_token: Option<&str>,
+    auth_header: Option<&str>,
+    query: &HashMap<String, String>,
+) -> bool {
+    let Some(expected) = expected_token.map(str::trim).filter(|t| !t.is_empty()) else {
+        return true;
+    };
+
+    auth_header
+        .and_then(extract_authorization_token)
+        .or_else(|| {
+            query
+                .get("access_token")
+                .or_else(|| query.get("token"))
+                .map(String::as_str)
+        })
+        .map(|token| token.trim() == expected)
+        .unwrap_or(false)
+}
+
+fn extract_authorization_token(header: &str) -> Option<&str> {
+    let trimmed = header.trim();
+    trimmed
+        .strip_prefix("Bearer ")
+        .or_else(|| trimmed.strip_prefix("bearer "))
+        .or_else(|| trimmed.strip_prefix("Token "))
+        .or_else(|| trimmed.strip_prefix("token "))
+        .or_else(|| {
+            if trimmed.contains(' ') {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_authorized;
+    use std::collections::HashMap;
+
+    #[test]
+    fn auth_allows_when_token_not_configured_or_blank() {
+        assert!(is_authorized(None, None, &HashMap::new()));
+        assert!(is_authorized(Some("   "), None, &HashMap::new()));
+    }
+
+    #[test]
+    fn auth_accepts_bearer_and_query_tokens() {
+        let mut query = HashMap::new();
+        query.insert("access_token".to_string(), "secret".to_string());
+
+        assert!(is_authorized(
+            Some("secret"),
+            Some("Bearer secret"),
+            &HashMap::new()
+        ));
+        assert!(is_authorized(Some("secret"), None, &query));
+    }
+
+    #[test]
+    fn auth_rejects_invalid_token() {
+        let mut query = HashMap::new();
+        query.insert("access_token".to_string(), "wrong".to_string());
+
+        assert!(!is_authorized(Some("secret"), Some("Bearer wrong"), &query));
+        assert!(!is_authorized(Some("secret"), None, &HashMap::new()));
+    }
 }

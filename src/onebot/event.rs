@@ -93,6 +93,8 @@ pub struct ApiResponse {
     pub retcode: i32,
     pub data: Option<serde_json::Value>,
     pub echo: Option<String>,
+    pub message: Option<String>,
+    pub wording: Option<String>,
 }
 
 // ─── Helper functions ────────────────────────────────────────────────────────

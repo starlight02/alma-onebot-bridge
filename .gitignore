@@ -6,8 +6,7 @@
 config.toml
 
 # Persistent state (runtime-generated)
-bridge-state.db
-bridge-state.json
+*.db*
 
 # OS files
 .DS_Store

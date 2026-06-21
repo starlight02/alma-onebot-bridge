@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
@@ -35,7 +35,7 @@ pub async fn ensure_people_profile(
         .filter(|c| !c.is_empty());
     let group_id_str = group_id.map(|g| g.to_string());
 
-    let profile_path = state.config.people_dir.join(format!("{}.md", user_id));
+    let profile_path = resolve_profile_path_for_user(&state.config.people_dir, user_id);
     let preferred_name = sender
         .and_then(|s| s.nickname.as_deref())
         .filter(|n| !n.is_empty())
@@ -55,7 +55,12 @@ pub async fn ensure_people_profile(
                 user_id, e
             );
         } else {
-            state.set_profile(user_id_str.clone(), user_id_str).await;
+            let profile_name = profile_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&user_id_str)
+                .to_string();
+            state.set_profile(user_id_str.clone(), profile_name).await;
         }
         return;
     }
@@ -122,6 +127,38 @@ pub async fn ensure_people_profile(
         user_id,
         group_cards.len()
     );
+}
+
+fn resolve_profile_path_for_user(people_dir: &Path, user_id: i64) -> PathBuf {
+    let user_id = user_id.to_string();
+    find_profile_path_by_qq_id(people_dir, &user_id)
+        .unwrap_or_else(|| people_dir.join(format!("{}.md", user_id)))
+}
+
+fn find_profile_path_by_qq_id(people_dir: &Path, qq_id: &str) -> Option<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(people_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let (frontmatter, _) = split_frontmatter(&content);
+        let matched = extract_frontmatter_field_from_lines(&frontmatter, "qq_id")
+            .map(|value| value == qq_id)
+            .unwrap_or(false);
+        if matched {
+            return Some(path);
+        }
+    }
+
+    None
 }
 
 fn create_profile_file(
@@ -475,7 +512,7 @@ pub fn count_profiles(people_dir: &std::path::Path) -> usize {
 mod tests {
     use super::{
         GroupCardInfo, build_default_body, create_profile_file, extract_group_cards_from_body,
-        format_group_cards_section, sync_profile_file,
+        format_group_cards_section, resolve_profile_path_for_user, sync_profile_file,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -488,6 +525,14 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("alma-onebot-bridge-{name}-{nonce}.md"))
+    }
+
+    fn temp_profile_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("alma-onebot-bridge-{name}-{nonce}"))
     }
 
     #[test]
@@ -509,6 +554,30 @@ mod tests {
         assert!(content.contains("qq_id: \"42\""));
         assert!(!content.contains("group_cards:"));
         assert!(content.contains("- 群名片:\n  - 123: 群名片A"));
+    }
+
+    #[test]
+    fn resolve_profile_path_prefers_existing_qq_id_profile() {
+        let dir = temp_profile_dir("people-dir");
+        fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("Alice.md");
+        fs::write(
+            &existing,
+            r#"---
+qq_id: "42"
+username: "Alice"
+---
+# Alice
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_profile_path_for_user(&dir, 42);
+        let fallback = dir.join("42.md");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(resolved, existing);
+        assert_ne!(resolved, fallback);
     }
 
     #[test]
