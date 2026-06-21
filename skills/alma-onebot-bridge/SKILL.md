@@ -225,7 +225,7 @@ For full Alma WS protocol details and the event sequence, read `references/alma-
 The end-to-end flow for each QQ message:
 
 1. Extract plain text from message segments
-2. Filter group messages (require @bot), strip @mention
+2. For group messages, record observed text/media into the in-memory ring buffer and `~/.config/alma/groups/<group_id>_<date>.log` before the @bot gate
 3. Ensure People Profile exists for the sender
 4. Look up the Alma thread in the bridge's local `threads` table; if missing or stale, create/check it through Alma REST
 5. Format message like built-in Telegram:
@@ -235,7 +235,22 @@ The end-to-end flow for each QQ message:
 6. Send via Alma WS (`generate_response`) and await reply
 7. Split reply by paragraphs (`\n\n`), then by QQ's ~4500 char limit
 8. Send each chunk via OneBot `send_msg` API
-9. Register sent replies for dedup (bidirectional forwarding)
+9. Register sent replies for dedup (bidirectional forwarding) and append Alma's group replies to `~/.config/alma/groups`
+
+The bridge also exposes local HTTP command endpoints for active sends from Alma tools:
+
+- `GET /qq/groups` — list known QQ groups and current OneBot connection status
+- `POST /qq/group/<group_id>/send` with `{"message":"..."}` — send a QQ group message
+- `POST /qq/private/<user_id>/send` with `{"message":"..."}` — send a QQ private message
+
+Loopback requests are allowed. Non-loopback requests require `ACCESS_TOKEN` via
+`Authorization: Bearer <token>` or `?token=...`. For QQ groups, do not use Alma's
+`alma group send`; it is Telegram-specific.
+
+Inside `~/.config/alma/groups/README.md`, the bridge must only update its own
+`alma-onebot-bridge` marked section and must preserve content outside that section. The
+bridge section is a group directory only; it must not list known members or group cards.
+Keep identity/group-card details in People Profiles.
 
 ## Step 9: Bidirectional Forwarding
 
@@ -251,7 +266,8 @@ Dedup compares the first 100 characters of text, keeping the last 20 entries per
 
 ## Step 10: State Persistence with Turso
 
-Use a local SQLite-compatible Turso database for persisting thread mappings and user profiles:
+Use a local SQLite-compatible Turso database for persisting thread mappings, user profiles,
+QQ group titles, and observed group cards:
 
 ```sql
 CREATE TABLE threads (
@@ -261,6 +277,18 @@ CREATE TABLE threads (
 CREATE TABLE profiles (
     user_id TEXT PRIMARY KEY,
     profile_name TEXT NOT NULL
+);
+CREATE TABLE groups (
+    group_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    last_active TEXT NOT NULL DEFAULT '0'
+);
+CREATE TABLE group_members (
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    last_seen TEXT NOT NULL DEFAULT '0',
+    PRIMARY KEY (group_id, user_id)
 );
 ```
 

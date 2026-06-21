@@ -7,13 +7,14 @@ A bridge service that connects [Alma](https://github.com/anthropics/alma) (local
 - **Full Alma pipeline** — Messages go through Alma's WebSocket protocol, so SOUL, Memory, People Profiles, and Skills all work as expected
 - **Bidirectional sync** — Messages sent from the Alma GUI are forwarded to QQ, and vice versa
 - **Group chat support** — Responds to @mentions in group chats, with group card (群名片) as display name
-- **Group chat history** — Injects recent group messages into AI context so the bot knows what the group has been discussing
+- **Group chat history** — Injects recent group messages into AI context and writes QQ group logs to Alma's native `~/.config/alma/groups` directory
+- **Alma group CLI compatibility** — `alma group list/history/search/context` can see QQ group logs; active QQ sends use bridge HTTP endpoints because `alma group send` is Telegram-only
 - **Rich message handling** — Face emojis converted to readable text (`[emoji:斜眼笑]`), images/voice/video described with labels, forwarded messages summarized with content extraction
 - **Reply & @mention** — Full reply/quoting protocol (incoming quotes and outgoing reply references), with automatic @mention in group replies
 - **People Profiles** — Automatically creates Alma People Profile files for each QQ user, with `qq_id` frontmatter for cross-platform identity matching
 - **Message splitting** — Long replies are split by paragraph and QQ's 4500-character limit
-- **Persistent state** — Thread mappings and user profiles stored in a Turso database
-- **Security** — Optional WebSocket access token authentication (`Bearer` header)
+- **Persistent state** — Thread mappings, user profiles, QQ group titles, and group card metadata stored in a Turso database
+- **Security** — Optional WebSocket access token authentication (`Bearer` header); HTTP send endpoints allow loopback or a valid token
 - **Configurable** — TOML config file with environment variable overrides
 
 ## Architecture
@@ -124,7 +125,7 @@ Startup order: Alma → Bridge → OneBot client.
 | `DB_PATH` | `database.path` | `bridge-state.db` | Database file path |
 | `PEOPLE_DIR` | `people.dir` | `~/.config/alma/people` | People profiles directory |
 | `ONEBOT_API_TIMEOUT` | `onebot.api_timeout` | `30` | OneBot API timeout (seconds) |
-| `ACCESS_TOKEN` | `onebot.access_token` | *(none)* | Bearer token for WS auth |
+| `ACCESS_TOKEN` | `onebot.access_token` | *(none)* | Bearer token for WS auth and non-loopback HTTP command endpoints |
 | `GROUP_HISTORY_SIZE` | `chat.group_history_size` | `30` | Group history context size (0 = disabled) |
 | `THINKING_MESSAGE` | `chat.thinking_message` | *(none)* | Pre-generation indicator message |
 | `RUST_LOG` | — | `info` | Log level (env-filter syntax) |
@@ -135,7 +136,7 @@ Startup order: Alma → Bridge → OneBot client.
 
 1. QQ user sends a message (or @mentions the bot in a group)
 2. OneBot client pushes the event to the bridge via reverse WebSocket
-3. Bridge extracts text, face emojis, and media info; records to group history
+3. Bridge extracts text, face emojis, and media info; records to in-memory group history and `~/.config/alma/groups/<group_id>_<date>.log`
 4. Bridge handles reply/quoting context and forwarded message extraction
 5. Bridge ensures a People Profile exists for the user
 6. Bridge finds or creates an Alma thread (keyed by `private:{user_id}` or `group:{group_id}`)
@@ -146,6 +147,30 @@ Startup order: Alma → Bridge → OneBot client.
 ### Bidirectional Sync (Alma GUI → QQ)
 
 Messages typed in the Alma GUI for a tracked thread are forwarded to QQ. A dedup mechanism (first 100 characters) prevents echo loops when the bridge itself generates replies.
+
+### Alma Group Commands and Active Sends
+
+The bridge writes QQ group logs in Alma's native group-log format:
+
+```bash
+alma group list
+alma group history <qq_group_id> 100
+alma group search <keyword>
+alma group context <qq_group_id>
+cat ~/.config/alma/groups/README.md
+```
+
+Inside `~/.config/alma/groups/README.md`, the bridge only maintains its own `alma-onebot-bridge` marked section and preserves any content outside that section. This section intentionally does not list known members or group cards; those belong in People Profiles to avoid duplicating identity data.
+
+For QQ groups, `alma group send` remains a Telegram command inside Alma. Use the bridge endpoint for active QQ sends:
+
+```bash
+curl -s -X POST http://127.0.0.1:8090/qq/group/<qq_group_id>/send \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"hello"}'
+```
+
+Private QQ sends use `POST /qq/private/<qq_user_id>/send` with the same JSON body. If the request is not from loopback, configure `ACCESS_TOKEN` and send it as `Authorization: Bearer <token>`.
 
 ### Sender Identity
 

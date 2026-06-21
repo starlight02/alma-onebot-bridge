@@ -271,7 +271,8 @@ instead of writing this table directly.
 - **Reply/quoting context** — `buildReplyContext` for quoted messages, reply segment for outgoing
 - **Response delivery** — listen on WebSocket for `message_delta` / `message_updated` events
 - **People profile auto-creation** (optional) — create `.md` files for new users with platform IDs
-- **Group chat log** (optional) — write to `~/.config/alma/groups/` for cross-session context
+- **Group chat log** — write group logs to `~/.config/alma/groups/<chatId>_<YYYY-MM-DD>.log` so `alma group list/history/search/context` can read them
+- **Active sends for custom platforms** — do not rely on Telegram-only commands such as `alma group send`; expose a bridge-owned endpoint/tool and inject its usage into `ephemeralContext`
 
 ### Implementation Steps
 
@@ -324,5 +325,5 @@ the final text.
      "ephemeralContext":"..."}}
 8. Server streams back message_delta events (accumulate partType:"text" only)
 9. Bridge sends response to platform with reply reference to user's message_id
-10. Bridge optionally writes chat log to ~/.config/alma/groups/
+10. Bridge writes group chat logs to `~/.config/alma/groups/<chatId>_<YYYY-MM-DD>.log`; if the custom platform needs active sending, use a bridge-owned endpoint/tool rather than Telegram-only `alma group send`
 ```

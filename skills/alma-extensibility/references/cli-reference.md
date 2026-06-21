@@ -90,8 +90,9 @@ alma dm <userId> <message>               # Telegram DM
 alma msg delete <chatId> <messageId>     # Delete message
 alma send photo <path> [caption]         # Send photo
 alma send file <path> [caption]          # Send file
-alma group list                          # List Telegram groups
-alma group send <chatId> "text"          # Send to group
+alma group list                          # List groups with local logs under ~/.config/alma/groups
+alma group history <chatId> [limit]      # Read local group logs
+alma group send <chatId> "text"          # Telegram group send only
 alma voices                              # List TTS voices
 alma image models                        # List image gen models
 alma image generate <prompt>             # Generate image

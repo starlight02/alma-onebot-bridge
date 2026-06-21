@@ -202,23 +202,19 @@ VALUES ('uuid', 'telegram', '<qq_user_id>', '<qq_user_id>', '<thread_uuid>', 1, 
 
 ## Group Chat History Format
 
-Bridges optionally write group interaction logs to `~/.config/alma/groups/<group_id>.md`:
+Alma's `alma group list/history/search/context` commands read plain log files from
+`~/.config/alma/groups/<chatId>_<YYYY-MM-DD>.log`:
 
-```markdown
-# Group Chat: QQ Group 100200300
-
-## 2026-06-19
-
-[14:30] [msg:42] [萌依]: 大家好
-[14:31] [msg:43] [Alma (YOU)]: 你好！有什么可以帮忙的吗？
-[14:32] [msg:44] [Alice]: [Replying to Alma (YOU)'s message: "你好！"] 帮我查一下天气
-[14:33] [msg:45] [Alma (YOU)]: [Replying to Alice's message: "帮我查一下天气"] 好的，我来查
+```text
+[14:30:00] [msg:42] [萌依 [id:123456789]]: 大家好
+[14:31:00] [msg:43] [Alma (BOT)]: 你好！有什么可以帮忙的吗？
+[14:32:00] [msg:44] [Alice [id:987654321]]: [Replying to Alma's message: "你好！"] 帮我查一下天气
 ```
 
-Format: `[HH:MM] [msg:N] [DisplayName]: text`
+Format: `[HH:MM:SS] [msg:N] [DisplayName [id:userId]]: text`
 
 - `[msg:N]` uses real platform message IDs
-- `[Alma (YOU)]` marks the AI's own messages in the log
+- `[Alma (BOT)]` marks the AI's own messages in persistent logs
 - Reply context uses the same `[Replying to X's message: "..."]` pattern
-- Recent entries from this log are included in `ephemeralContext` as
-  `RECENT GROUP CHAT HISTORY` block (last ~30 messages)
+- Recent in-memory entries are also included in `ephemeralContext` as a `RECENT CHAT HISTORY` block
+- Active sends for custom platforms should use a bridge-owned endpoint/tool; Alma's `alma group send` is Telegram-specific

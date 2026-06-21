@@ -477,23 +477,29 @@ the bridge falls back to `[Forwarded message]` without content details.
 
 ### 2.15 Group Chat History Context
 
-The bridge maintains an in-memory ring buffer of recent group messages, injected into
-`ephemeralContext` so Alma's AI knows what the group has been discussing — even messages
-that didn't @mention the bot.
+The bridge maintains two group-history layers:
+
+1. An in-memory ring buffer of recent messages, injected into `ephemeralContext` for the
+   current turn.
+2. Persistent Alma-compatible logs under `~/.config/alma/groups/<group_id>_<date>.log`,
+   so `alma group list`, `alma group history`, `alma group search`, and the local-log part
+   of `alma group context` can see QQ group history.
 
 **Architecture**:
 
-- **Storage**: `HashMap<String, VecDeque<GroupMessage>>` in `AppState`, keyed by session key
-- **GroupMessage**: `{ display_name: String, text: String, timestamp: u64 }`
-- **Capacity**: Configurable via `group_history_size` (default: 30, set to 0 to disable)
-- **Persistence**: In-memory only — resets on bridge restart (intentional: ephemeral context)
+- **In-memory storage**: `HashMap<String, VecDeque<GroupMessage>>` in `AppState`, keyed by session key
+- **Persistent logs**: Alma-native files in `~/.config/alma/groups`
+- **Group directory**: bridge-owned marked section inside `~/.config/alma/groups/README.md`, generated from group titles and log files only; content outside the `alma-onebot-bridge` markers is preserved, and the bridge section intentionally omits known members/group cards because identity data belongs in People Profiles
+- **Metadata persistence**: local Turso tables `groups` and `group_members`
+- **Capacity**: `group_history_size` controls only the in-memory prompt context (default: 30, set to 0 to disable)
 
 **Pipeline order (critical)**:
 
 ```
 extract text + faces + media
   → compute display_name (BEFORE @bot check)
-  → record to group history (ALL group messages, before @bot gate)
+  → record to in-memory group history and Alma group log (ALL group messages, before @bot gate)
+  → update group title / member card metadata and the bridge-owned README.md section
   → @bot check (early return if no @bot)
   → ... rest of pipeline
 ```
@@ -506,15 +512,23 @@ bot-directed messages, defeating the purpose.
 **Injected format** (in `ephemeralContext`):
 
 ```
-RECENT GROUP CHAT HISTORY (last 5 messages):
-[14:30] Alice: 大家好
-[14:31] Bob: 你好啊
-[14:35] Charlie: 今天天气不错
-[14:36] Alice: 是啊
-[14:40] Bob: 出去玩吗
+RECENT CHAT HISTORY:
+NOTE: Messages marked [Alma (YOU)] are YOUR OWN previous messages. When someone directs commands at [Alma (YOU)], they are talking to YOU, not your owner.
+[14:30] [msg:42] [Alice]: 大家好
+[14:31] [msg:43] [Bob]: 你好啊
+[14:35] [msg:44] [Alma (YOU)]: 收到
+---END HISTORY---
 ```
 
-Timestamps are formatted as HH:MM in UTC+8. Each message is truncated at 200 chars.
+Persistent log format:
+
+```text
+[14:30:00] [msg:42] [Alice [id:123456789]]: 大家好
+[14:31:00] [msg:43] [Alma (BOT)]: 收到
+```
+
+Alma's `alma group send` is still Telegram-only. The bridge injects a QQ-specific override
+and exposes `POST /qq/group/<group_id>/send` for active QQ group sends.
 
 ### 2.16 Thinking Indicator (Optional)
 
@@ -920,8 +934,6 @@ cargo run --release
 - **Alma WS reconnection**: Currently the bridge does not auto-reconnect if the Alma WS drops
 - **Streaming to QQ**: Forward partial replies as they arrive (QQ rate-limits messages, so this
   would need throttling)
-- **Persistent group history**: Current in-memory ring buffer resets on restart; could persist
-  to SQLite or write to `~/.config/alma/groups/` for cross-session context
 - **Message edit/delete from Alma**: When Alma deletes or edits a message in the GUI, call
   OneBot `delete_msg` or edit equivalent (if supported by the OneBot implementation)
 
