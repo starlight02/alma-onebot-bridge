@@ -11,6 +11,9 @@ mod pipeline;
 mod state;
 
 use std::collections::HashMap;
+use std::env;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 
 use warp::Filter;
 
@@ -18,22 +21,60 @@ use crate::alma_ws::AlmaWsClient;
 use crate::config::Config;
 use crate::state::SharedState;
 
+/// PID file location for process discovery by the macOS GUI shell.
+fn pid_file_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/alma/bridge/bridge.pid")
+}
+
+fn write_pid_file() {
+    let path = pid_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let pid = std::process::id();
+    match std::fs::write(&path, pid.to_string()) {
+        Ok(_) => tracing::info!("  PID file    : {} (pid={})", path.display(), pid),
+        Err(e) => tracing::warn!("Failed to write PID file {}: {}", path.display(), e),
+    }
+}
+
+fn remove_pid_file() {
+    let path = pid_file_path();
+    match std::fs::remove_file(&path) {
+        Ok(_) => tracing::info!("Removed PID file: {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("Failed to remove PID file {}: {}", path.display(), e),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialize tracing (respects RUST_LOG env var, defaults to info)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let _tracing_guard = init_tracing();
 
-    let config = Config::from_env();
-    let state = SharedState::new(config.clone())
-        .await
-        .expect("Failed to initialize state database");
+    let debugger_mode = env::args().any(|arg| arg == "--debugger");
+    let mut config = Config::from_env();
+    if debugger_mode {
+        apply_debugger_defaults(&mut config);
+    }
+
+    let state = match SharedState::new(config.clone()).await {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::error!("Failed to initialize state database: {}", e);
+            tracing::error!(
+                "If another bridge/debugger is running, set DB_PATH to a different file or stop the existing process."
+            );
+            std::process::exit(1);
+        }
+    };
 
     tracing::info!("Alma OneBot Bridge starting...");
+    write_pid_file();
+    if debugger_mode {
+        tracing::info!("  Debugger    : enabled");
+    }
     tracing::info!("  Bridge port : {}", config.bridge_port);
     tracing::info!("  Alma API    : {}", config.alma_api);
     tracing::info!("  People dir  : {:?}", config.people_dir);
@@ -93,6 +134,37 @@ async fn main() {
         });
     }
 
+    // ── SIGHUP: hot-reload config ──────────────────────────────────────────
+    // macOS GUI shell sends SIGHUP after writing config.toml.
+    // Only reload fields that don't require re-binding the server port.
+    #[cfg(unix)]
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sighup =
+                signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+            loop {
+                sighup.recv().await;
+                tracing::info!("[SIGHUP] Reloading config from disk...");
+                let new_config = Config::from_env();
+                let mut cfg = state.config.write().await;
+                cfg.group_history_size = new_config.group_history_size;
+                cfg.thinking_message = new_config.thinking_message;
+                cfg.show_thinking = new_config.show_thinking;
+                cfg.alma_run_timeout_secs = new_config.alma_run_timeout_secs;
+                cfg.alma_max_retries = new_config.alma_max_retries;
+                cfg.alma_retry_delay_ms = new_config.alma_retry_delay_ms;
+                cfg.access_token = new_config.access_token;
+                cfg.onebot_api_timeout_secs = new_config.onebot_api_timeout_secs;
+                cfg.alma_model = new_config.alma_model;
+                cfg.alma_api = new_config.alma_api;
+                cfg.people_dir = new_config.people_dir;
+                tracing::info!("[SIGHUP] Config hot-reload complete");
+            }
+        });
+    }
+
     // ── Routes ───────────────────────────────────────────────────────────
 
     // GET /health — simple health check
@@ -136,15 +208,12 @@ async fn main() {
     // WS endpoint — accepts connections at /, /ws, and /onebot/v11/ws
     // Different OneBot implementations use different default paths
     // Extracts optional Authorization header for token validation
-    let expected_token = state.config.access_token.clone();
     let ws_handler = {
         let state = state.clone();
-        let expected_token = expected_token.clone();
         move |auth: Option<String>, query: HashMap<String, String>, ws: warp::ws::Ws| {
             let state = state.clone();
-            let expected = expected_token.clone();
             ws.on_upgrade(move |socket| {
-                handlers::ws::handle_ws_connection(socket, state, auth, query, expected)
+                handlers::ws::handle_ws_connection(socket, state, auth, query)
             })
         }
     };
@@ -193,6 +262,72 @@ async fn main() {
         .graceful(shutdown_signal())
         .run()
         .await;
+
+    remove_pid_file();
+}
+
+fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let log_path = env::var_os("BRIDGE_LOG_FILE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+
+    let Some(log_path) = log_path else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        return None;
+    };
+
+    let parent = log_path.parent().unwrap_or_else(|| Path::new("."));
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!(
+            "Failed to create log directory {}; falling back to stderr: {}",
+            parent.display(),
+            e
+        );
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        return None;
+    }
+
+    let file_name = log_path
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("bridge.log"));
+    let file_appender = tracing_appender::rolling::never(parent, file_name);
+    let (writer, guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(writer)
+        .init();
+    Some(guard)
+}
+
+fn apply_debugger_defaults(config: &mut Config) {
+    if env::var_os("DB_PATH").is_none() {
+        config.db_path = env::temp_dir().join(format!(
+            "alma-onebot-bridge-debugger-{}.db",
+            std::process::id()
+        ));
+    }
+
+    if env::var_os("BRIDGE_PORT").is_none()
+        && let Some(port) = first_available_port(18090, 20)
+    {
+        config.bridge_port = port;
+    }
+}
+
+fn first_available_port(start: u16, attempts: u16) -> Option<u16> {
+    for offset in 0..attempts {
+        let Some(port) = start.checked_add(offset) else {
+            break;
+        };
+        if TcpListener::bind(("0.0.0.0", port)).is_ok() {
+            return Some(port);
+        }
+    }
+    None
 }
 
 async fn shutdown_signal() {

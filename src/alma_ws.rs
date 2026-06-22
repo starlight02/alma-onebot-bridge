@@ -8,10 +8,10 @@
 //! Also forwards `message_added` events for bidirectional communication
 //! (Alma GUI → QQ).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -54,6 +54,15 @@ type PendingMap = Arc<Mutex<HashMap<String, PendingGeneration>>>;
 
 /// Per-thread mutex to serialize generate() calls for the same thread.
 type GenerationGuards = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+const RECENT_BRIDGE_GENERATION_TTL: Duration = Duration::from_secs(30);
+const RECENT_BRIDGE_GENERATION_LIMIT: usize = 8;
+
+#[derive(Clone, Debug)]
+struct RecentBridgeGeneration {
+    text: String,
+    completed_at: Instant,
+}
 
 /// Persistent WebSocket client for Alma's chat pipeline.
 #[derive(Clone)]
@@ -328,6 +337,8 @@ async fn run_connected_session(
     let (mut sink, mut stream) = ws_stream.split();
     let mut generating_threads: HashSet<String> = HashSet::new();
     let mut pending_assistant_updates: HashMap<String, AlmaEvent> = HashMap::new();
+    let mut recent_bridge_generations: HashMap<String, VecDeque<RecentBridgeGeneration>> =
+        HashMap::new();
 
     loop {
         tokio::select! {
@@ -369,6 +380,7 @@ async fn run_connected_session(
                             event_tx,
                             &mut generating_threads,
                             &mut pending_assistant_updates,
+                            &mut recent_bridge_generations,
                         )
                         .await;
                     }
@@ -437,13 +449,14 @@ fn pending_generation_parts(pg: &PendingGeneration) -> (String, Option<String>, 
     (trimmed, thinking, user_msg_id)
 }
 
-fn resolve_pending_generation(thread_id: &str, pg: PendingGeneration) {
+fn resolve_pending_generation(thread_id: &str, pg: PendingGeneration) -> Option<String> {
     let (trimmed, thinking, user_msg_id) = pending_generation_parts(&pg);
 
     if trimmed.is_empty() {
         let _ = pg
             .result_tx
             .send(Err("Empty response from Alma".to_string()));
+        None
     } else {
         info!(
             "[AlmaWS] Generation complete for thread {} ({} chars, user_msg_id={:?}, thinking={})",
@@ -455,7 +468,9 @@ fn resolve_pending_generation(thread_id: &str, pg: PendingGeneration) {
                 .map(|t| format!("{} chars", t.len()))
                 .unwrap_or("none".into())
         );
+        let completed_text = trimmed.clone();
         let _ = pg.result_tx.send(Ok((trimmed, user_msg_id, thinking)));
+        Some(completed_text)
     }
 }
 
@@ -468,14 +483,14 @@ async fn resolve_empty_generation_after_grace(pending: PendingMap, thread_id: St
     };
 
     if let Some(pg) = pending_generation {
-        resolve_pending_generation(&thread_id, pg);
+        let _ = resolve_pending_generation(&thread_id, pg);
     }
 }
 
 async fn complete_pending_or_start_empty_grace(
     pending: &PendingMap,
     thread_id: &str,
-) -> (bool, bool) {
+) -> (bool, bool, Option<String>) {
     let mut completed_generation = None;
     let mut start_empty_grace = false;
     let mut had_pending_generation = false;
@@ -502,17 +517,59 @@ async fn complete_pending_or_start_empty_grace(
     }
     drop(map);
 
-    if let Some(pg) = completed_generation {
-        resolve_pending_generation(thread_id, pg);
+    let completed_text = if let Some(pg) = completed_generation {
+        resolve_pending_generation(thread_id, pg)
     } else if start_empty_grace {
         let pending = pending.clone();
         let thread_id = thread_id.to_string();
         tokio::spawn(async move {
             resolve_empty_generation_after_grace(pending, thread_id).await;
         });
+        None
+    } else {
+        None
+    };
+
+    (had_pending_generation, start_empty_grace, completed_text)
+}
+
+fn remember_bridge_generation(
+    recent: &mut HashMap<String, VecDeque<RecentBridgeGeneration>>,
+    thread_id: &str,
+    text: Option<String>,
+) {
+    let Some(text) = text.filter(|text| !text.is_empty()) else {
+        return;
+    };
+
+    let deque = recent.entry(thread_id.to_string()).or_default();
+    deque.push_back(RecentBridgeGeneration {
+        text,
+        completed_at: Instant::now(),
+    });
+    while deque.len() > RECENT_BRIDGE_GENERATION_LIMIT {
+        deque.pop_front();
+    }
+}
+
+fn is_recent_bridge_generation(
+    recent: &mut HashMap<String, VecDeque<RecentBridgeGeneration>>,
+    thread_id: &str,
+    text: &str,
+) -> bool {
+    let Some(deque) = recent.get_mut(thread_id) else {
+        return false;
+    };
+
+    while let Some(front) = deque.front() {
+        if front.completed_at.elapsed() > RECENT_BRIDGE_GENERATION_TTL {
+            deque.pop_front();
+        } else {
+            break;
+        }
     }
 
-    (had_pending_generation, start_empty_grace)
+    deque.iter().any(|generation| generation.text == text)
 }
 
 /// Dispatch a parsed WebSocket event to pending generations and/or event channel.
@@ -522,6 +579,7 @@ async fn dispatch_event(
     event_tx: &mpsc::UnboundedSender<AlmaEvent>,
     generating_threads: &mut HashSet<String>,
     pending_assistant_updates: &mut HashMap<String, AlmaEvent>,
+    recent_bridge_generations: &mut HashMap<String, VecDeque<RecentBridgeGeneration>>,
 ) {
     let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let data = match msg.get("data") {
@@ -597,8 +655,9 @@ async fn dispatch_event(
                 generating_threads.insert(thread_id.to_string());
             } else {
                 generating_threads.remove(thread_id);
-                let (had_pending_generation, _) =
+                let (had_pending_generation, _, completed_text) =
                     complete_pending_or_start_empty_grace(pending, thread_id).await;
+                remember_bridge_generation(recent_bridge_generations, thread_id, completed_text);
 
                 if let Some(event) = pending_assistant_updates.remove(thread_id) {
                     if had_pending_generation {
@@ -721,6 +780,20 @@ async fn dispatch_event(
                     return;
                 }
 
+                if role == "assistant"
+                    && is_recent_bridge_generation(
+                        recent_bridge_generations,
+                        &thread_id,
+                        &event.message_text,
+                    )
+                {
+                    debug!(
+                        "[AlmaWS] message_updated: suppressing post-completion update for bridge-owned generation in thread {}",
+                        thread_id
+                    );
+                    return;
+                }
+
                 let _ = event_tx.send(event);
             }
         }
@@ -766,8 +839,9 @@ async fn dispatch_event(
             if let Some(thread_id) = data.get("threadId").and_then(|t| t.as_str()) {
                 debug!("[AlmaWS] Progress ({}) for thread {}", msg_type, thread_id);
                 generating_threads.remove(thread_id);
-                let (had_pending_generation, _) =
+                let (had_pending_generation, _, completed_text) =
                     complete_pending_or_start_empty_grace(pending, thread_id).await;
+                remember_bridge_generation(recent_bridge_generations, thread_id, completed_text);
                 if let Some(event) = pending_assistant_updates.remove(thread_id) {
                     if had_pending_generation {
                         debug!(
@@ -1025,6 +1099,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let mut generating_threads = HashSet::from(["thread-1".to_string()]);
         let mut pending_assistant_updates = HashMap::new();
+        let mut recent_bridge_generations = HashMap::new();
 
         dispatch_event(
             &json!({
@@ -1035,6 +1110,7 @@ mod tests {
             &event_tx,
             &mut generating_threads,
             &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
         )
         .await;
 
@@ -1049,6 +1125,7 @@ mod tests {
             &event_tx,
             &mut generating_threads,
             &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
         )
         .await;
 
@@ -1077,6 +1154,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let mut generating_threads = HashSet::from(["thread-2".to_string()]);
         let mut pending_assistant_updates = HashMap::new();
+        let mut recent_bridge_generations = HashMap::new();
 
         dispatch_event(
             &json!({
@@ -1087,6 +1165,7 @@ mod tests {
             &event_tx,
             &mut generating_threads,
             &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
         )
         .await;
 
@@ -1099,5 +1178,68 @@ mod tests {
         assert_eq!(result.1.as_deref(), Some("user-msg-2"));
         assert!(!pending.lock().await.contains_key("thread-2"));
         assert!(!generating_threads.contains("thread-2"));
+    }
+
+    #[tokio::test]
+    async fn post_completion_message_updated_for_bridge_generation_is_suppressed() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (result_tx, result_rx) = oneshot::channel();
+        pending.lock().await.insert(
+            "thread-3".to_string(),
+            PendingGeneration {
+                text: "同一条回复".to_string(),
+                user_message_id: Some("user-msg-3".to_string()),
+                empty_response_grace_started: false,
+                result_tx,
+            },
+        );
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut generating_threads = HashSet::from(["thread-3".to_string()]);
+        let mut pending_assistant_updates = HashMap::new();
+        let mut recent_bridge_generations = HashMap::new();
+
+        dispatch_event(
+            &json!({
+                "type": "thread_generating",
+                "data": {"id": "thread-3", "isGenerating": false}
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(1), result_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0, "同一条回复");
+
+        dispatch_event(
+            &json!({
+                "type": "message_updated",
+                "data": {
+                    "threadId": "thread-3",
+                    "id": "assistant-msg-3",
+                    "message": {
+                        "id": "assistant-msg-3",
+                        "role": "assistant",
+                        "parts": [{"type": "text", "text": "同一条回复"}]
+                    }
+                }
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+        )
+        .await;
+
+        assert!(event_rx.try_recv().is_err());
     }
 }

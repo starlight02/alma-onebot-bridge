@@ -36,6 +36,19 @@ pub async fn process_message_event(
     let message_type = event.message_type.as_deref().unwrap_or("unknown");
     let segments = event.message.as_deref().unwrap_or(&[]);
 
+    // ── Snapshot config values (avoids repeated RwLock reads) ──────────────
+    let (onebot_timeout, thinking_msg_cfg, show_thinking, max_retries, base_delay_ms, run_timeout) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.onebot_api_timeout_secs,
+            cfg.thinking_message.clone(),
+            cfg.show_thinking,
+            cfg.alma_max_retries,
+            cfg.alma_retry_delay_ms,
+            cfg.alma_run_timeout_secs,
+        )
+    };
+
     // ── Extract plain text + face emojis ────────────────────────────────────
     let text = extract_text(segments);
     let face_text = convert_faces_to_text(segments);
@@ -102,14 +115,7 @@ pub async fn process_message_event(
         if let Some(title) = state.get_group_title(group_id_value).await {
             Some(title)
         } else {
-            match get_group_name(
-                ws_tx,
-                pending,
-                group_id_value,
-                state.config.onebot_api_timeout_secs,
-            )
-            .await
-            {
+            match get_group_name(ws_tx, pending, group_id_value, onebot_timeout).await {
                 Ok(Some(title)) => {
                     state.set_group_title(group_id_value, title.clone()).await;
                     Some(title)
@@ -193,14 +199,7 @@ pub async fn process_message_event(
     let mut quoted_image_urls = Vec::new();
     let mut is_reply_to_bot = false;
     let reply_context = if let Some(reply_msg_id) = extract_reply_id(segments) {
-        match get_msg(
-            ws_tx,
-            pending,
-            &reply_msg_id,
-            state.config.onebot_api_timeout_secs,
-        )
-        .await
-        {
+        match get_msg(ws_tx, pending, &reply_msg_id, onebot_timeout).await {
             Ok(quoted) => {
                 is_reply_to_bot = quoted.sender_id == Some(bot_id);
                 quoted_image_urls = quoted.image_urls.clone();
@@ -261,14 +260,7 @@ pub async fn process_message_event(
     // ── Forwarded message content ─────────────────────────────────────────
     // If the message contains a forward segment, fetch the forwarded content
     let forward_context = if let Some(forward_id) = extract_forward_id(segments) {
-        match get_forward_msg(
-            ws_tx,
-            pending,
-            &forward_id,
-            state.config.onebot_api_timeout_secs,
-        )
-        .await
-        {
+        match get_forward_msg(ws_tx, pending, &forward_id, onebot_timeout).await {
             Ok(nodes) if !nodes.is_empty() => {
                 let summaries: Vec<String> = nodes
                     .iter()
@@ -345,7 +337,7 @@ pub async fn process_message_event(
             target_type,
             target_id,
             ALMA_ERROR_REPLY,
-            state.config.onebot_api_timeout_secs,
+            onebot_timeout,
         )
         .await;
         return Err(e);
@@ -468,7 +460,7 @@ pub async fn process_message_event(
     // ── Send thinking indicator (optional, config-gated) ─────────────────
     // If configured, sends a brief placeholder message before generation starts,
     // so users see activity while Alma is processing. OneBot v11 has no typing API.
-    if let Some(ref thinking_msg) = state.config.thinking_message {
+    if let Some(ref thinking_msg) = thinking_msg_cfg {
         let target_id = if is_group { group_id_value } else { user_id };
         let target_type = if is_group { "group" } else { "private" };
         match send_text_message(
@@ -477,7 +469,7 @@ pub async fn process_message_event(
             target_type,
             target_id,
             thinking_msg,
-            state.config.onebot_api_timeout_secs,
+            onebot_timeout,
         )
         .await
         {
@@ -490,8 +482,6 @@ pub async fn process_message_event(
     }
 
     let (reply, thinking) = {
-        let max_retries = state.config.alma_max_retries;
-        let base_delay_ms = state.config.alma_retry_delay_ms;
         let mut last_err = String::new();
 
         let mut result = None;
@@ -521,7 +511,7 @@ pub async fn process_message_event(
                     model.as_deref(),
                     &formatted_message,
                     file_parts.clone(),
-                    state.config.alma_run_timeout_secs,
+                    run_timeout,
                     source,
                     &ephemeral_ctx,
                 )
@@ -566,7 +556,7 @@ pub async fn process_message_event(
     let target_type = if is_group { "group" } else { "private" };
 
     // ── Send thinking content as separate message (if enabled) ────────────
-    if state.config.show_thinking
+    if show_thinking
         && let Some(ref think_text) = thinking
         && !think_text.is_empty()
     {
@@ -582,7 +572,7 @@ pub async fn process_message_event(
                 target_type,
                 target_id,
                 chunk,
-                state.config.onebot_api_timeout_secs,
+                onebot_timeout,
             )
             .await
             {
@@ -616,7 +606,7 @@ pub async fn process_message_event(
                         chunk,
                         reply_id,
                         at_user_id.as_deref(),
-                        state.config.onebot_api_timeout_secs,
+                        onebot_timeout,
                     )
                     .await
                 } else {
@@ -626,7 +616,7 @@ pub async fn process_message_event(
                         target_type,
                         target_id,
                         chunk,
-                        state.config.onebot_api_timeout_secs,
+                        onebot_timeout,
                     )
                     .await
                 }
@@ -637,7 +627,7 @@ pub async fn process_message_event(
                     target_type,
                     target_id,
                     chunk,
-                    state.config.onebot_api_timeout_secs,
+                    onebot_timeout,
                 )
                 .await
             };
@@ -751,7 +741,7 @@ async fn build_ephemeral_context(state: &SharedState, input: EphemeralContextInp
         input.sender_nickname,
         input.group_title,
         input.group_id,
-        state.config.bridge_port,
+        state.config.read().await.bridge_port,
     );
 
     if let Some(profile_block) =
@@ -800,6 +790,12 @@ pub async fn handle_alma_event(
         return Ok(());
     }
 
+    // ── Snapshot config values ──────────────────────────────────────────────
+    let (show_thinking, onebot_timeout) = {
+        let cfg = state.config.read().await;
+        (cfg.show_thinking, cfg.onebot_api_timeout_secs)
+    };
+
     // Only forward assistant messages from threads we're tracking
     let target = match state.get_qq_target(&event.thread_id).await? {
         Some(t) => t,
@@ -839,7 +835,7 @@ pub async fn handle_alma_event(
         event.message_text.len()
     );
 
-    if state.config.show_thinking
+    if show_thinking
         && let Some(ref think_text) = event.thinking_text
         && !think_text.is_empty()
     {
@@ -851,7 +847,7 @@ pub async fn handle_alma_event(
                 &target.target_type,
                 target.target_id,
                 chunk,
-                state.config.onebot_api_timeout_secs,
+                onebot_timeout,
             )
             .await
             {
@@ -877,7 +873,7 @@ pub async fn handle_alma_event(
             &target.target_type,
             target.target_id,
             chunk,
-            state.config.onebot_api_timeout_secs,
+            onebot_timeout,
         )
         .await
         {
@@ -953,7 +949,7 @@ async fn ensure_alma_ws_client(state: &SharedState) -> Result<AlmaWsClient, Stri
         return Ok(client);
     }
 
-    let client = AlmaWsClient::connect(&state.config.alma_api).await?;
+    let client = AlmaWsClient::connect(&state.config.read().await.alma_api).await?;
     state.set_alma_ws(client.clone()).await;
     Ok(client)
 }
@@ -1026,7 +1022,9 @@ pub(crate) async fn record_alma_group_output(
 pub(crate) async fn refresh_alma_group_directory_readme(state: &SharedState) {
     match state.group_directory_snapshot().await {
         Ok(entries) => {
-            if let Err(e) = group_log::write_group_readme(&entries, state.config.bridge_port) {
+            if let Err(e) =
+                group_log::write_group_readme(&entries, state.config.read().await.bridge_port)
+            {
                 debug!("[GroupDirectory] Failed to write README: {}", e);
             }
         }

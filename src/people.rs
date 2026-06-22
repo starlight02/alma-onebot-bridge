@@ -105,7 +105,7 @@ pub async fn ensure_people_profile(
         pending,
         "get_stranger_info",
         serde_json::json!({"user_id": user_id}),
-        state.config.onebot_api_timeout_secs,
+        state.config.read().await.onebot_api_timeout_secs,
     )
     .await
     {
@@ -169,8 +169,9 @@ async fn resolve_profile_path_for_user(state: &SharedState, user_id: i64) -> Pat
         return path;
     }
 
-    let people_dir = state.config.people_dir.clone();
+    let people_dir = state.config.read().await.people_dir.clone();
     let fallback = people_dir.join(format!("{}.md", user_id));
+    let people_dir_for_fallback = people_dir.clone();
     let user_id_for_scan = user_id.clone();
     let path = tokio::task::spawn_blocking(move || {
         find_profile_path_by_qq_id(&people_dir, &user_id_for_scan).unwrap_or(fallback)
@@ -178,7 +179,7 @@ async fn resolve_profile_path_for_user(state: &SharedState, user_id: i64) -> Pat
     .await
     .unwrap_or_else(|e| {
         warn!("[People] Profile path scan task failed: {}", e);
-        state.config.people_dir.join(format!("{}.md", user_id))
+        people_dir_for_fallback.join(format!("{}.md", user_id))
     });
 
     state
@@ -537,7 +538,7 @@ pub async fn find_sender_profile(
     qq_id: &str,
     display_name: &str,
 ) -> Option<String> {
-    let people_dir = state.config.people_dir.clone();
+    let people_dir = state.config.read().await.people_dir.clone();
     let qq_id = qq_id.to_string();
     let display_name = display_name.to_string();
     let cached_path = state.people_profile_paths.read().await.get(&qq_id).cloned();
@@ -627,7 +628,7 @@ fn profile_block_from_path(path: &Path, qq_id: &str, display_name: &str) -> Opti
 
 /// Count total .md profile files in the people directory.
 pub async fn count_profiles(state: &SharedState) -> usize {
-    let people_dir = state.config.people_dir.clone();
+    let people_dir = state.config.read().await.people_dir.clone();
     tokio::task::spawn_blocking(move || count_profiles_in_dir(&people_dir))
         .await
         .unwrap_or(0)

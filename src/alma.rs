@@ -5,7 +5,7 @@ use crate::state::SharedState;
 
 /// Create a new thread via Alma REST API. Returns the thread ID.
 pub async fn create_thread(state: &SharedState, title: &str) -> Result<String, String> {
-    let url = format!("{}/api/threads", state.config.alma_api);
+    let url = format!("{}/api/threads", state.config.read().await.alma_api);
 
     let resp = state
         .http_client
@@ -44,7 +44,11 @@ pub async fn fetch_thread_model(
     state: &SharedState,
     thread_id: &str,
 ) -> Result<Option<String>, String> {
-    let url = format!("{}/api/threads/{}", state.config.alma_api, thread_id);
+    let url = format!(
+        "{}/api/threads/{}",
+        state.config.read().await.alma_api,
+        thread_id
+    );
 
     let resp = state
         .http_client
@@ -77,7 +81,7 @@ pub async fn fetch_thread_model(
 ///
 /// Returns the model string (e.g. "anthropic:claude-sonnet-4-20250514").
 pub async fn fetch_default_model(state: &SharedState) -> Result<String, String> {
-    let url = format!("{}/api/settings", state.config.alma_api);
+    let url = format!("{}/api/settings", state.config.read().await.alma_api);
 
     let resp = state
         .http_client
@@ -111,7 +115,11 @@ pub async fn fetch_default_model(state: &SharedState) -> Result<String, String> 
 
 /// Check whether a thread ID exists through Alma's public REST API.
 pub async fn thread_exists(state: &SharedState, thread_id: &str) -> Result<bool, String> {
-    let url = format!("{}/api/threads/{}", state.config.alma_api, thread_id);
+    let url = format!(
+        "{}/api/threads/{}",
+        state.config.read().await.alma_api,
+        thread_id
+    );
 
     let resp = state
         .http_client

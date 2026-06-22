@@ -14,15 +14,15 @@ use crate::state::SharedState;
 const MAX_INCOMING_TEXT_BYTES: usize = 1_000_000;
 
 /// Handle a new reverse WebSocket connection from the OneBot client.
-/// Validates access token if configured (expected_token is Some).
+/// Validates the current access token if configured.
 pub async fn handle_ws_connection(
     ws: WebSocket,
     state: SharedState,
     auth_header: Option<String>,
     query: HashMap<String, String>,
-    expected_token: Option<String>,
 ) {
     // ── Access token validation ──────────────────────────────────────────
+    let expected_token = state.config.read().await.access_token.clone();
     if !is_ws_authorized(expected_token.as_deref(), auth_header.as_deref(), &query) {
         warn!("WebSocket connection rejected: invalid or missing access token");
         return;

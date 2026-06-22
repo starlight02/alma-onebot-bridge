@@ -174,7 +174,12 @@ impl Config {
 
     fn load_config_file() -> FileConfig {
         // Try multiple locations for config.toml
-        let candidates = [PathBuf::from("config.toml"), PathBuf::from("bridge.toml")];
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let candidates = [
+            PathBuf::from("config.toml"),
+            PathBuf::from("bridge.toml"),
+            home.join(".config/alma/bridge/config.toml"),
+        ];
 
         for path in &candidates {
             if let Ok(content) = std::fs::read_to_string(path) {

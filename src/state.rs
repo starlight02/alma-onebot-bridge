@@ -69,7 +69,7 @@ struct SentReply {
 /// Application-wide shared state.
 pub struct AppState {
     pub http_client: Client,
-    pub config: Config,
+    pub config: RwLock<Config>,
     pub db: turso::Database,
     pub default_model: RwLock<Option<String>>,
     pub alma_ws: RwLock<Option<AlmaWsClient>>,
@@ -169,7 +169,7 @@ impl SharedState {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("Failed to build HTTP client"),
-            config,
+            config: RwLock::new(config),
             db,
             default_model: RwLock::new(None),
             alma_ws: RwLock::new(None),
@@ -421,7 +421,8 @@ impl SharedState {
 
     pub async fn get_default_model(&self) -> Option<String> {
         // Bootstrap/fallback model priority for new threads or API fallback paths.
-        if let Some(ref m) = self.config.alma_model {
+        let cfg = self.config.read().await;
+        if let Some(ref m) = cfg.alma_model {
             return Some(m.clone());
         }
         self.default_model.read().await.clone()
@@ -472,7 +473,7 @@ impl SharedState {
     /// Record a group message in the in-memory history buffer.
     /// Respects `config.group_history_size` — if 0, does nothing.
     pub async fn record_group_message(&self, session_key: &str, msg: GroupMessage) {
-        let max_size = self.config.group_history_size;
+        let max_size = self.config.read().await.group_history_size;
         if max_size == 0 {
             return;
         }

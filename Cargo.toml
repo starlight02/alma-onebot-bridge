@@ -13,6 +13,7 @@ serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = "0.1.18"
 tracing = "0.1.44"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.23.3", features = ["v4"] }
 turso = { version = "0.7.0-pre.10", default-features = false }

@@ -51,8 +51,9 @@ pub async fn list_groups_handler(
     query: HashMap<String, String>,
     remote: Option<SocketAddr>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
+    let access_token = state.config.read().await.access_token.clone();
     if !is_http_command_authorized(
-        state.config.access_token.as_deref(),
+        access_token.as_deref(),
         auth_header.as_deref(),
         &query,
         remote,
@@ -121,8 +122,12 @@ async fn send_message_handler(
     query: HashMap<String, String>,
     remote: Option<SocketAddr>,
 ) -> Result<warp::reply::WithStatus<warp::reply::Json>, warp::Rejection> {
+    let (access_token, onebot_timeout) = {
+        let cfg = state.config.read().await;
+        (cfg.access_token.clone(), cfg.onebot_api_timeout_secs)
+    };
     if !is_http_command_authorized(
-        state.config.access_token.as_deref(),
+        access_token.as_deref(),
         auth_header.as_deref(),
         &query,
         remote,
@@ -184,7 +189,7 @@ async fn send_message_handler(
                     chunk,
                     reply_to_id,
                     body.at_user_id.as_deref(),
-                    state.config.onebot_api_timeout_secs,
+                    onebot_timeout,
                 )
                 .await
             } else {
@@ -194,7 +199,7 @@ async fn send_message_handler(
                     target_type,
                     target_id,
                     chunk,
-                    state.config.onebot_api_timeout_secs,
+                    onebot_timeout,
                 )
                 .await
             }
@@ -205,7 +210,7 @@ async fn send_message_handler(
                 target_type,
                 target_id,
                 chunk,
-                state.config.onebot_api_timeout_secs,
+                onebot_timeout,
             )
             .await
         };
