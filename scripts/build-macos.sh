@@ -54,7 +54,20 @@ APP_RESOURCE="$APP/Contents/Resources/alma-onebot-bridge"
 if [[ ! -x "$APP_RESOURCE" ]]; then
     echo "==> Xcode did not copy the bridge binary; installing it into app resources..."
     mkdir -p "$APP/Contents/Resources"
-    cp "$ROOT/target/$TARGET/release/alma-onebot-bridge" "$APP_RESOURCE"
+    read -r -a bridge_targets <<< "$RUST_BRIDGE_TARGETS"
+    bridge_binaries=()
+    for bridge_target in "${bridge_targets[@]}"; do
+        bridge_binary="$ROOT/target/$bridge_target/release/alma-onebot-bridge"
+        if [[ ! -x "$bridge_binary" ]]; then
+            cargo build --release --target "$bridge_target"
+        fi
+        bridge_binaries+=("$bridge_binary")
+    done
+    if (( ${#bridge_binaries[@]} == 1 )); then
+        cp "${bridge_binaries[0]}" "$APP_RESOURCE"
+    else
+        lipo -create "${bridge_binaries[@]}" -output "$APP_RESOURCE"
+    fi
     chmod +x "$APP_RESOURCE"
 fi
 
