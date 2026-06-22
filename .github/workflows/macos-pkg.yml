@@ -1,0 +1,190 @@
+name: macOS PKG
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test Rust bridge
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run Rust tests
+        run: cargo test
+
+  build-pkg:
+    name: Build macOS PKG (${{ matrix.package_arch }})
+    runs-on: macos-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package_arch: arm64
+            build_universal: "0"
+            target: aarch64-apple-darwin
+            archs: arm64
+          - package_arch: amd64
+            build_universal: "0"
+            target: x86_64-apple-darwin
+            archs: x86_64
+          - package_arch: universal
+            build_universal: "1"
+            target: ""
+            archs: "arm64 x86_64"
+    env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APP_SIGN_IDENTITY: ${{ secrets.APP_SIGN_IDENTITY }}
+      INSTALLER_SIGN_IDENTITY: ${{ secrets.INSTALLER_SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust macOS targets
+        run: |
+          xcodebuild -version
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Select signing mode
+        run: |
+          signing_names=(
+            MACOS_CERTIFICATE_P12_BASE64 \
+            MACOS_CERTIFICATE_PASSWORD \
+            KEYCHAIN_PASSWORD \
+            APP_SIGN_IDENTITY \
+            INSTALLER_SIGN_IDENTITY \
+            APPLE_ID \
+            APPLE_TEAM_ID \
+            APPLE_APP_SPECIFIC_PASSWORD
+          )
+
+          present=0
+          missing=0
+          for name in "${signing_names[@]}"; do
+            if [[ -n "${!name}" ]]; then
+              present=$((present + 1))
+            fi
+          done
+
+          if [[ "$present" -eq 0 ]]; then
+            echo "SIGNING_MODE=unsigned" >> "$GITHUB_ENV"
+            echo "No Apple signing secrets configured. Building unsigned PKG."
+            exit 0
+          fi
+
+          for name in "${signing_names[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing signing secret: $name" >&2
+              missing=1
+            fi
+          done
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo "Partial signing configuration is unsafe. Provide all signing secrets or remove them all for unsigned builds." >&2
+            exit 1
+          fi
+
+          echo "SIGNING_MODE=signed" >> "$GITHUB_ENV"
+          echo "Apple signing secrets configured. Building signed and notarized PKG."
+
+      - name: Import Apple signing certificates
+        run: |
+          if [[ "${SIGNING_MODE}" != "signed" ]]; then
+            echo "Skipping certificate import for unsigned build."
+            exit 0
+          fi
+
+          CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/productbuild \
+            -T /usr/bin/security
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+      - name: Build PKG installer
+        run: |
+          if [[ "${SIGNING_MODE}" == "signed" ]]; then
+            export NOTARIZE=1
+          else
+            unset APP_SIGN_IDENTITY INSTALLER_SIGN_IDENTITY
+          fi
+          export BUILD_UNIVERSAL="${{ matrix.build_universal }}"
+          export PACKAGE_ARCH="${{ matrix.package_arch }}"
+          export ARCHS="${{ matrix.archs }}"
+          if [[ -n "${{ matrix.target }}" ]]; then
+            export TARGET="${{ matrix.target }}"
+          fi
+          scripts/package-macos-pkg.sh
+
+      - name: Upload PKG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AlmaOneBotBridge-macOS-${{ matrix.package_arch }}-PKG
+          path: |
+            dist/macos/*.pkg
+            dist/macos/*.pkg.sha256
+          if-no-files-found: error
+
+      - name: Attach PKG to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ "${SIGNING_MODE}" == "unsigned" ]]; then
+            RELEASE_NOTES="Unsigned macOS PKG installer for $TAG_NAME. Gatekeeper will warn because this build has no Developer ID signature or notarization."
+          else
+            RELEASE_NOTES="Signed and notarized macOS PKG installer for $TAG_NAME."
+          fi
+
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" \
+              --title "$TAG_NAME" \
+              --notes "$RELEASE_NOTES" \
+              || true
+          fi
+
+          gh release upload "$TAG_NAME" dist/macos/*.pkg dist/macos/*.pkg.sha256 --clobber

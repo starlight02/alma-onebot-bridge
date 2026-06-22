@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="platforms/macos/AlmaOneBotBridge/Assets.xcassets/BridgeIcon.imageset/bridge-icon.svg" alt="Alma OneBot Bridge icon" width="128" height="128">
+</p>
+
 # Alma OneBot Bridge
 
 A bridge service that connects [Alma](https://github.com/anthropics/alma) to QQ through [OneBot v11](https://github.com/botuniverse/onebot-11). Alma replies in QQ private chats and groups through a reverse WebSocket connection.
@@ -75,6 +79,12 @@ Install it into `/Applications` for Launchpad:
 
 ```bash
 INSTALL_TO_APPLICATIONS=1 ./scripts/build-macos.sh
+```
+
+Build a PKG installer with license acceptance:
+
+```bash
+./scripts/package-macos-pkg.sh
 ```
 
 macOS guide: [platforms/macos/README.md](./platforms/macos/README.md).

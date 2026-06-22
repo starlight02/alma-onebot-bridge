@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="platforms/macos/AlmaOneBotBridge/Assets.xcassets/BridgeIcon.imageset/bridge-icon.svg" alt="Alma OneBot Bridge 图标" width="128" height="128">
+</p>
+
 # Alma OneBot Bridge
 
 将 [Alma](https://github.com/anthropics/alma) 通过 [OneBot v11](https://github.com/botuniverse/onebot-11) 接入 QQ。Alma 通过反向 WebSocket 回复 QQ 私聊和群聊。
@@ -74,6 +78,12 @@ platforms/macos/build/Build/Products/Release/AlmaOneBotBridge.app
 
 ```bash
 INSTALL_TO_APPLICATIONS=1 ./scripts/build-macos.sh
+```
+
+构建带开源协议确认页的 PKG 安装包：
+
+```bash
+./scripts/package-macos-pkg.sh
 ```
 
 macOS 说明：[platforms/macos/README.md](./platforms/macos/README.md)。
