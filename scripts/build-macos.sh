@@ -29,7 +29,7 @@ fi
 
 echo "==> Building Xcode project..."
 cd "$MACOS_DIR"
-xcodebuild \
+xcodebuild_args=(
     -project AlmaOneBotBridge.xcodeproj \
     -scheme AlmaOneBotBridge \
     -configuration "$CONFIGURATION" \
@@ -39,8 +39,14 @@ xcodebuild \
     ARCHS="$ARCHS" \
     ONLY_ACTIVE_ARCH="$ONLY_ACTIVE_ARCH" \
     MARKETING_VERSION="$VERSION" \
-    CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}" \
-    | tail -5
+    CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}"
+)
+
+if [[ "${CI:-}" == "true" ]]; then
+    xcodebuild "${xcodebuild_args[@]}"
+else
+    xcodebuild "${xcodebuild_args[@]}" | tail -5
+fi
 
 APP="build/Build/Products/$CONFIGURATION/AlmaOneBotBridge.app"
 APP_RESOURCE="$APP/Contents/Resources/alma-onebot-bridge"

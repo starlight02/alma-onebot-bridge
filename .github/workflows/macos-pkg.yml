@@ -60,9 +60,40 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Select Xcode with macOS 26 SDK
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          candidates=(
+            /Applications/Xcode_27*.app
+            /Applications/Xcode_26*.app
+            /Applications/Xcode-beta.app
+            /Applications/Xcode.app
+          )
+
+          selected=""
+          while IFS= read -r app; do
+            [[ -x "$app/Contents/Developer/usr/bin/xcodebuild" ]] || continue
+            if "$app/Contents/Developer/usr/bin/xcodebuild" -showsdks | grep -Eq "macosx2[67]"; then
+              selected="$app"
+              break
+            fi
+          done < <(printf "%s\n" "${candidates[@]}" | sort -r)
+
+          if [[ -z "$selected" ]]; then
+            echo "No installed Xcode provides the macOS 26 SDK required by the macOS app." >&2
+            xcodebuild -version || true
+            xcodebuild -showsdks || true
+            exit 1
+          fi
+
+          sudo xcode-select -s "$selected/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -E "macosx2[67]"
+
       - name: Install Rust macOS targets
         run: |
-          xcodebuild -version
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Select signing mode
