@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Run Rust tests
         run: cargo test
@@ -58,7 +58,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Select Xcode with macOS 26 SDK
         run: |
@@ -185,7 +185,7 @@ jobs:
           scripts/package-macos-pkg.sh
 
       - name: Upload PKG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: AlmaOneBotBridge-macOS-${{ matrix.package_arch }}-PKG
           path: |
