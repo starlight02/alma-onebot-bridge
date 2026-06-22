@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MACOS_DIR="$ROOT/platforms/macos"
 CONFIGURATION="${CONFIGURATION:-Release}"
+VERSION="${VERSION:-$(awk -F\" '/^version =/ {print $2; exit}' "$ROOT/Cargo.toml")}"
 HOST_ARCH="$(uname -m)"
 BUILD_UNIVERSAL="${BUILD_UNIVERSAL:-0}"
 
@@ -37,6 +38,7 @@ xcodebuild \
     RUST_BRIDGE_TARGETS="$RUST_BRIDGE_TARGETS" \
     ARCHS="$ARCHS" \
     ONLY_ACTIVE_ARCH="$ONLY_ACTIVE_ARCH" \
+    MARKETING_VERSION="$VERSION" \
     CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}" \
     | tail -5
 
