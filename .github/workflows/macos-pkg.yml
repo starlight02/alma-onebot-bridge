@@ -213,6 +213,7 @@ jobs:
           if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release create "$TAG_NAME" \
               --title "$TAG_NAME" \
+              --generate-notes \
               --notes "$RELEASE_NOTES" \
               || true
           fi
