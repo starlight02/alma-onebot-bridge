@@ -1549,7 +1549,7 @@ mod tests {
             .unwrap();
 
         let (alma_api, req_rx) = spawn_create_thread_server("thread-from-rest").await;
-        let mut config = Config::from_env();
+        let mut config = Config::load();
         config.alma_api = alma_api;
         config.db_path = bridge_db_path.clone();
         let state = SharedState::new(config).await.unwrap();

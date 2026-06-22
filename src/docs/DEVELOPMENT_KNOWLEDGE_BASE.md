@@ -56,7 +56,7 @@ flowchart LR
 
 | Module | Responsibility |
 |--------|---------------|
-| `config.rs` | Config from `config.toml` + env var overrides (priority: env > TOML > default) |
+| `config.rs` | Config from TOML files and defaults |
 | `state.rs` | Shared state with Turso persistence + in-memory group chat history ring buffer |
 | `onebot/event.rs` | OneBot v11 event/message serde types + helpers for text, media, face, forward extraction |
 | `onebot/api.rs` | Echo-based WS API call mechanism + `send_text_message`, `send_reply_message`, `get_msg`, `get_forward_msg` helpers |
@@ -94,8 +94,7 @@ the `alma run` CLI.
 
 ### 2.2 Alma WebSocket Protocol (`ws://localhost:23001/ws/threads`)
 
-**This is the primary interface for AI generation.** It is the same protocol used by the
-Alma GUI and `alma run` CLI, ensuring full pipeline access.
+Alma GUI and `alma run` use this protocol for AI generation and pipeline access.
 
 #### Generating a Response
 
@@ -141,8 +140,8 @@ The full event sequence observed from a `generate_response` call:
 | `message_added` | **Always empty** for assistant | Fires immediately when message shell is created |
 | `message_updated` | **Partial** during generation, **full** after completion | Fires multiple times |
 
-**Implication for bidirectional forwarding**: You CANNOT use `message_added` to capture
-assistant replies — the text is always empty. Use `message_updated` and filter by
+**Implication for bidirectional forwarding**: Do not use `message_added` to capture
+assistant replies; the text is empty. Use `message_updated` and filter by
 generation state (only forward the final update after `thread_generating {isGenerating: false}`).
 
 #### Message Parts Format
@@ -278,14 +277,14 @@ username: "Alice"
 - 首次互动: 2026-06-19
 ```
 
-**Important**: Use `username` (not `qq_nickname`) in frontmatter — this matches
+Use `username` (not `qq_nickname`) in frontmatter. This matches
 Alma's standard field naming. Include both `telegram_id` and `qq_id` so the same
 person can be matched by both the QQ bridge and the Telegram bridge.
 
 Profile files are named by QQ ID (not nickname) to prevent collisions when different
 users share the same display name across groups.
 
-When Alma processes a message, it automatically loads relevant People Profiles
+When Alma processes a message, it loads relevant People Profiles
 into the AI context based on the `qq_id` field, giving the AI "memory" about QQ users.
 
 ### 2.8 Message Format (Telegram-Style for Alma Protocol)
@@ -551,8 +550,6 @@ immediately while Alma processes.
 thinking_message = "思考中..."
 ```
 
-Or env var: `THINKING_MESSAGE="思考中..."`
-
 **Behavior**: When enabled, the bridge sends a plain text message (NOT as a reply) to the
 chat before calling `alma_ws.generate()`. The actual AI reply follows as a separate message
 (with reply segment + @mention). This adds one extra message per interaction.
@@ -599,21 +596,21 @@ as a query parameter, but the bridge only validates the header.
 1. Warp extracts `Authorization` header as `Option<String>` before WS upgrade
    (using `warp::header::optional::<String>("authorization")`)
 2. Handler compares the extracted token against the configured `access_token`
-3. If `access_token` is not configured (`None`), all connections are accepted
+3. Without `access_token`, the bridge accepts all connections
 4. If configured and the header is missing, malformed, or doesn't match, the connection
    is rejected with a warning log and immediately closed
 
-**Configuration**: `ACCESS_TOKEN` env var or `onebot.access_token` in config.toml.
+**Configuration**: `onebot.access_token` in config.toml.
 
 ---
 
 ## 3. Configuration
 
-Configuration supports **three layers** with priority: **env vars > config.toml > defaults**.
+Use TOML for bridge settings. Runtime environment variables only carry process
+metadata such as log paths.
 
-The repository ships with `config.toml.example` as a template. Copy it to `config.toml`
-and edit as needed. `config.toml` is in `.gitignore` to prevent committing local settings
-(especially `access_token` values).
+The repo ships `config.toml.example` as a template. Copy it to `config.toml`.
+Git ignores `config.toml`, which keeps local values such as `access_token` out of commits.
 
 ### config.toml
 
@@ -643,33 +640,40 @@ group_history_size = 30        # Number of recent group messages for context (0 
 # thinking_message = "思考中..."  # Optional message sent before AI generation starts
 ```
 
-The bridge looks for `config.toml` or `bridge.toml` in the current directory.
+The bridge reads config in this order:
 
-### Environment Variables
+1. `config.toml` in the current directory
+2. `bridge.toml` in the current directory
+3. `~/.config/alma/bridge/config.toml`
+4. defaults
 
-| Variable | TOML Key | Default | Description |
-|----------|----------|---------|-------------|
-| `BRIDGE_PORT` | `bridge.port` | `8090` | WebSocket/HTTP listen port |
-| `ALMA_API` | `alma.api` | `http://localhost:23001` | Alma REST API base URL |
-| `ALMA_MODEL` | `alma.model` | *(Alma settings)* | Override AI model |
-| `ALMA_TIMEOUT` | `alma.timeout` | `120` | Generation timeout (seconds) |
-| `ALMA_MAX_RETRIES` | `alma.max_retries` | `2` | Number of retry attempts for failed generations |
-| `ALMA_RETRY_DELAY` | `alma.retry_delay_ms` | `3000` | Base delay between retries (ms, exponential backoff) |
-| `PEOPLE_DIR` | `people.dir` | `~/.config/alma/people` | People profiles directory |
-| `DB_PATH` | `database.path` | `bridge-state.db` | Turso database file path |
-| `ONEBOT_API_TIMEOUT` | `onebot.api_timeout` | `30` | OneBot API call timeout (seconds) |
-| `ACCESS_TOKEN` | `onebot.access_token` | *(none)* | OneBot access token for WS auth |
-| `GROUP_HISTORY_SIZE` | `chat.group_history_size` | `30` | Number of recent group messages for context (0 = disabled) |
-| `THINKING_MESSAGE` | `chat.thinking_message` | *(none)* | Optional "thinking" message sent before generation |
-| `RUST_LOG` | *(n/a)* | `info` | Tracing log level (env-filter syntax) |
+The macOS app starts the bridge in `~/.config/alma/bridge`, so the GUI-managed
+`config.toml` controls the app.
+
+### Configuration Keys
+
+| TOML Key | Default | Description |
+|----------|---------|-------------|
+| `bridge.port` | `8090` | WebSocket/HTTP listen port |
+| `alma.api` | `http://localhost:23001` | Alma REST API base URL |
+| `alma.model` | *(Alma settings)* | Override AI model |
+| `alma.timeout` | `120` | Generation timeout (seconds) |
+| `alma.max_retries` | `2` | Number of retry attempts for failed generations |
+| `alma.retry_delay_ms` | `3000` | Base delay between retries (ms, exponential backoff) |
+| `people.dir` | `~/.config/alma/people` | People profiles directory |
+| `database.path` | `bridge-state.db` | Turso database file path |
+| `onebot.api_timeout` | `30` | OneBot API call timeout (seconds) |
+| `onebot.access_token` | *(none)* | OneBot access token for WS auth |
+| `chat.group_history_size` | `30` | Number of recent group messages for context (0 = disabled) |
+| `chat.thinking_message` | *(none)* | Optional "thinking" message sent before generation |
+| `chat.show_thinking` | `false` | Send thinking blocks as separate QQ messages |
 
 ### Model Priority
 
 The AI model used for generation follows this priority:
-1. `ALMA_MODEL` env var (highest)
-2. `alma.model` in config.toml
-3. Alma's default model from `GET /api/settings` → `chat.defaultModel`
-4. Hardcoded fallback: `anthropic:claude-sonnet-4-20250514`
+1. `alma.model` in config.toml
+2. Alma's default model from `GET /api/settings` → `chat.defaultModel`
+3. Hardcoded fallback: `anthropic:claude-sonnet-4-20250514`
 
 ---
 
@@ -712,8 +716,8 @@ warp = { version = "0.4", features = ["server", "websocket"] }
 
 ### 5.2 `message_added` Has Empty Text for Assistant Messages
 
-**This is the #1 pitfall for bidirectional forwarding.** When Alma creates an assistant
-message, it fires `message_added` with an empty `parts` array (text = ""). The text is
+Bidirectional forwarding usually breaks here. When Alma creates an assistant
+message, it fires `message_added` with an empty `parts` array (`text = ""`). The text is
 populated later via `message_delta` events, and the complete text arrives in the final
 `message_updated` event.
 
@@ -753,7 +757,7 @@ In Warp, `ws.split()` returns `(SplitSink, SplitStream)`. You cannot use the
 
 1. Split the WS into sink + stream
 2. Create an `mpsc::unbounded_channel`
-3. Spawn a dedicated writer task that reads from the channel and writes to the sink
+3. Spawn a writer task that reads from the channel and writes to the sink
 4. Any task can send to the channel
 
 ### 5.7 OneBot Group Messages: @bot Required
@@ -787,9 +791,9 @@ Always use the **array format** for messages, not the CQ string format:
 
 The bridge accepts connections at three paths:
 
-- `/` — generic root path
-- `/ws` — NapCat/snowluma default (`ws://host:port/ws`)
-- `/onebot/v11/ws` — Lagrange default
+- `/`: generic root path
+- `/ws`: NapCat/snowluma default (`ws://host:port/ws`)
+- `/onebot/v11/ws`: Lagrange default
 
 If the OneBot client is configured for a path the bridge doesn't listen on,
 the connection will be rejected.
@@ -916,9 +920,6 @@ or the host's LAN IP to reach the bridge on the Mac host.
 ```bash
 cargo build --release
 ./target/release/alma-onebot-bridge
-
-# Or with custom config:
-RUST_LOG=debug BRIDGE_PORT=8080 ./target/release/alma-onebot-bridge
 
 # Or using config.toml (recommended):
 cp config.toml.example config.toml

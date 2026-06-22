@@ -23,7 +23,7 @@ struct AlmaOneBotBridgeApp: App {
                   : "bolt.horizontal.circle")
                 .symbolRenderingMode(.hierarchical)
         }
-        .menuBarExtraStyle(.menu)
+        .menuBarExtraStyle(.window)
 
         Settings {
             SettingsView()
@@ -35,6 +35,7 @@ struct AlmaOneBotBridgeApp: App {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     static var configManager: ConfigManager?
+    private var isTerminating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -44,8 +45,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        Self.configManager?.stopBridgeForQuit()
-        return .terminateNow
+        guard !isTerminating else { return .terminateLater }
+        isTerminating = true
+
+        guard let configManager = Self.configManager else {
+            return .terminateNow
+        }
+
+        configManager.stopBridgeForQuit {
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(

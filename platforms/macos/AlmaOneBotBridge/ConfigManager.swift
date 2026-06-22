@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import TOMLKit
 import os.log
+import Darwin
 
 private let log = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "AlmaOneBotBridge",
@@ -68,6 +69,10 @@ final class ConfigManager: ObservableObject {
         refreshBridgeStatus()
         guard !isBridgeRunning else { return }
         startBridge()
+    }
+
+    func refreshStatus() {
+        refreshBridgeStatus()
     }
 
     func startBridge() {
@@ -144,7 +149,7 @@ final class ConfigManager: ObservableObject {
         requestStop(pid: pid)
         waitForExit(pid: pid) { [weak self] didExit in
             guard let self else { return }
-            if !didExit {
+            if !didExit, self.isManagedBridgeProcess(pid) {
                 kill(pid, SIGKILL)
                 self.removePIDFileIfMatches(pid)
             }
@@ -164,7 +169,7 @@ final class ConfigManager: ObservableObject {
         requestStop(pid: pid)
         waitForExit(pid: pid) { [weak self] didExit in
             guard let self else { return }
-            if !didExit {
+            if !didExit, self.isManagedBridgeProcess(pid) {
                 kill(pid, SIGKILL)
                 self.removePIDFileIfMatches(pid)
             }
@@ -174,9 +179,24 @@ final class ConfigManager: ObservableObject {
         }
     }
 
-    func stopBridgeForQuit() {
-        guard let pid = currentBridgePID() else { return }
+    func stopBridgeForQuit(completion: @escaping () -> Void) {
+        guard let pid = currentBridgePID() else {
+            completion()
+            return
+        }
         requestStop(pid: pid)
+        waitForExit(pid: pid, attempts: 15) { [weak self] didExit in
+            guard let self else {
+                completion()
+                return
+            }
+            if !didExit, self.isManagedBridgeProcess(pid) {
+                kill(pid, SIGKILL)
+                self.removePIDFileIfMatches(pid)
+            }
+            self.markStopped()
+            completion()
+        }
     }
 
     private func handleBridgeTermination(_ terminatedProcess: Process) {
@@ -202,8 +222,11 @@ final class ConfigManager: ObservableObject {
     private func requestStop(pid: pid_t) {
         if let process, process.isRunning, process.processIdentifier == pid {
             process.terminate()
-        } else {
+        } else if isManagedBridgeProcess(pid) {
             kill(pid, SIGTERM)
+        } else {
+            removePIDFileIfMatches(pid)
+            log.warning("Skipped SIGTERM for non-bridge pid=\(pid)")
         }
     }
 
@@ -213,10 +236,10 @@ final class ConfigManager: ObservableObject {
         completion: @escaping (Bool) -> Void
     ) {
         guard attempts > 0 else {
-            completion(!isPIDAlive(pid))
+            completion(!isManagedBridgeProcess(pid))
             return
         }
-        if !isPIDAlive(pid) {
+        if !isManagedBridgeProcess(pid) {
             completion(true)
             return
         }
@@ -230,7 +253,7 @@ final class ConfigManager: ObservableObject {
     private func startStatusMonitor() {
         refreshBridgeStatus()
         statusTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.refreshBridgeStatus()
             }
         }
@@ -240,7 +263,7 @@ final class ConfigManager: ObservableObject {
         let runningProcessPID = process?.isRunning == true ? process?.processIdentifier : nil
         let pidFromFile = readPIDFile()
         let pid = runningProcessPID ?? pidFromFile
-        let running = pid.map(isPIDAlive) ?? false
+        let running = runningProcessPID != nil || pidFromFile.map(isManagedBridgeProcess) == true
 
         if !running, let stalePID = pidFromFile {
             removePIDFileIfMatches(stalePID)
@@ -429,7 +452,11 @@ final class ConfigManager: ObservableObject {
     }
 
     private func bridgeEnvironment() -> [String: String] {
-        var environment = ProcessInfo.processInfo.environment
+        let parentEnvironment = ProcessInfo.processInfo.environment
+        var environment: [String: String] = [:]
+        for key in ["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE"] {
+            environment[key] = parentEnvironment[key]
+        }
         environment["RUST_LOG"] = "info"
         environment["BRIDGE_LOG_FILE"] = logFileURL.path()
         environment["ALMA_ONEBOT_BRIDGE_MANAGED_BY"] = "macos"
@@ -453,7 +480,7 @@ final class ConfigManager: ObservableObject {
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.logFileHandle?.write(data)
             }
         }
@@ -463,7 +490,7 @@ final class ConfigManager: ObservableObject {
         if let process, process.isRunning {
             return process.processIdentifier
         }
-        if let pid = readPIDFile(), isPIDAlive(pid) {
+        if let pid = readPIDFile(), isManagedBridgeProcess(pid) {
             return pid
         }
         return nil
@@ -477,7 +504,24 @@ final class ConfigManager: ObservableObject {
     }
 
     private func isPIDAlive(_ pid: pid_t) -> Bool {
-        kill(pid, 0) == 0
+        if kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
+    }
+
+    private func isManagedBridgeProcess(_ pid: pid_t) -> Bool {
+        guard isPIDAlive(pid), let executablePath = executablePath(for: pid) else {
+            return false
+        }
+        return URL(fileURLWithPath: executablePath).lastPathComponent == "alma-onebot-bridge"
+    }
+
+    private func executablePath(for pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        return String(cString: buffer)
     }
 
     private func removePIDFileIfMatches(_ pid: pid_t) {

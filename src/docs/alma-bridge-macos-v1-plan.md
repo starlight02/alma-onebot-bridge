@@ -1,5 +1,9 @@
 # Alma OneBot Bridge — macOS 原生应用 V1 精简方案
 
+> **当前状态**：此文档保留为 V1 设计记录。当前 macOS 应用已经包含菜单栏托管、
+> 启动/停止/重启、健康检查、原生设置、日志入口和自动安装脚本。面向用户的最新说明
+> 以 [`platforms/macos/README.md`](../../platforms/macos/README.md) 为准。
+
 > **目标系统**：macOS 26.0+（Tahoe → Golden Gate）  
 > **V1 范围**：菜单栏图标 + 单个设置页面 + 进程状态 + SIGHUP 热重载  
 > **架构**：Monorepo，GUI 壳在 `platforms/macos/`  

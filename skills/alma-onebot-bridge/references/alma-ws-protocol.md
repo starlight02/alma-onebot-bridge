@@ -194,7 +194,6 @@ presence of `data.message_id` alone as success.
 
 The AI model used for generation follows this priority:
 
-1. `ALMA_MODEL` env var (highest priority)
-2. `alma.model` in `config.toml`
-3. Alma's default model from `GET /api/settings` -> `chat.defaultModel`
-4. Hardcoded fallback: `anthropic:claude-sonnet-4-20250514`
+1. `alma.model` in `config.toml`
+2. Alma's default model from `GET /api/settings` -> `chat.defaultModel`
+3. Hardcoded fallback: `anthropic:claude-sonnet-4-20250514`

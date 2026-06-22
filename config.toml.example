@@ -1,6 +1,7 @@
 # Alma OneBot Bridge Configuration
 # Copy this file to config.toml and edit as needed.
-# Environment variables take priority over config file values.
+# Configure bridge behavior here or in the macOS settings window.
+# Environment variables are reserved for runtime metadata such as log paths.
 
 [bridge]
 port = 8090

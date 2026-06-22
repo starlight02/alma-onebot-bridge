@@ -1,22 +1,22 @@
 # Alma OneBot Bridge
 
-将 [Alma](https://github.com/anthropics/alma)（本地 AI 聊天助手）通过 [OneBot v11](https://github.com/botuniverse/onebot-11) 协议接入 QQ 的桥接服务。采用反向 WebSocket 架构，让 Alma 可以作为 QQ 私聊和群聊中的机器人使用。
+将 [Alma](https://github.com/anthropics/alma) 通过 [OneBot v11](https://github.com/botuniverse/onebot-11) 接入 QQ。Alma 通过反向 WebSocket 回复 QQ 私聊和群聊。
 
 ## 特性
 
-- **完整 Alma 管线** — 消息通过 Alma WebSocket 协议处理，SOUL、Memory、People Profiles、Skills 全部生效
-- **双向同步** — Alma GUI 中发送的消息会转发到 QQ，反之亦然
-- **群聊支持** — 群聊中 @bot 才响应，使用群名片作为显示名称
-- **群聊历史** — 将最近群聊消息注入 AI 上下文，并把 QQ 群日志写入 Alma 原生 `~/.config/alma/groups` 目录
-- **Alma 群命令兼容** — `alma group list/history/search/context` 可以看到 QQ 群日志；QQ 主动发送走桥接器 HTTP 端点，因为 `alma group send` 是 Telegram 专用命令
-- **富消息处理** — QQ 表情转换为可读文本（`[emoji:斜眼笑]`），图片/语音/视频以标签描述，转发消息提取内容摘要
-- **回复 & @提及** — 完整的引用/回复协议（incoming 引用上下文 + outgoing 回复引用），群聊回复自动 @用户
-- **People Profiles** — 自动为每个 QQ 用户创建 Alma People Profile 文件，包含 `qq_id` 前置标识，支持跨平台身份匹配
-- **消息分段** — 长回复按段落和 QQ 的 4500 字限制自动拆分
-- **状态持久化** — 线程映射、用户资料、QQ 群名和群名片元数据存储在 Turso 数据库中
-- **安全认证** — 可选的 WebSocket 访问令牌认证（`Bearer` 头）；HTTP 发送端点允许本机 loopback 或有效 token
-- **灵活配置** — TOML 配置文件 + 环境变量覆盖
-- **macOS 原生应用** — 菜单栏应用会启动并托管桥接服务，提供原生设置、日志、启动/停止/重启和退出控制
+- **Alma 管线**：消息走 Alma WebSocket 协议，SOUL、Memory、People Profiles、Skills 都会生效。
+- **双向同步**：Alma GUI 消息转发到 QQ，QQ 消息创建或复用 Alma 线程。
+- **群聊支持**：群聊需要 @bot 才响应，显示名优先使用群名片。
+- **群聊历史**：桥接器把最近群聊消息放进上下文，并写入 `~/.config/alma/groups`。
+- **Alma 群命令兼容**：`alma group list/history/search/context` 可以读取 QQ 群日志。主动发 QQ 消息走桥接器 HTTP 端点，因为 `alma group send` 面向 Telegram。
+- **富消息处理**：桥接器把 QQ 表情转成文本，给图片/语音/视频加标签，并提取转发消息内容。
+- **回复和 @提及**：桥接器处理 incoming 引用上下文和 outgoing 回复引用，群聊回复会 @发送者。
+- **People Profiles**：桥接器为 QQ 用户创建 Alma People Profile，写入 `qq_id` frontmatter。
+- **消息分段**：长回复先按段落拆分，再按 QQ 的 4500 字限制拆分。
+- **状态持久化**：Turso 保存线程映射、用户资料、QQ群名和群名片元数据。
+- **安全认证**：WebSocket 可要求 `Bearer` token。HTTP 发送端点接受本机 loopback 或有效 token。
+- **配置**：支持 TOML 配置文件和 macOS 设置窗口。
+- **macOS 应用**：菜单栏应用管理桥接服务、设置、日志、启动/停止/重启和退出。
 
 ## 架构
 
@@ -55,9 +55,8 @@ cargo build --release
 
 ### macOS 菜单栏应用
 
-macOS 原生应用会把 Rust 桥接服务作为受管后台进程运行。从 Finder 或启动台打开
-`AlmaOneBotBridge.app` 后，桥接服务会自动启动，菜单栏会显示状态图标；退出应用时会
-停止受管的桥接进程。
+macOS 应用从菜单栏运行 Rust 桥接服务。它负责启动/停止桥接服务，打开设置窗口，
+写入 `~/.config/alma/bridge/config.toml`，并把日志放在同一目录。
 
 构建 app bundle：
 
@@ -71,24 +70,13 @@ macOS 原生应用会把 Rust 桥接服务作为受管后台进程运行。从 F
 platforms/macos/build/Build/Products/Release/AlmaOneBotBridge.app
 ```
 
-要让它出现在启动台，可以复制到 `/Applications`，也可以让脚本安装：
+安装到 `/Applications` 后，启动台会显示它：
 
 ```bash
 INSTALL_TO_APPLICATIONS=1 ./scripts/build-macos.sh
 ```
 
-应用使用下面这些路径保存配置和运行日志：
-
-```text
-~/.config/alma/bridge/config.toml
-~/.config/alma/bridge/bridge.log
-~/.config/alma/bridge/bridge.pid
-```
-
-菜单栏提供 **Start**、**Stop**、**Restart**、**Preferences**、**Open Config Directory**、
-**Open Bridge Log** 和 **Quit**。在设置窗口保存后，聊天参数、模型覆盖和超时参数会通过
-`SIGHUP` 热重载；监听端口、Alma API 地址、访问令牌、数据库路径这类无法安全热重载的
-配置会自动重启受管的桥接进程。
+macOS 说明：[platforms/macos/README.md](./platforms/macos/README.md)。
 
 ### 配置
 
@@ -119,9 +107,7 @@ group_history_size = 30        # 群聊历史上下文条数（0 = 禁用）
 # thinking_message = "思考中..."  # AI 生成前发送的提示消息（可选）
 ```
 
-> **注意**：`config.toml` 已在 `.gitignore` 中，不会被提交到 git。仓库只追踪 `config.toml.example` 模板。
-
-环境变量优先级高于配置文件（如 `ALMA_MODEL`、`BRIDGE_PORT`）。
+> **注意**：Git 忽略 `config.toml`。仓库只追踪 `config.toml.example`。
 
 ### 配置 OneBot 客户端
 
@@ -155,34 +141,33 @@ group_history_size = 30        # 群聊历史上下文条数（0 = 禁用）
 # 开启调试日志
 RUST_LOG=debug ./target/release/alma-onebot-bridge
 
-# 本地 debugger 模式：默认避开生产 DB 和端口，除非显式覆盖
+# 本地 debugger 模式：使用临时 DB，并从 18090 起选择第一个可用端口
 RUST_LOG=debug ./target/debug/alma-onebot-bridge --debugger
 ```
 
 启动顺序：Alma → 桥接服务 → OneBot 客户端。
 
 `--debugger` 模式用于 IDE/debugger 本地启动，避免和已运行的桥接服务抢同一个
-`bridge-state.db` 或 `8090` 端口。如果没有设置 `DB_PATH`，会使用按进程隔离的临时
-数据库；如果没有设置 `BRIDGE_PORT`，会从 `18090` 开始选择第一个可用端口。
+`bridge-state.db` 或 `8090` 端口。它会使用按进程隔离的临时数据库，并从 `18090`
+开始选择第一个可用端口。
 
 ## 配置参考
 
-| 环境变量 | TOML 键 | 默认值 | 说明 |
-|----------|---------|--------|------|
-| `BRIDGE_PORT` | `bridge.port` | `8090` | 监听端口 |
-| `ALMA_API` | `alma.api` | `http://localhost:23001` | Alma API 地址 |
-| `ALMA_MODEL` | `alma.model` | *(Alma 设置)* | 覆盖 AI 模型 |
-| `ALMA_TIMEOUT` | `alma.timeout` | `120` | 生成超时（秒） |
-| `ALMA_MAX_RETRIES` | `alma.max_retries` | `2` | 生成失败重试次数 |
-| `ALMA_RETRY_DELAY` | `alma.retry_delay_ms` | `3000` | 重试基础延迟（毫秒，指数退避） |
-| `DB_PATH` | `database.path` | `bridge-state.db` | 数据库文件路径 |
-| `PEOPLE_DIR` | `people.dir` | `~/.config/alma/people` | People Profiles 目录 |
-| `ONEBOT_API_TIMEOUT` | `onebot.api_timeout` | `30` | OneBot API 超时（秒） |
-| `ACCESS_TOKEN` | `onebot.access_token` | *(无)* | WS 连接和非 loopback HTTP 命令端点的 Bearer 令牌认证 |
-| `GROUP_HISTORY_SIZE` | `chat.group_history_size` | `30` | 群聊历史上下文条数（0 = 禁用） |
-| `THINKING_MESSAGE` | `chat.thinking_message` | *(无)* | AI 生成前的提示消息 |
-| `RUST_LOG` | — | `info` | 日志级别（env-filter 语法） |
-| `BRIDGE_LOG_FILE` | — | *(stderr)* | 可选日志文件路径；macOS 应用用它写入 `bridge.log` |
+| TOML 键 | 默认值 | 说明 |
+|---------|--------|------|
+| `bridge.port` | `8090` | 监听端口 |
+| `alma.api` | `http://localhost:23001` | Alma API 地址 |
+| `alma.model` | *(Alma 设置)* | 覆盖 AI 模型 |
+| `alma.timeout` | `120` | 生成超时（秒） |
+| `alma.max_retries` | `2` | 生成失败重试次数 |
+| `alma.retry_delay_ms` | `3000` | 重试基础延迟（毫秒，指数退避） |
+| `database.path` | `bridge-state.db` | 数据库文件路径 |
+| `people.dir` | `~/.config/alma/people` | People Profiles 目录 |
+| `onebot.api_timeout` | `30` | OneBot API 超时（秒） |
+| `onebot.access_token` | *(无)* | WS 连接和非 loopback HTTP 命令端点的 Bearer 令牌认证 |
+| `chat.group_history_size` | `30` | 群聊历史上下文条数（0 = 禁用） |
+| `chat.thinking_message` | *(无)* | AI 生成前的提示消息 |
+| `chat.show_thinking` | `false` | 将思考块作为单独 QQ 消息发送 |
 
 ## 工作原理
 
@@ -214,7 +199,7 @@ alma group context <qq_group_id>
 cat ~/.config/alma/groups/README.md
 ```
 
-在 `~/.config/alma/groups/README.md` 里，桥接器只维护自己的 `alma-onebot-bridge` 标记区块，并保留区块外的已有内容。这个区块不列出已知成员或群名片；身份和群名片信息只放在 People Profiles，避免重复。
+在 `~/.config/alma/groups/README.md` 里，桥接器只编辑自己的 `alma-onebot-bridge` 标记区块，区块外内容不动。成员和群名片放在 People Profiles。
 
 对 QQ 群来说，`alma group send` 仍然是 Alma 内部的 Telegram 命令。主动发送 QQ 群消息请使用桥接器端点：
 
@@ -224,25 +209,25 @@ curl -s -X POST http://127.0.0.1:8090/qq/group/<qq_group_id>/send \
   -d '{"message":"hello"}'
 ```
 
-QQ 私聊主动发送使用 `POST /qq/private/<qq_user_id>/send`，JSON body 相同。非本机 loopback 请求需要配置 `ACCESS_TOKEN` 并携带 `Authorization: Bearer <token>`。
+QQ 私聊主动发送使用 `POST /qq/private/<qq_user_id>/send`，JSON body 相同。非本机 loopback 请求需要配置 `onebot.access_token` 并携带 `Authorization: Bearer <token>`。
 
 ### 发送者身份
 
-消息格式遵循 Alma 渠道桥接协议（Telegram 风格）：
+桥接器按 Alma 渠道桥接协议格式化消息：
 
 - 群聊：`[From: Alice [id:12345678] [msg:12345]] 消息内容`
 - 私聊：`[msg:67890] 消息内容`
 - 引用回复：`[From: Alice [id:12345678] [msg:12346]] [Replying to Bob's message: "之前的话"] 这是回复`
 
-群聊里 `[msg:N]` 位于 `[From: ...]` 发送者头部内，和 Alma 内置 Telegram/Discord 渠道格式一致；私聊不带 `[From: ...]` 头。`[msg:N]` 使用真实的 OneBot 消息 ID；群聊中的 `[id:N]` 使用发送者 QQ 号。QQ 表情会转换为文本（如 `[emoji:斜眼笑]`），图片/语音/视频以标签描述。
+群聊里 `[msg:N]` 位于 `[From: ...]` 发送者头部内，和 Alma 内置 Telegram/Discord 渠道格式一致；私聊不带 `[From: ...]` 头。`[msg:N]` 使用 OneBot 消息 ID；群聊中的 `[id:N]` 使用发送者 QQ 号。桥接器把 QQ 表情转成文本（如 `[emoji:斜眼笑]`），图片/语音/视频用标签描述。
 
 ## WebSocket 路径
 
 桥接服务接受以下路径的 OneBot 连接：
 
-- `/` — 通用
-- `/ws` — NapCat / snowluma 默认路径
-- `/onebot/v11/ws` — Lagrange 默认路径
+- `/`：通用
+- `/ws`：NapCat / snowluma 默认路径
+- `/onebot/v11/ws`：Lagrange 默认路径
 
 ## 开发
 
@@ -257,8 +242,8 @@ RUST_LOG=debug cargo run
 cargo build --release
 ```
 
-详细技术文档（包括 Alma WebSocket 协议发现、事件时序、常见坑点）请参阅 [DEVELOPMENT_KNOWLEDGE_BASE.md](./DEVELOPMENT_KNOWLEDGE_BASE.md)。
+技术记录：[DEVELOPMENT_KNOWLEDGE_BASE.md](./src/docs/DEVELOPMENT_KNOWLEDGE_BASE.md)。
 
 ## 许可证
 
-[AGPL-3.0](./LICENSE) — GNU Affero General Public License v3.0
+[AGPL-3.0](./LICENSE)，GNU Affero General Public License v3.0

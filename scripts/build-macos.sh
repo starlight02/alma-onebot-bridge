@@ -5,16 +5,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MACOS_DIR="$ROOT/platforms/macos"
 TARGET="${TARGET:-$(rustc -vV | awk '/host:/ {print $2}')}"
 CONFIGURATION="${CONFIGURATION:-Release}"
-
-echo "==> Building Rust binary for $TARGET..."
-cd "$ROOT"
-cargo build --release --target "$TARGET"
-
-echo "==> Copying binary to Xcode Resources..."
-RESOURCES="$MACOS_DIR/AlmaOneBotBridge/Resources"
-mkdir -p "$RESOURCES"
-cp "$ROOT/target/$TARGET/release/alma-onebot-bridge" "$RESOURCES/"
-chmod +x "$RESOURCES/alma-onebot-bridge"
+HOST_ARCH="$(uname -m)"
+DESTINATION="${DESTINATION:-platform=macOS,arch=$HOST_ARCH}"
 
 echo "==> Building Xcode project..."
 cd "$MACOS_DIR"
@@ -22,7 +14,9 @@ xcodebuild \
     -project AlmaOneBotBridge.xcodeproj \
     -scheme AlmaOneBotBridge \
     -configuration "$CONFIGURATION" \
+    -destination "$DESTINATION" \
     -derivedDataPath build/ \
+    RUST_BRIDGE_TARGET="$TARGET" \
     CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}" \
     | tail -5
 

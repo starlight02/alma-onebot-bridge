@@ -54,7 +54,7 @@ async fn main() {
     let _tracing_guard = init_tracing();
 
     let debugger_mode = env::args().any(|arg| arg == "--debugger");
-    let mut config = Config::from_env();
+    let mut config = Config::load();
     if debugger_mode {
         apply_debugger_defaults(&mut config);
     }
@@ -64,7 +64,7 @@ async fn main() {
         Err(e) => {
             tracing::error!("Failed to initialize state database: {}", e);
             tracing::error!(
-                "If another bridge/debugger is running, set DB_PATH to a different file or stop the existing process."
+                "If another bridge/debugger is running, change database.path in config.toml or stop the existing process."
             );
             std::process::exit(1);
         }
@@ -80,7 +80,7 @@ async fn main() {
     tracing::info!("  People dir  : {:?}", config.people_dir);
     tracing::info!("  Database    : {:?}", config.db_path);
     if let Some(ref model) = config.alma_model {
-        tracing::info!("  Model       : {} (ALMA_MODEL override)", model);
+        tracing::info!("  Model       : {} (config override)", model);
     }
     tracing::info!("  Group hist  : {} messages", config.group_history_size);
     if let Some(ref msg) = config.thinking_message {
@@ -147,7 +147,7 @@ async fn main() {
             loop {
                 sighup.recv().await;
                 tracing::info!("[SIGHUP] Reloading config from disk...");
-                let new_config = Config::from_env();
+                let new_config = Config::load();
                 let mut cfg = state.config.write().await;
                 cfg.group_history_size = new_config.group_history_size;
                 cfg.thinking_message = new_config.thinking_message;
@@ -304,16 +304,12 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 }
 
 fn apply_debugger_defaults(config: &mut Config) {
-    if env::var_os("DB_PATH").is_none() {
-        config.db_path = env::temp_dir().join(format!(
-            "alma-onebot-bridge-debugger-{}.db",
-            std::process::id()
-        ));
-    }
+    config.db_path = env::temp_dir().join(format!(
+        "alma-onebot-bridge-debugger-{}.db",
+        std::process::id()
+    ));
 
-    if env::var_os("BRIDGE_PORT").is_none()
-        && let Some(port) = first_available_port(18090, 20)
-    {
+    if let Some(port) = first_available_port(18090, 20) {
         config.bridge_port = port;
     }
 }

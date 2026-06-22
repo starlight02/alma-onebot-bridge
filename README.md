@@ -1,22 +1,22 @@
 # Alma OneBot Bridge
 
-A bridge service that connects [Alma](https://github.com/anthropics/alma) (local AI chat assistant) to QQ via the [OneBot v11](https://github.com/botuniverse/onebot-11) protocol. It enables Alma to serve as a bot in QQ private and group chats using a reverse WebSocket architecture.
+A bridge service that connects [Alma](https://github.com/anthropics/alma) to QQ through [OneBot v11](https://github.com/botuniverse/onebot-11). Alma replies in QQ private chats and groups through a reverse WebSocket connection.
 
 ## Features
 
-- **Full Alma pipeline** — Messages go through Alma's WebSocket protocol, so SOUL, Memory, People Profiles, and Skills all work as expected
-- **Bidirectional sync** — Messages sent from the Alma GUI are forwarded to QQ, and vice versa
-- **Group chat support** — Responds to @mentions in group chats, with group card (群名片) as display name
-- **Group chat history** — Injects recent group messages into AI context and writes QQ group logs to Alma's native `~/.config/alma/groups` directory
-- **Alma group CLI compatibility** — `alma group list/history/search/context` can see QQ group logs; active QQ sends use bridge HTTP endpoints because `alma group send` is Telegram-only
-- **Rich message handling** — Face emojis converted to readable text (`[emoji:斜眼笑]`), images/voice/video described with labels, forwarded messages summarized with content extraction
-- **Reply & @mention** — Full reply/quoting protocol (incoming quotes and outgoing reply references), with automatic @mention in group replies
-- **People Profiles** — Automatically creates Alma People Profile files for each QQ user, with `qq_id` frontmatter for cross-platform identity matching
-- **Message splitting** — Long replies are split by paragraph and QQ's 4500-character limit
-- **Persistent state** — Thread mappings, user profiles, QQ group titles, and group card metadata stored in a Turso database
-- **Security** — Optional WebSocket access token authentication (`Bearer` header); HTTP send endpoints allow loopback or a valid token
-- **Configurable** — TOML config file with environment variable overrides
-- **Native macOS app** — Menu bar app that launches and supervises the bridge, with native settings, logs, start/stop/restart, and quit controls
+- **Alma pipeline**: Messages use Alma's WebSocket protocol, so SOUL, Memory, People Profiles, and Skills apply.
+- **Bidirectional sync**: Alma GUI messages forward to QQ. QQ messages create or reuse Alma threads.
+- **Group chat support**: Groups require @mentions. The bridge uses the sender's group card as display name.
+- **Group chat history**: The bridge injects recent group messages into context and writes logs under `~/.config/alma/groups`.
+- **Alma group CLI compatibility**: `alma group list/history/search/context` can read QQ group logs. Active QQ sends use bridge HTTP endpoints because `alma group send` targets Telegram.
+- **Rich message handling**: The bridge converts QQ face emojis to text, labels images/voice/video, and extracts forwarded message content.
+- **Reply and @mention**: Incoming quotes and outgoing reply references work. Group replies mention the sender.
+- **People Profiles**: The bridge creates Alma People Profile files for QQ users with `qq_id` frontmatter.
+- **Message splitting**: Long replies split by paragraph, then by QQ's 4500-character limit.
+- **Persistent state**: Turso stores thread mappings, user profiles, QQ group titles, and group card metadata.
+- **Security**: WebSocket auth can require a `Bearer` token. HTTP send endpoints accept loopback or a valid token.
+- **Config**: Use TOML config or the macOS settings window.
+- **macOS app**: The menu bar app manages the bridge, settings, logs, start/stop/restart, and quit.
 
 ## Architecture
 
@@ -55,9 +55,9 @@ cargo build --release
 
 ### macOS Menu Bar App
 
-The native macOS app wraps the Rust bridge as a supervised background process.
-Opening `AlmaOneBotBridge.app` from Finder or Launchpad starts the bridge, keeps a
-menu bar icon visible, and stops the bridge when you quit the app.
+The macOS app runs the Rust bridge from the menu bar. It starts and stops the
+bridge, opens Preferences, writes `~/.config/alma/bridge/config.toml`, and keeps
+logs next to that config.
 
 Build the app bundle:
 
@@ -65,32 +65,19 @@ Build the app bundle:
 ./scripts/build-macos.sh
 ```
 
-The output is:
+The script writes:
 
 ```text
 platforms/macos/build/Build/Products/Release/AlmaOneBotBridge.app
 ```
 
-To make it available from Launchpad, copy it to `/Applications` or let the build
-script install it:
+Install it into `/Applications` for Launchpad:
 
 ```bash
 INSTALL_TO_APPLICATIONS=1 ./scripts/build-macos.sh
 ```
 
-The app stores its editable config and runtime log under:
-
-```text
-~/.config/alma/bridge/config.toml
-~/.config/alma/bridge/bridge.log
-~/.config/alma/bridge/bridge.pid
-```
-
-The menu bar controls expose **Start**, **Stop**, **Restart**, **Preferences**,
-**Open Config Directory**, **Open Bridge Log**, and **Quit**. Saving preferences
-hot-reloads chat/model/timeout settings with `SIGHUP`; changes that cannot be
-hot-reloaded safely, such as the listen port, Alma API URL, access token, or DB
-path, automatically restart the supervised bridge process.
+macOS guide: [platforms/macos/README.md](./platforms/macos/README.md).
 
 ### Configure
 
@@ -121,9 +108,7 @@ group_history_size = 30        # Recent group messages for AI context (0 = disab
 # thinking_message = "思考中..."  # Optional message before AI generation
 ```
 
-> **Note**: `config.toml` is in `.gitignore` — it won't be committed to git. Only `config.toml.example` is tracked.
-
-Environment variables override config file values (e.g., `ALMA_MODEL`, `BRIDGE_PORT`).
+> **Note**: Git ignores `config.toml`. The repo tracks only `config.toml.example`.
 
 ### Configure OneBot Client
 
@@ -157,35 +142,33 @@ If the OneBot client runs in Docker, use `host.docker.internal` as `<bridge-host
 # Or with debug logging
 RUST_LOG=debug ./target/release/alma-onebot-bridge
 
-# Local debugger mode: avoids the default DB and port unless explicitly overridden
+# Local debugger mode: uses a temporary DB and the first available port from 18090
 RUST_LOG=debug ./target/debug/alma-onebot-bridge --debugger
 ```
 
 Startup order: Alma → Bridge → OneBot client.
 
 `--debugger` mode is intended for local IDE/debugger launches while another
-bridge may already be running. If `DB_PATH` is not set, it uses a per-process
-temporary database; if `BRIDGE_PORT` is not set, it chooses the first available
-port starting at `18090`.
+bridge may already be running. It uses a per-process temporary database and
+chooses the first available port starting at `18090`.
 
 ## Configuration Reference
 
-| Variable | TOML Key | Default | Description |
-|----------|----------|---------|-------------|
-| `BRIDGE_PORT` | `bridge.port` | `8090` | Listen port |
-| `ALMA_API` | `alma.api` | `http://localhost:23001` | Alma API base URL |
-| `ALMA_MODEL` | `alma.model` | *(Alma settings)* | Override AI model |
-| `ALMA_TIMEOUT` | `alma.timeout` | `120` | Generation timeout (seconds) |
-| `ALMA_MAX_RETRIES` | `alma.max_retries` | `2` | Retry attempts for failed generations |
-| `ALMA_RETRY_DELAY` | `alma.retry_delay_ms` | `3000` | Base retry delay (ms, exponential backoff) |
-| `DB_PATH` | `database.path` | `bridge-state.db` | Database file path |
-| `PEOPLE_DIR` | `people.dir` | `~/.config/alma/people` | People profiles directory |
-| `ONEBOT_API_TIMEOUT` | `onebot.api_timeout` | `30` | OneBot API timeout (seconds) |
-| `ACCESS_TOKEN` | `onebot.access_token` | *(none)* | Bearer token for WS auth and non-loopback HTTP command endpoints |
-| `GROUP_HISTORY_SIZE` | `chat.group_history_size` | `30` | Group history context size (0 = disabled) |
-| `THINKING_MESSAGE` | `chat.thinking_message` | *(none)* | Pre-generation indicator message |
-| `RUST_LOG` | — | `info` | Log level (env-filter syntax) |
-| `BRIDGE_LOG_FILE` | — | *(stderr)* | Optional log file path; used by the macOS app for `bridge.log` |
+| TOML Key | Default | Description |
+|----------|---------|-------------|
+| `bridge.port` | `8090` | Listen port |
+| `alma.api` | `http://localhost:23001` | Alma API base URL |
+| `alma.model` | *(Alma settings)* | Override AI model |
+| `alma.timeout` | `120` | Generation timeout (seconds) |
+| `alma.max_retries` | `2` | Retry attempts for failed generations |
+| `alma.retry_delay_ms` | `3000` | Base retry delay (ms, exponential backoff) |
+| `database.path` | `bridge-state.db` | Database file path |
+| `people.dir` | `~/.config/alma/people` | People profiles directory |
+| `onebot.api_timeout` | `30` | OneBot API timeout (seconds) |
+| `onebot.access_token` | *(none)* | Bearer token for WS auth and non-loopback HTTP command endpoints |
+| `chat.group_history_size` | `30` | Group history context size (0 = disabled) |
+| `chat.thinking_message` | *(none)* | Pre-generation indicator message |
+| `chat.show_thinking` | `false` | Send thinking blocks as separate QQ messages |
 
 ## How It Works
 
@@ -217,7 +200,7 @@ alma group context <qq_group_id>
 cat ~/.config/alma/groups/README.md
 ```
 
-Inside `~/.config/alma/groups/README.md`, the bridge only maintains its own `alma-onebot-bridge` marked section and preserves any content outside that section. This section intentionally does not list known members or group cards; those belong in People Profiles to avoid duplicating identity data.
+Inside `~/.config/alma/groups/README.md`, the bridge edits only its marked `alma-onebot-bridge` section and leaves the rest alone. People Profiles store members and group cards.
 
 For QQ groups, `alma group send` remains a Telegram command inside Alma. Use the bridge endpoint for active QQ sends:
 
@@ -227,25 +210,25 @@ curl -s -X POST http://127.0.0.1:8090/qq/group/<qq_group_id>/send \
   -d '{"message":"hello"}'
 ```
 
-Private QQ sends use `POST /qq/private/<qq_user_id>/send` with the same JSON body. If the request is not from loopback, configure `ACCESS_TOKEN` and send it as `Authorization: Bearer <token>`.
+Private QQ sends use `POST /qq/private/<qq_user_id>/send` with the same JSON body. If the request is not from loopback, configure `onebot.access_token` and send it as `Authorization: Bearer <token>`.
 
 ### Sender Identity
 
-Messages are formatted to match Alma's channel bridge protocol (Telegram-style):
+The bridge formats messages for Alma's channel bridge protocol:
 
 - Group: `[From: Alice [id:12345678] [msg:12345]] 消息内容`
 - Private: `[msg:67890] 消息内容`
 - With quote: `[From: Alice [id:12345678] [msg:12346]] [Replying to Bob's message: "之前的话"] 这是回复`
 
-For group messages, `[msg:N]` is part of the `[From: ...]` sender header, matching Alma's built-in Telegram/Discord bridge format. Private messages do not include a `[From: ...]` header. The `[msg:N]` tag uses the real OneBot message ID; `[id:N]` uses the sender QQ ID in group messages. Face emojis are converted to text (e.g., `[emoji:斜眼笑]`), and images/voice/video are described with labels.
+For group messages, `[msg:N]` stays inside the `[From: ...]` sender header, matching Alma's built-in Telegram/Discord bridge format. Private messages omit `[From: ...]`. `[msg:N]` uses the OneBot message ID; group `[id:N]` uses the sender QQ ID. The bridge converts face emojis to text such as `[emoji:斜眼笑]` and labels images, voice, and video.
 
 ## WebSocket Paths
 
 The bridge accepts OneBot connections at:
 
-- `/` — generic
-- `/ws` — NapCat / snowluma default
-- `/onebot/v11/ws` — Lagrange default
+- `/`: generic
+- `/ws`: NapCat / snowluma default
+- `/onebot/v11/ws`: Lagrange default
 
 ## Development
 
@@ -260,8 +243,8 @@ RUST_LOG=debug cargo run
 cargo build --release
 ```
 
-See [DEVELOPMENT_KNOWLEDGE_BASE.md](./DEVELOPMENT_KNOWLEDGE_BASE.md) for detailed technical documentation including Alma WebSocket protocol findings, event sequences, and common pitfalls.
+Technical notes: [DEVELOPMENT_KNOWLEDGE_BASE.md](./src/docs/DEVELOPMENT_KNOWLEDGE_BASE.md).
 
 ## License
 
-[AGPL-3.0](./LICENSE) — GNU Affero General Public License v3.0
+[AGPL-3.0](./LICENSE), GNU Affero General Public License v3.0

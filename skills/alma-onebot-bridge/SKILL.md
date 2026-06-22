@@ -79,7 +79,7 @@ Organize the codebase into focused modules:
 ```
 src/
   main.rs          -- entry point: tracing, config, state, routes, warp::serve
-  config.rs        -- three-layer config: env vars > config.toml > defaults
+  config.rs        -- TOML config files plus defaults
   state.rs         -- shared state with Turso persistence
   onebot/
     mod.rs         -- re-exports api + event
@@ -124,7 +124,7 @@ The health check endpoint (HTTP) and WS endpoints coexist on the same port. Warp
 
 ## Step 4: WebSocket Split Pattern
 
-When a OneBot client connects, split the WS into sink + stream. Create an `mpsc::unbounded_channel` for outgoing messages and spawn a dedicated writer task. This allows any task to send messages through the channel without contending for the sink.
+When a OneBot client connects, split the WS into sink + stream. Create an `mpsc::unbounded_channel` for outgoing messages and spawn a writer task. Any task can send through the channel without contending for the sink.
 
 ```rust
 let (ws_sink, ws_stream) = ws.split();
@@ -144,7 +144,7 @@ The same pattern applies to the Alma WS connection (using `tokio-tungstenite` in
 
 ## Step 5: Echo Correlation Mechanism
 
-This is the core pattern for making synchronous-style API calls over the shared, asynchronous WebSocket connection with the OneBot client. Both events and API responses flow through the same WS, so the `echo` field disambiguates them.
+Use this pattern for synchronous-style API calls over the shared WebSocket connection with the OneBot client. Events and API responses flow through the same WS, so the `echo` field disambiguates them.
 
 The fundamental discrimination rule for incoming WS messages:
 - Has `echo` + `retcode` fields -> API response (correlate to pending call)
@@ -246,11 +246,11 @@ The end-to-end flow for each QQ message:
 
 The bridge also exposes local HTTP command endpoints for active sends from Alma tools:
 
-- `GET /qq/groups` — list known QQ groups and current OneBot connection status
-- `POST /qq/group/<group_id>/send` with `{"message":"..."}` — send a QQ group message
-- `POST /qq/private/<user_id>/send` with `{"message":"..."}` — send a QQ private message
+- `GET /qq/groups`: list known QQ groups and current OneBot connection status
+- `POST /qq/group/<group_id>/send` with `{"message":"..."}`: send a QQ group message
+- `POST /qq/private/<user_id>/send` with `{"message":"..."}`: send a QQ private message
 
-Loopback requests are allowed. Non-loopback requests require `ACCESS_TOKEN` via
+Loopback requests are allowed. Non-loopback requests require `onebot.access_token` via
 `Authorization: Bearer <token>` or `?token=...`. For QQ groups, do not use Alma's
 `alma group send`; it is Telegram-specific.
 
@@ -320,16 +320,25 @@ Use `username` (not `qq_nickname`) in frontmatter to match Alma's standard field
 
 ## Step 12: Configuration
 
-Three-layer config with priority: env vars > `config.toml` / `bridge.toml` > hardcoded defaults.
+Use TOML files for bridge settings. Environment variables are reserved for runtime
+metadata such as log paths.
 
-| Variable | TOML Key | Default | Purpose |
-|---|---|---|---|
-| `BRIDGE_PORT` | `bridge.port` | `8090` | WS/HTTP listen port |
-| `ALMA_API` | `alma.api` | `http://localhost:23001` | Alma API base URL |
-| `ALMA_MODEL` | `alma.model` | *(Alma settings)* | Override AI model |
-| `ALMA_TIMEOUT` | `alma.timeout` | `120` | Generation timeout (s) |
-| `DB_PATH` | `database.path` | `bridge-state.db` | Database file path |
-| `ONEBOT_API_TIMEOUT` | `onebot.api_timeout` | `30` | OneBot API timeout (s) |
+The bridge reads config in this order:
+
+1. `config.toml` in the current directory
+2. `bridge.toml` in the current directory
+3. `~/.config/alma/bridge/config.toml`
+4. defaults
+
+| TOML Key | Default | Purpose |
+|---|---|---|
+| `bridge.port` | `8090` | WS/HTTP listen port |
+| `alma.api` | `http://localhost:23001` | Alma API base URL |
+| `alma.model` | *(Alma settings)* | Override AI model |
+| `alma.timeout` | `120` | Generation timeout (s) |
+| `database.path` | `bridge-state.db` | Database file path |
+| `onebot.api_timeout` | `30` | OneBot API timeout (s) |
+| `onebot.access_token` | *(none)* | Bearer token for WS auth and non-loopback HTTP command endpoints |
 
 Default port is 8090 (not 8080) because port 8080 is commonly occupied by Docker/nginx-ui on development machines.
 

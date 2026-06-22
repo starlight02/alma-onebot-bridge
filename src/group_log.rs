@@ -203,7 +203,7 @@ fn build_group_readme_body(
         "```bash\ncurl -s -X POST http://127.0.0.1:{}/qq/group/<chatId>/send \\\n  -H 'Content-Type: application/json' \\\n  -d '{{\"message\":\"...\"}}'\n```\n\n",
         bridge_port
     ));
-    out.push_str("If the bridge is exposed beyond loopback, set `ACCESS_TOKEN`; loopback requests are accepted so Alma can call the endpoint locally without leaking the token into prompts.\n\n");
+    out.push_str("If the bridge is exposed beyond loopback, set `onebot.access_token` in config.toml; loopback requests are accepted so Alma can call the endpoint locally without leaking the token into prompts.\n\n");
 
     if groups.is_empty() {
         out.push_str("No QQ group logs yet.\n");

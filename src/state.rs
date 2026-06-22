@@ -824,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn onebot_connection_epoch_keeps_only_latest_current() {
         let db_path = temp_db_path("connection-epoch");
-        let mut config = Config::from_env();
+        let mut config = Config::load();
         config.db_path = db_path.clone();
         let state = SharedState::new(config).await.unwrap();
 

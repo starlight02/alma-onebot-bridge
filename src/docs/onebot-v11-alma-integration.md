@@ -173,7 +173,7 @@ import path from 'path';
 
 // ===== 配置 =====
 const ALMA_API = 'http://localhost:23001';
-const BRIDGE_PORT = 8080;
+const BRIDGE_PORT = 8090;
 const PEOPLE_DIR = path.join(process.env.HOME!, '.config/alma/people');
 const STATE_FILE = './bridge-state.json';  // 持久化会话映射
 
@@ -992,7 +992,7 @@ alma status
 # 终端 2: 启动桥接服务
 cd alma-onebot-bridge
 npx ts-node bridge-server-ws.ts
-# 输出: [Bridge] Listening on port 8080
+# 输出: [Bridge] Listening on port 8090
 # 输出: [Bridge] Waiting for OneBot reverse WebSocket connection...
 
 # 终端 3: 启动 OneBot 实现 (NapCat)
