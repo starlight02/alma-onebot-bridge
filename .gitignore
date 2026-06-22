@@ -16,3 +16,12 @@ config.toml
 .vscode/
 *.swp
 *.swo
+
+# Xcode
+platforms/macos/build/
+platforms/macos/AlmaOneBotBridge.xcodeproj/xcuserdata/
+platforms/macos/AlmaOneBotBridge.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# Build script artifacts
+platforms/macos/AlmaOneBotBridge/Resources/alma-onebot-bridge

@@ -16,6 +16,7 @@
 - **状态持久化** — 线程映射、用户资料、QQ 群名和群名片元数据存储在 Turso 数据库中
 - **安全认证** — 可选的 WebSocket 访问令牌认证（`Bearer` 头）；HTTP 发送端点允许本机 loopback 或有效 token
 - **灵活配置** — TOML 配置文件 + 环境变量覆盖
+- **macOS 原生应用** — 菜单栏应用会启动并托管桥接服务，提供原生设置、日志、启动/停止/重启和退出控制
 
 ## 架构
 
@@ -51,6 +52,43 @@ git clone <repo-url>
 cd alma-onebot-bridge
 cargo build --release
 ```
+
+### macOS 菜单栏应用
+
+macOS 原生应用会把 Rust 桥接服务作为受管后台进程运行。从 Finder 或启动台打开
+`AlmaOneBotBridge.app` 后，桥接服务会自动启动，菜单栏会显示状态图标；退出应用时会
+停止受管的桥接进程。
+
+构建 app bundle：
+
+```bash
+./scripts/build-macos.sh
+```
+
+输出路径：
+
+```text
+platforms/macos/build/Build/Products/Release/AlmaOneBotBridge.app
+```
+
+要让它出现在启动台，可以复制到 `/Applications`，也可以让脚本安装：
+
+```bash
+INSTALL_TO_APPLICATIONS=1 ./scripts/build-macos.sh
+```
+
+应用使用下面这些路径保存配置和运行日志：
+
+```text
+~/.config/alma/bridge/config.toml
+~/.config/alma/bridge/bridge.log
+~/.config/alma/bridge/bridge.pid
+```
+
+菜单栏提供 **Start**、**Stop**、**Restart**、**Preferences**、**Open Config Directory**、
+**Open Bridge Log** 和 **Quit**。在设置窗口保存后，聊天参数、模型覆盖和超时参数会通过
+`SIGHUP` 热重载；监听端口、Alma API 地址、访问令牌、数据库路径这类无法安全热重载的
+配置会自动重启受管的桥接进程。
 
 ### 配置
 
@@ -116,9 +154,16 @@ group_history_size = 30        # 群聊历史上下文条数（0 = 禁用）
 
 # 开启调试日志
 RUST_LOG=debug ./target/release/alma-onebot-bridge
+
+# 本地 debugger 模式：默认避开生产 DB 和端口，除非显式覆盖
+RUST_LOG=debug ./target/debug/alma-onebot-bridge --debugger
 ```
 
 启动顺序：Alma → 桥接服务 → OneBot 客户端。
+
+`--debugger` 模式用于 IDE/debugger 本地启动，避免和已运行的桥接服务抢同一个
+`bridge-state.db` 或 `8090` 端口。如果没有设置 `DB_PATH`，会使用按进程隔离的临时
+数据库；如果没有设置 `BRIDGE_PORT`，会从 `18090` 开始选择第一个可用端口。
 
 ## 配置参考
 
@@ -137,6 +182,7 @@ RUST_LOG=debug ./target/release/alma-onebot-bridge
 | `GROUP_HISTORY_SIZE` | `chat.group_history_size` | `30` | 群聊历史上下文条数（0 = 禁用） |
 | `THINKING_MESSAGE` | `chat.thinking_message` | *(无)* | AI 生成前的提示消息 |
 | `RUST_LOG` | — | `info` | 日志级别（env-filter 语法） |
+| `BRIDGE_LOG_FILE` | — | *(stderr)* | 可选日志文件路径；macOS 应用用它写入 `bridge.log` |
 
 ## 工作原理
 

@@ -16,6 +16,7 @@ A bridge service that connects [Alma](https://github.com/anthropics/alma) (local
 - **Persistent state** — Thread mappings, user profiles, QQ group titles, and group card metadata stored in a Turso database
 - **Security** — Optional WebSocket access token authentication (`Bearer` header); HTTP send endpoints allow loopback or a valid token
 - **Configurable** — TOML config file with environment variable overrides
+- **Native macOS app** — Menu bar app that launches and supervises the bridge, with native settings, logs, start/stop/restart, and quit controls
 
 ## Architecture
 
@@ -51,6 +52,45 @@ git clone <repo-url>
 cd alma-onebot-bridge
 cargo build --release
 ```
+
+### macOS Menu Bar App
+
+The native macOS app wraps the Rust bridge as a supervised background process.
+Opening `AlmaOneBotBridge.app` from Finder or Launchpad starts the bridge, keeps a
+menu bar icon visible, and stops the bridge when you quit the app.
+
+Build the app bundle:
+
+```bash
+./scripts/build-macos.sh
+```
+
+The output is:
+
+```text
+platforms/macos/build/Build/Products/Release/AlmaOneBotBridge.app
+```
+
+To make it available from Launchpad, copy it to `/Applications` or let the build
+script install it:
+
+```bash
+INSTALL_TO_APPLICATIONS=1 ./scripts/build-macos.sh
+```
+
+The app stores its editable config and runtime log under:
+
+```text
+~/.config/alma/bridge/config.toml
+~/.config/alma/bridge/bridge.log
+~/.config/alma/bridge/bridge.pid
+```
+
+The menu bar controls expose **Start**, **Stop**, **Restart**, **Preferences**,
+**Open Config Directory**, **Open Bridge Log**, and **Quit**. Saving preferences
+hot-reloads chat/model/timeout settings with `SIGHUP`; changes that cannot be
+hot-reloaded safely, such as the listen port, Alma API URL, access token, or DB
+path, automatically restart the supervised bridge process.
 
 ### Configure
 
@@ -116,9 +156,17 @@ If the OneBot client runs in Docker, use `host.docker.internal` as `<bridge-host
 
 # Or with debug logging
 RUST_LOG=debug ./target/release/alma-onebot-bridge
+
+# Local debugger mode: avoids the default DB and port unless explicitly overridden
+RUST_LOG=debug ./target/debug/alma-onebot-bridge --debugger
 ```
 
 Startup order: Alma → Bridge → OneBot client.
+
+`--debugger` mode is intended for local IDE/debugger launches while another
+bridge may already be running. If `DB_PATH` is not set, it uses a per-process
+temporary database; if `BRIDGE_PORT` is not set, it chooses the first available
+port starting at `18090`.
 
 ## Configuration Reference
 
@@ -137,6 +185,7 @@ Startup order: Alma → Bridge → OneBot client.
 | `GROUP_HISTORY_SIZE` | `chat.group_history_size` | `30` | Group history context size (0 = disabled) |
 | `THINKING_MESSAGE` | `chat.thinking_message` | *(none)* | Pre-generation indicator message |
 | `RUST_LOG` | — | `info` | Log level (env-filter syntax) |
+| `BRIDGE_LOG_FILE` | — | *(stderr)* | Optional log file path; used by the macOS app for `bridge.log` |
 
 ## How It Works
 
