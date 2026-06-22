@@ -3,8 +3,6 @@ name: macOS PKG
 on:
   pull_request:
   push:
-    branches:
-      - master
     tags:
       - "v*"
   release:
@@ -31,6 +29,7 @@ jobs:
     name: Build macOS PKG (${{ matrix.package_arch }})
     runs-on: macos-latest
     needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
