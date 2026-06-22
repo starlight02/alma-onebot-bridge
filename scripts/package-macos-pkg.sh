@@ -13,8 +13,8 @@ WORK_DIR="$DIST_DIR/work"
 RESOURCES_DIR="$WORK_DIR/resources"
 DISTRIBUTION_XML="$WORK_DIR/Distribution.xml"
 APP_PATH="$ROOT/platforms/macos/build/Build/Products/$CONFIGURATION/$APP_NAME.app"
-STAGING_ROOT="$WORK_DIR/root"
-STAGED_APP="$STAGING_ROOT/Applications/$APP_NAME.app"
+STAGING_APP_DIR="$WORK_DIR/app"
+STAGED_APP="$STAGING_APP_DIR/$APP_NAME.app"
 COMPONENT_PKG="$WORK_DIR/$APP_NAME-component.pkg"
 
 export COPYFILE_DISABLE=1
@@ -54,11 +54,11 @@ fi
 
 echo "==> Preparing installer resources..."
 cp "$ROOT/LICENSE" "$RESOURCES_DIR/LICENSE.txt"
-mkdir -p "$STAGING_ROOT/Applications"
+mkdir -p "$STAGING_APP_DIR"
 ditto --norsrc --noextattr --noqtn --noacl "$APP_PATH" "$STAGED_APP"
-chmod -R u+rwX "$STAGING_ROOT"
-xattr -cr "$STAGING_ROOT" 2>/dev/null || true
-find "$STAGING_ROOT" \( -name ".DS_Store" -o -name "._*" -o -name ".__*" \) -delete
+chmod -R u+rwX "$STAGED_APP"
+xattr -cr "$STAGED_APP" 2>/dev/null || true
+find "$STAGED_APP" \( -name ".DS_Store" -o -name "._*" -o -name ".__*" \) -delete
 
 cat > "$DISTRIBUTION_XML" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
@@ -79,8 +79,8 @@ EOF
 
 echo "==> Building component package..."
 pkgbuild \
-    --root "$STAGING_ROOT" \
-    --install-location / \
+    --component "$STAGED_APP" \
+    --install-location /Applications \
     --identifier "$BUNDLE_ID" \
     --version "$VERSION" \
     --ownership recommended \
@@ -100,6 +100,20 @@ fi
 echo "==> Building product package..."
 rm -f "$FINAL_PKG"
 productbuild "${productbuild_args[@]}" "$FINAL_PKG"
+
+echo "==> Inspecting installer payload..."
+PACKAGE_CHECK_DIR="$WORK_DIR/check"
+rm -rf "$PACKAGE_CHECK_DIR"
+pkgutil --expand-full "$FINAL_PKG" "$PACKAGE_CHECK_DIR"
+COMPONENT_INFO="$PACKAGE_CHECK_DIR/$APP_NAME-component.pkg/PackageInfo"
+if ! grep -q 'install-location="/Applications"' "$COMPONENT_INFO"; then
+    echo "error: component package does not install into /Applications" >&2
+    exit 1
+fi
+if grep -q 'path="./Applications/' "$COMPONENT_INFO"; then
+    echo "error: component package payload nests Applications inside the app install location" >&2
+    exit 1
+fi
 
 if [[ "${NOTARIZE:-0}" == "1" ]]; then
     if [[ -z "${INSTALLER_SIGN_IDENTITY:-}" ]]; then
