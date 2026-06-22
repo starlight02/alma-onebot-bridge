@@ -5,6 +5,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="AlmaOneBotBridge"
 BUNDLE_ID="moe.aili.alma-onebot-bridge"
 VERSION="${VERSION:-$(awk -F\" '/^version =/ {print $2; exit}' "$ROOT/Cargo.toml")}"
+IFS=. read -r VERSION_MAJOR VERSION_MINOR VERSION_PATCH _ <<< "$VERSION"
+VERSION_MAJOR="${VERSION_MAJOR:-0}"
+VERSION_MINOR="${VERSION_MINOR:-0}"
+VERSION_PATCH="${VERSION_PATCH:-0}"
+BUILD_NUMBER="${BUILD_NUMBER:-$((10#$VERSION_MAJOR * 10000 + 10#$VERSION_MINOR * 100 + 10#$VERSION_PATCH))}"
 CONFIGURATION="${CONFIGURATION:-Release}"
 DIST_DIR="${DIST_DIR:-$ROOT/dist/macos}"
 BUILD_UNIVERSAL="${BUILD_UNIVERSAL:-1}"
@@ -12,9 +17,10 @@ PACKAGE_ARCH="${PACKAGE_ARCH:-}"
 WORK_DIR="$DIST_DIR/work"
 RESOURCES_DIR="$WORK_DIR/resources"
 DISTRIBUTION_XML="$WORK_DIR/Distribution.xml"
+COMPONENT_PLIST="$WORK_DIR/components.plist"
 APP_PATH="$ROOT/platforms/macos/build/Build/Products/$CONFIGURATION/$APP_NAME.app"
-STAGING_APP_DIR="$WORK_DIR/app"
-STAGED_APP="$STAGING_APP_DIR/$APP_NAME.app"
+STAGING_ROOT="$WORK_DIR/root"
+STAGED_APP="$STAGING_ROOT/Applications/$APP_NAME.app"
 COMPONENT_PKG="$WORK_DIR/$APP_NAME-component.pkg"
 
 export COPYFILE_DISABLE=1
@@ -44,6 +50,7 @@ echo "==> Building $PACKAGE_ARCH macOS app..."
 BUILD_UNIVERSAL="$BUILD_UNIVERSAL" \
 CONFIGURATION="$CONFIGURATION" \
 VERSION="$VERSION" \
+BUILD_NUMBER="$BUILD_NUMBER" \
 APP_SIGN_IDENTITY="${APP_SIGN_IDENTITY:-}" \
 "$ROOT/scripts/build-macos.sh"
 
@@ -54,11 +61,32 @@ fi
 
 echo "==> Preparing installer resources..."
 cp "$ROOT/LICENSE" "$RESOURCES_DIR/LICENSE.txt"
-mkdir -p "$STAGING_APP_DIR"
+mkdir -p "$STAGING_ROOT/Applications"
 ditto --norsrc --noextattr --noqtn --noacl "$APP_PATH" "$STAGED_APP"
-chmod -R u+rwX "$STAGED_APP"
-xattr -cr "$STAGED_APP" 2>/dev/null || true
-find "$STAGED_APP" \( -name ".DS_Store" -o -name "._*" -o -name ".__*" \) -delete
+chmod -R u+rwX "$STAGING_ROOT"
+xattr -cr "$STAGING_ROOT" 2>/dev/null || true
+find "$STAGING_ROOT" \( -name ".DS_Store" -o -name "._*" -o -name ".__*" \) -delete
+
+cat > "$COMPONENT_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+    <dict>
+        <key>BundleHasStrictIdentifier</key>
+        <true/>
+        <key>BundleIsRelocatable</key>
+        <false/>
+        <key>BundleIsVersionChecked</key>
+        <false/>
+        <key>BundleOverwriteAction</key>
+        <string>upgrade</string>
+        <key>RootRelativeBundlePath</key>
+        <string>Applications/$APP_NAME.app</string>
+    </dict>
+</array>
+</plist>
+EOF
 
 cat > "$DISTRIBUTION_XML" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
@@ -79,8 +107,9 @@ EOF
 
 echo "==> Building component package..."
 pkgbuild \
-    --component "$STAGED_APP" \
-    --install-location /Applications \
+    --root "$STAGING_ROOT" \
+    --component-plist "$COMPONENT_PLIST" \
+    --install-location / \
     --identifier "$BUNDLE_ID" \
     --version "$VERSION" \
     --ownership recommended \
@@ -106,12 +135,44 @@ PACKAGE_CHECK_DIR="$WORK_DIR/check"
 rm -rf "$PACKAGE_CHECK_DIR"
 pkgutil --expand-full "$FINAL_PKG" "$PACKAGE_CHECK_DIR"
 COMPONENT_INFO="$PACKAGE_CHECK_DIR/$APP_NAME-component.pkg/PackageInfo"
-if ! grep -q 'install-location="/Applications"' "$COMPONENT_INFO"; then
-    echo "error: component package does not install into /Applications" >&2
+PACKAGE_APP="$PACKAGE_CHECK_DIR/$APP_NAME-component.pkg/Payload/Applications/$APP_NAME.app"
+PACKAGE_INFO_PLIST="$PACKAGE_APP/Contents/Info.plist"
+PACKAGE_ICONSET_CHECK="$PACKAGE_CHECK_DIR/AppIcon.iconset"
+if ! grep -q 'install-location="/"' "$COMPONENT_INFO"; then
+    echo "error: component package root install location changed" >&2
     exit 1
 fi
-if grep -q 'path="./Applications/' "$COMPONENT_INFO"; then
-    echo "error: component package payload nests Applications inside the app install location" >&2
+if ! grep -q "path=\"./Applications/$APP_NAME.app\"" "$COMPONENT_INFO"; then
+    echo "error: component package payload does not contain Applications/$APP_NAME.app" >&2
+    exit 1
+fi
+if grep -q '<bundle-version>' "$COMPONENT_INFO"; then
+    echo "error: component package still enables bundle version checks" >&2
+    exit 1
+fi
+if [[ ! -f "$PACKAGE_APP/Contents/Resources/AppIcon.icns" ]]; then
+    echo "error: package payload is missing AppIcon.icns" >&2
+    exit 1
+fi
+iconutil -c iconset "$PACKAGE_APP/Contents/Resources/AppIcon.icns" -o "$PACKAGE_ICONSET_CHECK"
+if [[ ! -f "$PACKAGE_ICONSET_CHECK/icon_512x512@2x.png" ]]; then
+    echo "error: package AppIcon.icns is missing the 1024px rendition" >&2
+    exit 1
+fi
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$PACKAGE_INFO_PLIST")" != "AppIcon.icns" ]]; then
+    echo "error: package Info.plist is missing CFBundleIconFile=AppIcon.icns" >&2
+    exit 1
+fi
+if /usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$PACKAGE_INFO_PLIST" >/dev/null 2>&1; then
+    echo "error: package Info.plist must not use asset-catalog CFBundleIconName" >&2
+    exit 1
+fi
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PACKAGE_INFO_PLIST")" != "$VERSION" ]]; then
+    echo "error: package Info.plist version does not match $VERSION" >&2
+    exit 1
+fi
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PACKAGE_INFO_PLIST")" != "$BUILD_NUMBER" ]]; then
+    echo "error: package Info.plist build number does not match $BUILD_NUMBER" >&2
     exit 1
 fi
 
