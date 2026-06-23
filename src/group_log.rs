@@ -165,6 +165,9 @@ pub fn write_group_readme_at(
         Err(e) => return Err(e),
     };
     let readme = merge_group_readme(existing.as_deref(), &bridge_section);
+    if existing.as_deref() == Some(readme.as_str()) {
+        return Ok(());
+    }
     std::fs::write(path, readme)
 }
 

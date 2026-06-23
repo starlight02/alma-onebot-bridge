@@ -11,6 +11,27 @@ private let log = Logger(
 )
 private let maxBridgeLogBytes: UInt64 = 10 * 1024 * 1024
 private let bridgeLogBackupCount = 3
+private let projectName = "alma-onebot-bridge"
+private let projectURL = "https://github.com/starlight02/alma-onebot-bridge"
+private let projectAuthor = "星光の殲滅者"
+private let projectAuthorURL = "https://github.com/starlight02"
+private let projectLicense = "AGPL-3.0-only"
+private let projectLicenseURL = "https://spdx.org/licenses/AGPL-3.0-only"
+
+private final class LinkOpeningTextView: NSTextView {
+    override func clicked(onLink link: Any, at charIndex: Int) {
+        if let url = link as? URL {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        if let urlString = link as? String,
+           let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        super.clicked(onLink: link, at: charIndex)
+    }
+}
 
 enum BridgeApplyAction {
     case none
@@ -419,6 +440,141 @@ final class ConfigManager: ObservableObject {
         default:
             break
         }
+    }
+
+    func showAboutAlert() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let clipboardInformation = aboutClipboardInformationText()
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "\(applicationName) \(applicationVersionDisplay)"
+        alert.accessoryView = aboutInformationView()
+        alert.addButton(withTitle: "好")
+        alert.addButton(withTitle: "复制信息")
+
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(
+                "\(alert.messageText)\n\n\(clipboardInformation)",
+                forType: .string
+            )
+        }
+    }
+
+    private var applicationName: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
+            ?? "AlmaOneBotBridge"
+    }
+
+    private var applicationVersionDisplay: String {
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "Unknown"
+        return "版本 \(version)"
+    }
+
+    private var sourceVersionDisplay: String {
+        let commit = Bundle.main.object(forInfoDictionaryKey: "AlmaGitCommit") as? String
+            ?? "Unknown"
+        let isDirty = (
+            Bundle.main.object(forInfoDictionaryKey: "AlmaGitDirty") as? String
+        ) == "true"
+
+        if isDirty, commit != "Unknown" {
+            return "\(commit)（本地构建含未提交修改）"
+        }
+        return commit
+    }
+
+    private var aboutStatusDisplay: String {
+        let portSuffix = "：端口 \(model.bridgePort)"
+        if statusText.hasSuffix(portSuffix) {
+            return String(statusText.dropLast(portSuffix.count))
+        }
+        return statusText
+    }
+
+    private func aboutInformationView() -> NSView {
+        let width: CGFloat = 420
+        let textView = LinkOpeningTextView(frame: NSRect(x: 0, y: 0, width: width, height: 170))
+        textView.drawsBackground = false
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textStorage?.setAttributedString(aboutInformationAttributedText())
+
+        if let layoutManager = textView.layoutManager,
+           let textContainer = textView.textContainer {
+            layoutManager.ensureLayout(for: textContainer)
+            let usedRect = layoutManager.usedRect(for: textContainer)
+            textView.frame.size = NSSize(width: width, height: ceil(usedRect.height))
+        }
+
+        return textView
+    }
+
+    private func aboutInformationAttributedText() -> NSAttributedString {
+        let text = NSMutableAttributedString()
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineSpacing = 2
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let baseAttributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraphStyle
+        ]
+
+        func append(_ value: String, attributes: [NSAttributedString.Key: Any] = baseAttributes) {
+            text.append(NSAttributedString(string: value, attributes: attributes))
+        }
+
+        func appendLine(_ value: String = "") {
+            append("\(value)\n")
+        }
+
+        func appendLinkedLine(label: String, value: String, urlString: String) {
+            append(label)
+            var linkAttributes = baseAttributes
+            linkAttributes[.link] = urlString
+            linkAttributes[.foregroundColor] = NSColor.linkColor
+            linkAttributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            append(value, attributes: linkAttributes)
+            appendLine()
+        }
+
+        appendLine("提交版本：\(sourceVersionDisplay)")
+        appendLinkedLine(label: "项目地址：", value: projectName, urlString: projectURL)
+        appendLinkedLine(label: "作者：", value: projectAuthor, urlString: projectAuthorURL)
+        appendLinkedLine(label: "开源协议：", value: projectLicense, urlString: projectLicenseURL)
+        appendLine()
+        appendLine("运行状态：\(aboutStatusDisplay)")
+        appendLine("监听端口：\(model.bridgePort)")
+        appendLine("Bridge PID：\(bridgePID.map(String.init) ?? "无")")
+        append("Alma API：\(model.almaApi)")
+
+        return text
+    }
+
+    private func aboutClipboardInformationText() -> String {
+        let pidText = bridgePID.map(String.init) ?? "无"
+
+        return """
+        提交版本：\(sourceVersionDisplay)
+        运行状态：\(aboutStatusDisplay)
+        监听端口：\(model.bridgePort)
+        Bridge PID：\(pidText)
+        Alma API：\(model.almaApi)
+        """
     }
 
     // MARK: Load

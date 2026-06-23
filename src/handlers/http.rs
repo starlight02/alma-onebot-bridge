@@ -236,14 +236,13 @@ async fn send_message_handler(
             message_ids.push(msg_id);
         }
 
-        if let Some(thread_id) = thread_id.as_deref() {
-            state.register_sent_reply(thread_id, chunk).await;
-        }
-
         if target_type == "group" {
             record_alma_group_output(&state, target_id, chunk, msg_id, current_unix_timestamp())
                 .await;
         }
+    }
+    if let Some(thread_id) = thread_id.as_deref() {
+        state.register_sent_reply(thread_id, message).await;
     }
 
     Ok(json_status(

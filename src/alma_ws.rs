@@ -292,16 +292,11 @@ async fn connection_supervisor(
                         "[AlmaWS] Reconnect attempt {} failed: {}; retrying in {}ms",
                         reconnect_attempt, e, delay
                     );
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
-                        maybe_msg = outbound_rx.recv() => {
-                            if maybe_msg.is_none() {
-                                debug!("[AlmaWS] outbound channel closed while reconnecting");
-                                return;
-                            }
-                            debug!("[AlmaWS] dropping outbound message while disconnected");
-                        }
+                    if outbound_rx.is_closed() && outbound_rx.is_empty() {
+                        debug!("[AlmaWS] outbound channel closed while reconnecting");
+                        return;
                     }
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
                     continue;
                 }
             },
@@ -1028,12 +1023,15 @@ mod tests {
         PendingGeneration, PendingMap, dispatch_event, extract_think_blocks,
         normalize_assistant_text, sanitize_visible_assistant_text,
     };
+    use futures_util::StreamExt;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::net::TcpListener;
     use tokio::sync::{Mutex, mpsc, oneshot};
     use tokio::time::timeout;
+    use tokio_tungstenite::accept_async;
 
     #[test]
     fn normalizes_html_breaks_and_separates_thinking() {
@@ -1237,5 +1235,47 @@ mod tests {
         .await;
 
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnect_keeps_outbound_messages_queued() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let url = format!("ws://{}", addr);
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let supervisor = tokio::spawn(super::connection_supervisor(
+            url,
+            None,
+            outbound_rx,
+            pending,
+            event_tx,
+            connected,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        outbound_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "queued while reconnecting".into(),
+            ))
+            .unwrap();
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let received = timeout(Duration::from_secs(4), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            ws.next().await.unwrap().unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(received.to_text().unwrap(), "queued while reconnecting");
+        drop(outbound_tx);
+        supervisor.abort();
     }
 }

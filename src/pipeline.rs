@@ -542,6 +542,8 @@ pub async fn process_message_event(
         None
     };
     let mut is_first = true;
+    let mut any_reply_chunk_sent = false;
+    let mut all_reply_chunks_sent = true;
     for para in &paragraphs {
         let chunks = split_text(para, QQ_MSG_LIMIT);
         for chunk in &chunks {
@@ -585,6 +587,7 @@ pub async fn process_message_event(
 
             match result {
                 Ok(resp) => {
+                    any_reply_chunk_sent = true;
                     state.register_sent_reply(&thread_id, chunk).await;
                     let msg_id = resp
                         .data
@@ -607,6 +610,7 @@ pub async fn process_message_event(
                     );
                 }
                 Err(e) => {
+                    all_reply_chunks_sent = false;
                     warn!(
                         "[Reply] Failed to send to {} {}: {}",
                         target_type, target_id, e
@@ -614,6 +618,9 @@ pub async fn process_message_event(
                 }
             }
         }
+    }
+    if any_reply_chunk_sent && all_reply_chunks_sent {
+        state.register_sent_reply(&thread_id, &reply).await;
     }
 
     Ok(())
@@ -660,7 +667,7 @@ struct ObservedGroupMessage<'a> {
 
 async fn record_observed_group_message(state: &SharedState, message: ObservedGroupMessage<'_>) {
     let session_key = format!("group:{}", message.group_id);
-    if let Err(e) = state
+    let is_new_group = match state
         .touch_group(
             message.group_id,
             message.group_title,
@@ -668,11 +675,15 @@ async fn record_observed_group_message(state: &SharedState, message: ObservedGro
         )
         .await
     {
-        debug!(
-            "[GroupDirectory] Failed to touch group {}: {}",
-            message.group_id, e
-        );
-    }
+        Ok(is_new_group) => is_new_group,
+        Err(e) => {
+            debug!(
+                "[GroupDirectory] Failed to touch group {}: {}",
+                message.group_id, e
+            );
+            false
+        }
+    };
     if message.user_id != 0
         && let Err(e) = state
             .record_group_member(
@@ -717,7 +728,9 @@ async fn record_observed_group_message(state: &SharedState, message: ObservedGro
         debug!("[GroupHistory] Failed to append Alma group log: {}", e);
     }
 
-    refresh_alma_group_directory_readme(state).await;
+    if is_new_group {
+        refresh_alma_group_directory_readme(state).await;
+    }
     debug!(
         "[GroupHistory] Recorded message from {} in {}",
         message.display_name, session_key
@@ -867,10 +880,8 @@ pub async fn handle_alma_event(
         .was_sent_recently(&event.thread_id, &event.message_text)
         .await
     {
-        // Promoted to info: dedup hits are the second most common reason
-        // for "Alma GUI reply not synced" complaints.
         info!(
-            "[Alma→QQ] Dedup hit for thread {} (prefix matches a sent reply, {} chars)",
+            "[Alma→QQ] Dedup hit for thread {} (exact sent reply match, {} chars)",
             event.thread_id,
             event.message_text.len()
         );
@@ -913,10 +924,9 @@ pub async fn handle_alma_event(
 
     // Forward the Alma GUI assistant message to QQ
     let chunks = split_text(&event.message_text, QQ_MSG_LIMIT);
+    let mut any_chunk_sent = false;
+    let mut all_chunks_sent = true;
     for chunk in &chunks {
-        // Register to avoid echo loops
-        state.register_sent_reply(&event.thread_id, chunk).await;
-
         match send_text_message(
             ws_tx,
             pending,
@@ -928,6 +938,8 @@ pub async fn handle_alma_event(
         .await
         {
             Ok(resp) => {
+                any_chunk_sent = true;
+                state.register_sent_reply(&event.thread_id, chunk).await;
                 let msg_id = resp
                     .data
                     .as_ref()
@@ -952,9 +964,15 @@ pub async fn handle_alma_event(
                 );
             }
             Err(e) => {
+                all_chunks_sent = false;
                 warn!("[Alma→QQ] Failed to forward: {}", e);
             }
         }
+    }
+    if any_chunk_sent && all_chunks_sent {
+        state
+            .register_sent_reply(&event.thread_id, &event.message_text)
+            .await;
     }
 
     Ok(())
@@ -974,7 +992,13 @@ async fn resolve_thread_for_session(
                 "[Thread] Local mapping {} -> {} is stale; Alma API has no such thread",
                 session_key, thread_id
             ),
-            Err(e) => return Err(e),
+            Err(e) => {
+                warn!(
+                    "[Thread] Could not verify existing Alma thread {} for {}; using local mapping and letting generation handle failures: {}",
+                    thread_id, session_key, e
+                );
+                return Ok((thread_id, true));
+            }
         }
     }
 
@@ -1051,9 +1075,13 @@ pub(crate) async fn record_alma_group_output(
             },
         )
         .await;
-    if let Err(e) = state.touch_group(group_id, None, timestamp_secs).await {
-        debug!("[GroupDirectory] Failed to touch group {}: {}", group_id, e);
-    }
+    let is_new_group = match state.touch_group(group_id, None, timestamp_secs).await {
+        Ok(is_new_group) => is_new_group,
+        Err(e) => {
+            debug!("[GroupDirectory] Failed to touch group {}: {}", group_id, e);
+            false
+        }
+    };
     if let Err(e) = group_log::append_alma_group_log_async(
         group_id,
         "Alma".to_string(),
@@ -1068,7 +1096,9 @@ pub(crate) async fn record_alma_group_output(
     {
         debug!("[GroupHistory] Failed to append Alma group log: {}", e);
     }
-    refresh_alma_group_directory_readme(state).await;
+    if is_new_group {
+        refresh_alma_group_directory_readme(state).await;
+    }
 }
 
 pub(crate) async fn refresh_alma_group_directory_readme(state: &SharedState) {

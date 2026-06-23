@@ -339,7 +339,7 @@ AlmaWsClient internal channel
 tokio::sync::broadcast channel (capacity: 64)
   ↓ (each OneBot connection subscribes)
 handle_alma_event()
-  ↓ (dedup check: first 100 chars)
+  ↓ (dedup check: exact recently sent text)
 OneBot send_msg → QQ
 ```
 
@@ -349,9 +349,9 @@ the thread is NOT generating. This prevents:
 - Forwarding partial text during active generation
 - Duplicate messages (bridge pipeline sends directly, Alma event would re-send)
 
-**Dedup mechanism**: `register_sent_reply()` + `was_sent_recently()` compare the first
-100 characters of outgoing text. This prevents echo loops when the bridge sends a reply
-to QQ and Alma also records it in the thread.
+**Dedup mechanism**: `register_sent_reply()` + `was_sent_recently()` compare exact
+recently sent text. This prevents echo loops without suppressing different messages
+that happen to share a long prefix.
 
 ### 2.10 Reply/Quoting Protocol
 
@@ -811,9 +811,9 @@ hostname to reach services on the Mac host. The OrbStack bridge network
 
 ### 5.14 Dedup Comparison Precision
 
-The dedup mechanism compares the first 100 characters of text. This is sufficient
-for most messages but could theoretically miss duplicates that diverge after 100 chars.
-The sent reply buffer keeps the last 20 entries per thread.
+The dedup mechanism compares exact recently sent text. This avoids suppressing
+distinct assistant messages that share a long boilerplate prefix. The sent reply
+buffer keeps the last 20 entries per thread.
 
 ### 5.15 Per-Thread Generation Guards
 

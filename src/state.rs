@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,6 +125,8 @@ pub struct AppState {
     pub group_history: RwLock<HashMap<String, VecDeque<GroupMessage>>>,
     /// Cached QQ group titles keyed by numeric group_id.
     pub group_titles: RwLock<HashMap<i64, String>>,
+    /// Group IDs already present in the group directory database.
+    known_group_ids: RwLock<HashSet<i64>>,
     /// Cached People Profile paths keyed by QQ user_id string.
     pub people_profile_paths: RwLock<HashMap<String, PathBuf>>,
     /// Active OneBot reverse-WS API path for HTTP command endpoints.
@@ -139,6 +141,33 @@ pub struct AppState {
 /// Cheap-to-clone wrapper around `Arc<AppState>`.
 #[derive(Clone)]
 pub struct SharedState(Arc<AppState>);
+
+async fn load_known_group_ids(conn: &turso::Connection) -> Result<HashSet<i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT group_id FROM groups")
+        .await
+        .map_err(|e| format!("DB prepare error: {}", e))?;
+    let mut rows = stmt
+        .query(())
+        .await
+        .map_err(|e| format!("DB query error: {}", e))?;
+
+    let mut group_ids = HashSet::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| format!("DB row error: {}", e))?
+    {
+        let group_id = row
+            .get::<String>(0)
+            .map_err(|e| format!("DB get group_id error: {}", e))?
+            .parse::<i64>()
+            .map_err(|e| format!("Invalid group_id in DB: {}", e))?;
+        group_ids.insert(group_id);
+    }
+
+    Ok(group_ids)
+}
 
 impl std::ops::Deref for SharedState {
     type Target = AppState;
@@ -206,6 +235,8 @@ impl SharedState {
         .await
         .map_err(|e| format!("Failed to create group_members table: {}", e))?;
 
+        let known_group_ids = load_known_group_ids(&conn).await?;
+
         let (alma_event_tx, _) = tokio::sync::broadcast::channel(64);
 
         Ok(SharedState(Arc::new(AppState {
@@ -221,6 +252,7 @@ impl SharedState {
             sent_replies: RwLock::new(HashMap::new()),
             group_history: RwLock::new(HashMap::new()),
             group_titles: RwLock::new(HashMap::new()),
+            known_group_ids: RwLock::new(known_group_ids),
             people_profile_paths: RwLock::new(HashMap::new()),
             onebot_api: RwLock::new(None),
             alma_event_tx,
@@ -452,6 +484,10 @@ impl SharedState {
         *self.alma_ws.write().await = Some(client);
     }
 
+    pub async fn clear_alma_ws(&self) {
+        *self.alma_ws.write().await = None;
+    }
+
     pub async fn get_alma_ws(&self) -> Option<AlmaWsClient> {
         self.alma_ws.read().await.clone()
     }
@@ -489,10 +525,9 @@ impl SharedState {
     }
 
     /// Check if a text was recently sent as a reply (for dedup).
-    /// Short identical replies are deduped within a narrow time window to avoid
+    /// Identical replies are deduped within a narrow time window to avoid
     /// double-sending the same Alma reply via both the direct send path and the
-    /// later `message_updated` event. Longer replies also allow prefix matching
-    /// to cover chunking differences.
+    /// later `message_updated` event.
     pub async fn was_sent_recently(&self, thread_id: &str, text: &str) -> bool {
         let mut map = self.sent_replies.write().await;
         if let Some(deque) = map.get_mut(thread_id) {
@@ -553,7 +588,7 @@ impl SharedState {
         group_id: i64,
         title: Option<&str>,
         timestamp_secs: u64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let timestamp = normalize_timestamp(timestamp_secs).to_string();
         let title = title.map(str::trim).filter(|t| !t.is_empty()).unwrap_or("");
         if !title.is_empty() {
@@ -563,11 +598,12 @@ impl SharedState {
                 .insert(group_id, title.to_string());
         }
 
+        let numeric_group_id = group_id;
         let conn = self
             .db
             .connect()
             .map_err(|e| format!("DB connect error: {}", e))?;
-        let group_id = group_id.to_string();
+        let group_id = numeric_group_id.to_string();
 
         let mut insert = conn
             .prepare(
@@ -595,7 +631,8 @@ impl SharedState {
             .await
             .map_err(|e| format!("DB update error: {}", e))?;
 
-        Ok(())
+        let mut known_group_ids = self.known_group_ids.write().await;
+        Ok(known_group_ids.insert(numeric_group_id))
     }
 
     pub async fn record_group_member(
@@ -798,38 +835,13 @@ fn normalize_timestamp(timestamp_secs: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// Safely truncate a string prefix by bytes without panicking on UTF-8 boundaries.
-/// Walks backwards from `max_bytes` to the nearest char boundary.
-fn safe_prefix(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 fn sent_reply_matches(sent: &str, candidate: &str) -> bool {
-    if sent == candidate {
-        return true;
-    }
-
-    let sent_prefix = safe_prefix(sent, 100);
-    let candidate_prefix = safe_prefix(candidate, 100);
-    let min_match_len: usize = 30;
-
-    sent_prefix == candidate_prefix
-        && sent_prefix.len() >= min_match_len
-        && candidate_prefix.len() >= min_match_len
+    sent == candidate
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ReverseThreadCache, SESSION_REVERSE_LIMIT, SharedState, safe_prefix, sent_reply_matches,
-    };
+    use super::{ReverseThreadCache, SESSION_REVERSE_LIMIT, SharedState, sent_reply_matches};
     use crate::config::Config;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -843,13 +855,6 @@ mod tests {
     }
 
     #[test]
-    fn safe_prefix_keeps_utf8_boundaries() {
-        let prefix = safe_prefix("你好世界你好世界", 7);
-        assert!(!prefix.contains('\u{fffd}'));
-        assert!(prefix.len() <= 7);
-    }
-
-    #[test]
     fn sent_reply_matches_short_exact_cjk_reply() {
         assert!(sent_reply_matches("萌依收到电报", "萌依收到电报"));
     }
@@ -860,10 +865,10 @@ mod tests {
     }
 
     #[test]
-    fn sent_reply_matches_long_prefix_equivalent_chunks() {
+    fn sent_reply_matches_rejects_shared_long_prefix() {
         let text = "这是一个足够长的回复，用来验证前缀匹配在长文本场景下仍然有效，而且不会被 UTF-8 截断搞坏。";
         let prefix_equivalent = "这是一个足够长的回复，用来验证前缀匹配在长文本场景下仍然有效，而且不会被 UTF-8 截断搞坏。后续补充";
-        assert!(sent_reply_matches(text, prefix_equivalent));
+        assert!(!sent_reply_matches(text, prefix_equivalent));
     }
 
     #[tokio::test]
@@ -916,6 +921,29 @@ mod tests {
             .unwrap();
 
         assert!(state.get_qq_target("thread-bad").await.unwrap().is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn touch_group_reports_new_groups_and_loads_existing_groups_on_startup() {
+        let db_path = temp_db_path("known-groups");
+        let mut config = Config::load();
+        config.db_path = db_path.clone();
+
+        let state = SharedState::new(config.clone()).await.unwrap();
+        assert!(state.touch_group(10001, Some("测试群"), 1).await.unwrap());
+        assert!(!state.touch_group(10001, Some("测试群"), 2).await.unwrap());
+        drop(state);
+
+        let restarted = SharedState::new(config).await.unwrap();
+        assert!(
+            !restarted
+                .touch_group(10001, Some("测试群"), 3)
+                .await
+                .unwrap()
+        );
+        assert!(restarted.touch_group(10002, None, 4).await.unwrap());
 
         let _ = std::fs::remove_file(db_path);
     }

@@ -57,6 +57,11 @@ struct MenuBarView: View {
                 dismiss()
             }
 
+            MenuPanelButton(title: "关于 Alma Bridge", systemImage: "info.circle") {
+                configManager.showAboutAlert()
+                dismiss()
+            }
+
             if let error = configManager.lastError, !error.isEmpty {
                 Divider()
                 Text(error)

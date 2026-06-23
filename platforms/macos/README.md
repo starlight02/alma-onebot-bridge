@@ -24,6 +24,8 @@ Download the latest macOS PKG from GitHub Releases:
 
 Open the PKG and follow Installer. The installer asks you to accept the
 AGPL-3.0 license, then installs the app into `/Applications`.
+If the installed app is already running, Installer quits it before replacing the
+app and reopens the newly installed app after installation.
 
 Unsigned builds include `unsigned` in the file name. macOS may show a Gatekeeper
 warning for unsigned packages. If that happens, open System Settings, go to
@@ -84,6 +86,7 @@ If you changed the bridge port in Preferences, update the OneBot URL to match.
 - `Preferences...`: opens settings
 - `Open Config Directory`: opens the config and log folder
 - `Open Bridge Log`: opens the current bridge log
+- `About Alma Bridge`: shows the installed app version, source commit, project URL, author, license, and bridge status
 - `Quit`: stops the bridge and exits the app
 
 ## Logs and Files

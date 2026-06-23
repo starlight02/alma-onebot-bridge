@@ -13,6 +13,27 @@ BUILD_NUMBER="${BUILD_NUMBER:-$((10#$VERSION_MAJOR * 10000 + 10#$VERSION_MINOR *
 HOST_ARCH="$(uname -m)"
 BUILD_UNIVERSAL="${BUILD_UNIVERSAL:-0}"
 
+if [[ -z "${GIT_COMMIT:-}" || -z "${GIT_VERSION:-}" || -z "${GIT_DIRTY:-}" ]]; then
+    if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        RESOLVED_GIT_COMMIT="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
+        RESOLVED_GIT_VERSION="$(git -C "$ROOT" describe --tags --always 2>/dev/null || printf '%s' "$RESOLVED_GIT_COMMIT")"
+        RESOLVED_GIT_DIRTY=false
+        if ! git -C "$ROOT" diff --quiet --ignore-submodules -- \
+            || ! git -C "$ROOT" diff --cached --quiet --ignore-submodules --; then
+            RESOLVED_GIT_DIRTY=true
+            RESOLVED_GIT_VERSION="$RESOLVED_GIT_VERSION-dirty"
+        fi
+    else
+        RESOLVED_GIT_COMMIT=unknown
+        RESOLVED_GIT_VERSION=unknown
+        RESOLVED_GIT_DIRTY=false
+    fi
+
+    GIT_COMMIT="${GIT_COMMIT:-$RESOLVED_GIT_COMMIT}"
+    GIT_VERSION="${GIT_VERSION:-$RESOLVED_GIT_VERSION}"
+    GIT_DIRTY="${GIT_DIRTY:-$RESOLVED_GIT_DIRTY}"
+fi
+
 if [[ "$BUILD_UNIVERSAL" == "1" ]]; then
     RUST_BRIDGE_TARGETS="${RUST_BRIDGE_TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
     ARCHS="${ARCHS:-arm64 x86_64}"
@@ -60,6 +81,16 @@ APP_ICONSET="$MACOS_DIR/AppIcon.iconset"
 APP_ICNS="$APP/Contents/Resources/AppIcon.icns"
 APP_INFO_PLIST="$APP/Contents/Info.plist"
 
+set_plist_string() {
+    local key="$1"
+    local value="$2"
+    if /usr/libexec/PlistBuddy -c "Print :$key" "$APP_INFO_PLIST" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Set :$key $value" "$APP_INFO_PLIST"
+    else
+        /usr/libexec/PlistBuddy -c "Add :$key string $value" "$APP_INFO_PLIST"
+    fi
+}
+
 echo "==> Installing complete macOS app icon..."
 ICON_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/alma-onebot-icon.XXXXXX")"
 trap 'rm -rf "$ICON_WORK_DIR"' EXIT
@@ -79,6 +110,10 @@ if /usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$APP_INFO_PLIST" >/dev/
 else
     /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string AppIcon.icns' "$APP_INFO_PLIST"
 fi
+echo "==> Embedding git version: $GIT_COMMIT ($GIT_VERSION)"
+set_plist_string "AlmaGitCommit" "$GIT_COMMIT"
+set_plist_string "AlmaGitVersion" "$GIT_VERSION"
+set_plist_string "AlmaGitDirty" "$GIT_DIRTY"
 
 if [[ ! -x "$APP_RESOURCE" ]]; then
     echo "==> Xcode did not copy the bridge binary; installing it into app resources..."

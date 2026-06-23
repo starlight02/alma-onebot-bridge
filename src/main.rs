@@ -170,6 +170,7 @@ async fn main() {
                 tracing::info!("[SIGHUP] Reloading config from disk...");
                 let new_config = Config::load();
                 let mut cfg = state.config.write().await;
+                let alma_api_changed = cfg.alma_api != new_config.alma_api;
                 cfg.group_history_size = new_config.group_history_size;
                 cfg.thinking_message = new_config.thinking_message;
                 cfg.show_thinking = new_config.show_thinking;
@@ -181,6 +182,13 @@ async fn main() {
                 cfg.alma_model = new_config.alma_model;
                 cfg.alma_api = new_config.alma_api;
                 cfg.people_dir = new_config.people_dir;
+                drop(cfg);
+                if alma_api_changed {
+                    state.clear_alma_ws().await;
+                    tracing::info!(
+                        "[SIGHUP] Alma API changed; dropped existing WebSocket client so the next request reconnects"
+                    );
+                }
                 tracing::info!("[SIGHUP] Config hot-reload complete");
             }
         });
