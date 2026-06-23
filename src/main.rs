@@ -12,6 +12,9 @@ mod state;
 
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +23,9 @@ use warp::Filter;
 use crate::alma_ws::AlmaWsClient;
 use crate::config::Config;
 use crate::state::SharedState;
+
+const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+const LOG_BACKUP_COUNT: u8 = 3;
 
 /// PID file location for process discovery by the macOS GUI shell.
 fn pid_file_path() -> PathBuf {
@@ -59,6 +65,20 @@ async fn main() {
         apply_debugger_defaults(&mut config);
     }
 
+    let bind_addr = ([0, 0, 0, 0], config.bridge_port);
+    let preflight_addr = format!("0.0.0.0:{}", config.bridge_port);
+    match TcpListener::bind(&preflight_addr) {
+        Ok(listener) => drop(listener),
+        Err(e) => {
+            tracing::error!(
+                "Cannot listen on {}: {}. Stop the existing bridge or change bridge.port in config.toml.",
+                preflight_addr,
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+
     let state = match SharedState::new(config.clone()).await {
         Ok(state) => state,
         Err(e) => {
@@ -71,7 +91,6 @@ async fn main() {
     };
 
     tracing::info!("Alma OneBot Bridge starting...");
-    write_pid_file();
     if debugger_mode {
         tracing::info!("  Debugger    : enabled");
     }
@@ -89,6 +108,8 @@ async fn main() {
     if config.show_thinking {
         tracing::info!("  Show thinking: enabled (thinking blocks sent as separate messages)");
     }
+
+    write_pid_file();
 
     // ── Initialize Alma WebSocket client ─────────────────────────────────
     // Connect to Alma's internal WS endpoint for the full chat pipeline.
@@ -252,12 +273,12 @@ async fn main() {
         .or(ws_onebot);
 
     tracing::info!(
-        "Listening on 0.0.0.0:{} — waiting for OneBot reverse WS connection...",
-        config.bridge_port
+        "Listening on {} — waiting for OneBot reverse WS connection...",
+        preflight_addr
     );
 
     warp::serve(routes)
-        .bind(([0, 0, 0, 0], config.bridge_port))
+        .bind(bind_addr)
         .await
         .graceful(shutdown_signal())
         .run()
@@ -290,6 +311,10 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         return None;
     }
 
+    if let Err(e) = rotate_log_file_if_needed(&log_path, LOG_ROTATE_BYTES, LOG_BACKUP_COUNT) {
+        eprintln!("Failed to rotate log file {}: {}", log_path.display(), e);
+    }
+
     let file_name = log_path
         .file_name()
         .map(PathBuf::from)
@@ -301,6 +326,43 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         .with_writer(writer)
         .init();
     Some(guard)
+}
+
+fn rotate_log_file_if_needed(path: &Path, max_bytes: u64, backups: u8) -> io::Result<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+
+    if metadata.len() <= max_bytes {
+        return Ok(false);
+    }
+
+    if backups == 0 {
+        fs::remove_file(path)?;
+        return Ok(true);
+    }
+
+    let oldest = rotated_log_path(path, backups);
+    if oldest.exists() {
+        fs::remove_file(&oldest)?;
+    }
+
+    for index in (1..backups).rev() {
+        let from = rotated_log_path(path, index);
+        if from.exists() {
+            fs::rename(&from, rotated_log_path(path, index + 1))?;
+        }
+    }
+
+    fs::rename(path, rotated_log_path(path, 1))?;
+    Ok(true)
+}
+
+fn rotated_log_path(path: &Path, index: u8) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_else(|| OsStr::new("bridge.log"));
+    path.with_file_name(format!("{}.{}", file_name.to_string_lossy(), index))
 }
 
 fn apply_debugger_defaults(config: &mut Config) {
@@ -345,4 +407,52 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received; stopping HTTP/WebSocket server");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rotate_log_file_if_needed, rotated_log_path};
+    use std::{env, fs};
+
+    #[test]
+    fn rotates_log_when_it_exceeds_limit() {
+        let dir = env::temp_dir().join(format!(
+            "alma-onebot-bridge-log-rotate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("bridge.log");
+
+        fs::write(&log, b"current").unwrap();
+        fs::write(rotated_log_path(&log, 1), b"previous").unwrap();
+
+        let rotated = rotate_log_file_if_needed(&log, 3, 3).unwrap();
+
+        assert!(rotated);
+        assert!(!log.exists());
+        assert_eq!(fs::read(rotated_log_path(&log, 1)).unwrap(), b"current");
+        assert_eq!(fs::read(rotated_log_path(&log, 2)).unwrap(), b"previous");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_small_log_in_place() {
+        let dir = env::temp_dir().join(format!(
+            "alma-onebot-bridge-log-keep-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("bridge.log");
+        fs::write(&log, b"small").unwrap();
+
+        let rotated = rotate_log_file_if_needed(&log, 10, 3).unwrap();
+
+        assert!(!rotated);
+        assert_eq!(fs::read(&log).unwrap(), b"small");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

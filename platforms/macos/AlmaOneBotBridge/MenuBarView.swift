@@ -52,7 +52,7 @@ struct MenuBarView: View {
             }
 
             MenuPanelButton(title: "打开运行日志", systemImage: "doc.text.magnifyingglass") {
-                ensureLogFileExists()
+                configManager.ensureLogFileExists()
                 NSWorkspace.shared.open(configManager.logFileURL)
                 dismiss()
             }
@@ -98,12 +98,6 @@ struct MenuBarView: View {
         if configManager.isBridgeHealthy { return .green }
         if configManager.isBridgeRunning { return .orange }
         return .secondary
-    }
-
-    private func ensureLogFileExists() {
-        if !FileManager.default.fileExists(atPath: configManager.logFileURL.path()) {
-            FileManager.default.createFile(atPath: configManager.logFileURL.path(), contents: nil)
-        }
     }
 }
 

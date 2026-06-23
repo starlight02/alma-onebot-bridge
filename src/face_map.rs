@@ -153,25 +153,25 @@ pub fn face_name(id: &str) -> Option<&'static str> {
 
 /// Reverse lookup: find a QQ face expression ID by its human-readable name.
 /// Returns `None` for unknown names.
-pub fn face_id(name: &str) -> Option<&'static str> {
+pub fn face_id(name: &str) -> Option<String> {
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
-    static REVERSE: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+    static REVERSE: OnceLock<HashMap<&'static str, u16>> = OnceLock::new();
 
     let map = REVERSE.get_or_init(|| {
         let mut m = HashMap::with_capacity(200);
         // Scan the full known ID range; face_name returns &'static str
-        for id in 0..=500 {
-            let id_str = Box::leak(id.to_string().into_boxed_str());
-            if let Some(n) = face_name(id_str) {
-                m.entry(n).or_insert(&*id_str);
+        for id in 0u16..=500 {
+            let id_str = id.to_string();
+            if let Some(n) = face_name(&id_str) {
+                m.entry(n).or_insert(id);
             }
         }
         m
     });
 
-    map.get(name).copied()
+    map.get(name).map(u16::to_string)
 }
 
 #[cfg(test)]
@@ -182,6 +182,6 @@ mod tests {
     fn duplicate_face_names_keep_first_known_id() {
         assert_eq!(face_name("264"), Some("捂脸"));
         assert_eq!(face_name("319"), Some("捂脸"));
-        assert_eq!(face_id("捂脸"), Some("264"));
+        assert_eq!(face_id("捂脸"), Some("264".to_string()));
     }
 }

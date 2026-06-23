@@ -49,6 +49,33 @@ pub fn append_alma_group_log(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn append_alma_group_log_async(
+    chat_id: i64,
+    display_name: String,
+    text: String,
+    is_alma: bool,
+    timestamp_secs: u64,
+    message_id: Option<i64>,
+    user_id: Option<i64>,
+    username: Option<String>,
+) -> Result<(), std::io::Error> {
+    tokio::task::spawn_blocking(move || {
+        append_alma_group_log(
+            chat_id,
+            &display_name,
+            &text,
+            is_alma,
+            timestamp_secs,
+            message_id,
+            user_id,
+            username.as_deref(),
+        )
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn append_alma_group_log_at(
     home: &Path,
     chat_id: i64,
@@ -111,6 +138,15 @@ pub fn write_group_readme(
         return Ok(());
     };
     write_group_readme_at(&home, entries, bridge_port)
+}
+
+pub async fn write_group_readme_async(
+    entries: Vec<GroupDirectoryEntry>,
+    bridge_port: u16,
+) -> Result<(), std::io::Error> {
+    tokio::task::spawn_blocking(move || write_group_readme(&entries, bridge_port))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 pub fn write_group_readme_at(

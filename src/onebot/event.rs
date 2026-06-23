@@ -4,43 +4,24 @@ use serde::{Deserialize, Serialize};
 
 /// Top-level OneBot event. `self_id` is always present; the rest depends on `post_type`.
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct OneBotEvent {
     pub time: Option<u64>,
     pub self_id: i64,
-    pub post_type: String,
 
     // Message fields
     pub message_type: Option<String>,
-    pub sub_type: Option<String>,
     pub message_id: Option<i64>,
     pub user_id: Option<i64>,
     pub group_id: Option<i64>,
     pub message: Option<Vec<MessageSegment>>,
-    pub raw_message: Option<String>,
     pub sender: Option<Sender>,
-
-    // Meta event
-    pub meta_event_type: Option<String>,
-
-    // Notice
-    pub notice_type: Option<String>,
-    pub operator_id: Option<i64>,
-
-    // Request
-    pub request_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct Sender {
     pub user_id: Option<i64>,
     pub nickname: Option<String>,
-    pub sex: Option<String>,
-    pub age: Option<i32>,
     pub card: Option<String>,
-    pub role: Option<String>,
-    pub title: Option<String>,
 }
 
 // ─── Message Segments (Array format) ─────────────────────────────────────────
@@ -53,7 +34,6 @@ pub struct MessageSegment {
     pub data: serde_json::Value,
 }
 
-#[allow(dead_code)]
 impl MessageSegment {
     pub fn text(content: &str) -> Self {
         MessageSegment {
@@ -87,12 +67,10 @@ pub struct ApiRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct ApiResponse {
     pub status: String,
     pub retcode: i32,
     pub data: Option<serde_json::Value>,
-    pub echo: Option<String>,
     pub message: Option<String>,
     pub wording: Option<String>,
 }

@@ -1,3 +1,4 @@
+use futures_util::future::join_all;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use warp::ws::Message;
@@ -111,82 +112,32 @@ pub async fn process_message_event(
         sender_nickname
     };
 
-    let group_title = if is_group {
-        if let Some(title) = state.get_group_title(group_id_value).await {
-            Some(title)
-        } else {
-            match get_group_name(ws_tx, pending, group_id_value, onebot_timeout).await {
-                Ok(Some(title)) => {
-                    state.set_group_title(group_id_value, title.clone()).await;
-                    Some(title)
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    debug!(
-                        "[GroupMeta] get_group_name failed for {}: {}",
-                        group_id_value, e
-                    );
-                    None
-                }
-            }
-        }
-    } else {
-        None
-    };
+    let group_title = resolve_group_title(
+        state,
+        ws_tx,
+        pending,
+        is_group,
+        group_id_value,
+        onebot_timeout,
+    )
+    .await;
 
     // ── Record to group history (before @bot gate, so ALL messages are captured) ──
     let observed_text = observed_message_text(&text, &media_lines);
     if is_group && !observed_text.is_empty() {
-        let session_key = format!("group:{}", group_id_value);
-        let message_id = event.message_id;
-        if let Err(e) = state
-            .touch_group(group_id_value, group_title.as_deref(), event_time)
-            .await
-        {
-            debug!(
-                "[GroupDirectory] Failed to touch group {}: {}",
-                group_id_value, e
-            );
-        }
-        if user_id != 0
-            && let Err(e) = state
-                .record_group_member(group_id_value, user_id, display_name, event_time)
-                .await
-        {
-            debug!(
-                "[GroupDirectory] Failed to record member {} in group {}: {}",
-                user_id, group_id_value, e
-            );
-        }
-        state
-            .record_group_message(
-                &session_key,
-                crate::state::GroupMessage {
-                    display_name: display_name.to_string(),
-                    text: observed_text.clone(),
-                    timestamp: event_time,
-                    message_id,
-                    is_bot: false,
-                },
-            )
-            .await;
-        if let Err(e) = group_log::append_alma_group_log(
-            group_id_value,
-            display_name,
-            &observed_text,
-            false,
-            event_time,
-            message_id,
-            Some(user_id),
-            None,
-        ) {
-            debug!("[GroupHistory] Failed to append Alma group log: {}", e);
-        }
-        refresh_alma_group_directory_readme(state).await;
-        debug!(
-            "[GroupHistory] Recorded message from {} in {}",
-            display_name, session_key
-        );
+        record_observed_group_message(
+            state,
+            ObservedGroupMessage {
+                group_id: group_id_value,
+                group_title: group_title.as_deref(),
+                user_id,
+                display_name,
+                text: &observed_text,
+                timestamp_secs: event_time,
+                message_id: event.message_id,
+            },
+        )
+        .await;
     }
 
     // ── Message ID & Reply context ────────────────────────────────────────
@@ -668,57 +619,156 @@ pub async fn process_message_event(
     Ok(())
 }
 
+async fn resolve_group_title(
+    state: &SharedState,
+    ws_tx: &mpsc::UnboundedSender<Message>,
+    pending: &PendingCalls,
+    is_group: bool,
+    group_id: i64,
+    timeout_secs: u64,
+) -> Option<String> {
+    if !is_group {
+        return None;
+    }
+
+    if let Some(title) = state.get_group_title(group_id).await {
+        return Some(title);
+    }
+
+    match get_group_name(ws_tx, pending, group_id, timeout_secs).await {
+        Ok(Some(title)) => {
+            state.set_group_title(group_id, title.clone()).await;
+            Some(title)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            debug!("[GroupMeta] get_group_name failed for {}: {}", group_id, e);
+            None
+        }
+    }
+}
+
+struct ObservedGroupMessage<'a> {
+    group_id: i64,
+    group_title: Option<&'a str>,
+    user_id: i64,
+    display_name: &'a str,
+    text: &'a str,
+    timestamp_secs: u64,
+    message_id: Option<i64>,
+}
+
+async fn record_observed_group_message(state: &SharedState, message: ObservedGroupMessage<'_>) {
+    let session_key = format!("group:{}", message.group_id);
+    if let Err(e) = state
+        .touch_group(
+            message.group_id,
+            message.group_title,
+            message.timestamp_secs,
+        )
+        .await
+    {
+        debug!(
+            "[GroupDirectory] Failed to touch group {}: {}",
+            message.group_id, e
+        );
+    }
+    if message.user_id != 0
+        && let Err(e) = state
+            .record_group_member(
+                message.group_id,
+                message.user_id,
+                message.display_name,
+                message.timestamp_secs,
+            )
+            .await
+    {
+        debug!(
+            "[GroupDirectory] Failed to record member {} in group {}: {}",
+            message.user_id, message.group_id, e
+        );
+    }
+
+    state
+        .record_group_message(
+            &session_key,
+            crate::state::GroupMessage {
+                display_name: message.display_name.to_string(),
+                text: message.text.to_string(),
+                timestamp: message.timestamp_secs,
+                message_id: message.message_id,
+                is_bot: false,
+            },
+        )
+        .await;
+
+    if let Err(e) = group_log::append_alma_group_log_async(
+        message.group_id,
+        message.display_name.to_string(),
+        message.text.to_string(),
+        false,
+        message.timestamp_secs,
+        message.message_id,
+        Some(message.user_id),
+        None,
+    )
+    .await
+    {
+        debug!("[GroupHistory] Failed to append Alma group log: {}", e);
+    }
+
+    refresh_alma_group_directory_readme(state).await;
+    debug!(
+        "[GroupHistory] Recorded message from {} in {}",
+        message.display_name, session_key
+    );
+}
+
 async fn build_file_parts(
     state: &SharedState,
     image_urls: &[String],
     quoted_image_urls: &[String],
     segments: &[crate::onebot::event::MessageSegment],
 ) -> Vec<serde_json::Value> {
-    let mut file_parts = Vec::new();
+    let mut downloads = Vec::new();
 
     for (idx, url) in image_urls.iter().enumerate() {
         let default_filename = format!("image_{}.png", idx + 1);
-        match download_media_as_file_part(&state.http_client, url, &default_filename).await {
-            Ok(part) => {
-                info!(
-                    "[Alma] Successfully downloaded and prepared image part: {}",
-                    url
-                );
-                file_parts.push(part);
-            }
-            Err(e) => warn!("[Alma] Failed to download image {}: {}", url, e),
-        }
+        downloads.push(("image", default_filename, url.clone()));
     }
 
     // Download quoted/replied images too, so Alma can see the referenced image
     // instead of only a textual placeholder like "[Image]".
     for (idx, url) in quoted_image_urls.iter().enumerate() {
         let default_filename = format!("quoted_image_{}.png", idx + 1);
-        match download_media_as_file_part(&state.http_client, url, &default_filename).await {
-            Ok(part) => {
-                info!(
-                    "[Alma] Successfully downloaded and prepared quoted image part: {}",
-                    url
-                );
-                file_parts.push(part);
-            }
-            Err(e) => warn!("[Alma] Failed to download quoted image {}: {}", url, e),
-        }
+        downloads.push(("quoted image", default_filename, url.clone()));
     }
 
     for (filename, url) in &crate::onebot::event::extract_files(segments) {
-        match download_media_as_file_part(&state.http_client, url, filename).await {
+        downloads.push(("file", filename.clone(), url.clone()));
+    }
+
+    let client = state.http_client.clone();
+    let results = join_all(downloads.into_iter().map(|(kind, filename, url)| {
+        let client = client.clone();
+        async move {
+            let result = download_media_as_file_part(&client, &url, &filename).await;
+            (kind, filename, url, result)
+        }
+    }))
+    .await;
+
+    let mut file_parts = Vec::new();
+    for (kind, filename, url, result) in results {
+        match result {
             Ok(part) => {
                 info!(
-                    "[Alma] Successfully downloaded and prepared file part: {} ({})",
-                    filename, url
+                    "[Alma] Successfully downloaded and prepared {} part: {} ({})",
+                    kind, filename, url
                 );
                 file_parts.push(part);
             }
-            Err(e) => warn!(
-                "[Alma] Failed to download file {} from {}: {}",
-                filename, url, e
-            ),
+            Err(e) => warn!("[Alma] Failed to download {} {}: {}", kind, url, e),
         }
     }
 
@@ -1004,16 +1054,18 @@ pub(crate) async fn record_alma_group_output(
     if let Err(e) = state.touch_group(group_id, None, timestamp_secs).await {
         debug!("[GroupDirectory] Failed to touch group {}: {}", group_id, e);
     }
-    if let Err(e) = group_log::append_alma_group_log(
+    if let Err(e) = group_log::append_alma_group_log_async(
         group_id,
-        "Alma",
-        text,
+        "Alma".to_string(),
+        text.to_string(),
         true,
         timestamp_secs,
         message_id,
         None,
         None,
-    ) {
+    )
+    .await
+    {
         debug!("[GroupHistory] Failed to append Alma group log: {}", e);
     }
     refresh_alma_group_directory_readme(state).await;
@@ -1022,9 +1074,8 @@ pub(crate) async fn record_alma_group_output(
 pub(crate) async fn refresh_alma_group_directory_readme(state: &SharedState) {
     match state.group_directory_snapshot().await {
         Ok(entries) => {
-            if let Err(e) =
-                group_log::write_group_readme(&entries, state.config.read().await.bridge_port)
-            {
+            let bridge_port = state.config.read().await.bridge_port;
+            if let Err(e) = group_log::write_group_readme_async(entries, bridge_port).await {
                 debug!("[GroupDirectory] Failed to write README: {}", e);
             }
         }
@@ -1050,9 +1101,12 @@ fn observed_message_text(text: &str, media_lines: &[String]) -> String {
 }
 
 fn format_history_time(timestamp_secs: u64) -> String {
-    let instant = timestamp_or_now(timestamp_secs)
-        .to_offset(time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC));
+    let instant = timestamp_or_now(timestamp_secs).to_offset(local_offset());
     format!("{:02}:{:02}", instant.hour(), instant.minute())
+}
+
+fn local_offset() -> time::UtcOffset {
+    time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
 }
 
 fn timestamp_or_now(timestamp_secs: u64) -> time::OffsetDateTime {
@@ -1077,7 +1131,11 @@ fn split_paragraphs(text: &str) -> Vec<String> {
 }
 
 /// Split text into chunks that fit within QQ's message length limit.
+///
+/// Limits smaller than one UTF-8 scalar value are rounded up so splitting never
+/// produces invalid text. The production QQ limit is much larger than this.
 pub(crate) fn split_text(text: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(4);
     if text.len() <= limit {
         return vec![text.to_string()];
     }
@@ -1516,6 +1574,13 @@ mod tests {
         let chunks = split_text("你好世界", 5);
 
         assert_eq!(chunks, vec!["你", "好", "世", "界"]);
+    }
+
+    #[test]
+    fn split_text_tiny_limit_still_makes_utf8_progress() {
+        let chunks = split_text("你好", 1);
+
+        assert_eq!(chunks, vec!["你", "好"]);
     }
 
     #[tokio::test]

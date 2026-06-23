@@ -22,6 +22,7 @@ struct AlmaOneBotBridgeApp: App {
                   ? "bolt.horizontal.circle.fill"
                   : "bolt.horizontal.circle")
                 .symbolRenderingMode(.hierarchical)
+                .background(SettingsRequestObserver())
         }
         .menuBarExtraStyle(.window)
 

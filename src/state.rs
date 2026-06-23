@@ -16,6 +16,50 @@ use crate::onebot::OneBotApiHandle;
 
 const SESSION_REVERSE_LIMIT: usize = 4096;
 
+#[derive(Debug, Default)]
+struct ReverseThreadCache {
+    map: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl ReverseThreadCache {
+    fn get(&mut self, thread_id: &str) -> Option<String> {
+        let session_key = self.map.get(thread_id).cloned()?;
+        self.promote(thread_id);
+        Some(session_key)
+    }
+
+    fn insert(&mut self, thread_id: String, session_key: String) {
+        self.map.insert(thread_id.clone(), session_key);
+        self.promote_or_push(thread_id);
+        self.enforce_limit();
+    }
+
+    fn promote(&mut self, thread_id: &str) {
+        if let Some(idx) = self.order.iter().position(|key| key == thread_id)
+            && let Some(key) = self.order.remove(idx)
+        {
+            self.order.push_back(key);
+        }
+    }
+
+    fn promote_or_push(&mut self, thread_id: String) {
+        if let Some(idx) = self.order.iter().position(|key| key == &thread_id) {
+            let _ = self.order.remove(idx);
+        }
+        self.order.push_back(thread_id);
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.map.len() > SESSION_REVERSE_LIMIT {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+    }
+}
+
 /// Identifies a QQ chat target for bidirectional forwarding.
 #[derive(Clone, Debug)]
 pub struct QqTarget {
@@ -74,7 +118,7 @@ pub struct AppState {
     pub default_model: RwLock<Option<String>>,
     pub alma_ws: RwLock<Option<AlmaWsClient>>,
     /// Reverse lookup: Alma thread_id → QQ session key (for bidirectional forwarding)
-    pub session_reverse: RwLock<HashMap<String, String>>,
+    session_reverse: RwLock<ReverseThreadCache>,
     /// Recent outgoing reply texts per thread (for dedup in bidirectional mode)
     sent_replies: RwLock<HashMap<String, VecDeque<SentReply>>>,
     /// In-memory group chat history per session key (for ephemeral context injection)
@@ -173,7 +217,7 @@ impl SharedState {
             db,
             default_model: RwLock::new(None),
             alma_ws: RwLock::new(None),
-            session_reverse: RwLock::new(HashMap::new()),
+            session_reverse: RwLock::new(ReverseThreadCache::default()),
             sent_replies: RwLock::new(HashMap::new()),
             group_history: RwLock::new(HashMap::new()),
             group_titles: RwLock::new(HashMap::new()),
@@ -270,7 +314,7 @@ impl SharedState {
     /// Look up the QQ target for a given Alma thread ID (for bidirectional forwarding).
     pub async fn get_qq_target(&self, thread_id: &str) -> Result<Option<QqTarget>, String> {
         let session_key =
-            if let Some(session_key) = self.session_reverse.read().await.get(thread_id).cloned() {
+            if let Some(session_key) = self.session_reverse.write().await.get(thread_id) {
                 session_key
             } else {
                 let conn = match self.db.connect() {
@@ -322,7 +366,13 @@ impl SharedState {
         let target_type = parts[0].to_string();
         let target_id: i64 = match parts[1].parse() {
             Ok(id) => id,
-            Err(e) => return Err(format!("Invalid session target id '{}': {}", parts[1], e)),
+            Err(e) => {
+                debug!(
+                    "Ignoring malformed QQ session target id '{}' for thread {}: {}",
+                    parts[1], thread_id, e
+                );
+                return Ok(None);
+            }
         };
 
         Ok(Some(QqTarget {
@@ -332,17 +382,10 @@ impl SharedState {
     }
 
     async fn cache_thread_mapping(&self, thread_id: String, session_key: String) {
-        let mut reverse = self.session_reverse.write().await;
-        reverse.insert(thread_id, session_key);
-        if reverse.len() <= SESSION_REVERSE_LIMIT {
-            return;
-        }
-
-        let excess = reverse.len().saturating_sub(SESSION_REVERSE_LIMIT);
-        let keys: Vec<String> = reverse.keys().take(excess).cloned().collect();
-        for key in keys {
-            reverse.remove(&key);
-        }
+        self.session_reverse
+            .write()
+            .await
+            .insert(thread_id, session_key);
     }
 
     // ── Profile map ──────────────────────────────────────────────────────
@@ -784,7 +827,9 @@ fn sent_reply_matches(sent: &str, candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SharedState, safe_prefix, sent_reply_matches};
+    use super::{
+        ReverseThreadCache, SESSION_REVERSE_LIMIT, SharedState, safe_prefix, sent_reply_matches,
+    };
     use crate::config::Config;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -833,6 +878,44 @@ mod tests {
 
         assert!(!state.is_current_onebot_connection(first));
         assert!(state.is_current_onebot_connection(second));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn reverse_thread_cache_evicts_least_recently_used_mapping() {
+        let mut cache = ReverseThreadCache::default();
+        for idx in 0..SESSION_REVERSE_LIMIT {
+            cache.insert(format!("thread-{idx}"), format!("group:{idx}"));
+        }
+
+        assert_eq!(cache.get("thread-0"), Some("group:0".to_string()));
+        cache.insert(
+            "thread-new".to_string(),
+            format!("group:{}", SESSION_REVERSE_LIMIT),
+        );
+
+        assert_eq!(cache.get("thread-1"), None);
+        assert_eq!(cache.get("thread-0"), Some("group:0".to_string()));
+        assert_eq!(
+            cache.get("thread-new"),
+            Some(format!("group:{}", SESSION_REVERSE_LIMIT))
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_session_key_returns_no_qq_target() {
+        let db_path = temp_db_path("malformed-session-key");
+        let mut config = Config::load();
+        config.db_path = db_path.clone();
+        let state = SharedState::new(config).await.unwrap();
+
+        state
+            .set_thread_id("group:".to_string(), "thread-bad".to_string())
+            .await
+            .unwrap();
+
+        assert!(state.get_qq_target("thread-bad").await.unwrap().is_none());
 
         let _ = std::fs::remove_file(db_path);
     }

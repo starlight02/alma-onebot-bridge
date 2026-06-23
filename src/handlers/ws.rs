@@ -1,6 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, timeout};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -39,6 +39,7 @@ pub async fn handle_ws_connection(
     // Channel for pushing messages TO the WebSocket (any task can send)
     let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Message>();
     let mut ws_rx = UnboundedReceiverStream::new(ws_rx);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Pending API call correlation map
     let pending_calls = PendingCalls::new();
@@ -176,9 +177,17 @@ pub async fn handle_ws_connection(
                     let st = state.clone();
                     let tx = ws_tx.clone();
                     let pc = pending_calls.clone();
+                    let mut shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = process_message_event(&event, &st, &tx, &pc).await {
-                            error!("Message processing error: {}", e);
+                        tokio::select! {
+                            result = process_message_event(&event, &st, &tx, &pc) => {
+                                if let Err(e) = result {
+                                    error!("Message processing error: {}", e);
+                                }
+                            }
+                            _ = shutdown.changed() => {
+                                debug!("Message processing cancelled because OneBot connection closed");
+                            }
                         }
                     });
                 }
@@ -236,6 +245,8 @@ pub async fn handle_ws_connection(
             .unwrap_or_default()
     );
     state.clear_onebot_api_handle(connection_id).await;
+    let _ = shutdown_tx.send(true);
+    pending_calls.close_all().await;
     let _ = ws_tx.send(Message::close());
     drop(ws_tx);
     forwarding.abort();

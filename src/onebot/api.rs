@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -14,13 +15,49 @@ use super::event::{
 
 /// Thread-safe holder for pending OneBot API calls, shared across all handler tasks.
 #[derive(Clone)]
-pub struct PendingCalls(
-    pub Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<ApiResponse>>>>,
-);
+pub struct PendingCalls(Arc<PendingCallsInner>);
+
+struct PendingCallsInner {
+    closed: AtomicBool,
+    calls: Mutex<std::collections::HashMap<String, oneshot::Sender<ApiResponse>>>,
+}
 
 impl PendingCalls {
     pub fn new() -> Self {
-        PendingCalls(Arc::new(Mutex::new(std::collections::HashMap::new())))
+        PendingCalls(Arc::new(PendingCallsInner {
+            closed: AtomicBool::new(false),
+            calls: Mutex::new(std::collections::HashMap::new()),
+        }))
+    }
+
+    pub async fn close_all(&self) {
+        self.0.closed.store(true, Ordering::Release);
+        self.0.calls.lock().await.clear();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+
+    async fn insert(
+        &self,
+        echo: String,
+        sender: oneshot::Sender<ApiResponse>,
+    ) -> Result<(), String> {
+        if self.is_closed() {
+            return Err("OneBot connection closed".to_string());
+        }
+
+        let mut calls = self.0.calls.lock().await;
+        if self.is_closed() {
+            return Err("OneBot connection closed".to_string());
+        }
+        calls.insert(echo, sender);
+        Ok(())
+    }
+
+    async fn remove(&self, echo: &str) -> Option<oneshot::Sender<ApiResponse>> {
+        self.0.calls.lock().await.remove(echo)
     }
 }
 
@@ -47,11 +84,6 @@ pub async fn call_api(
 ) -> Result<ApiResponse, String> {
     let echo = format!("bridge-{}-{}", uuid::Uuid::new_v4(), action);
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-
-    // Register pending call
-    pending.0.lock().await.insert(echo.clone(), resp_tx);
-
     // Send the request through WS
     let request = ApiRequest {
         action: action.to_string(),
@@ -62,9 +94,15 @@ pub async fn call_api(
     let msg_text =
         serde_json::to_string(&request).map_err(|e| format!("serialize error: {}", e))?;
 
-    ws_tx
-        .send(Message::text(msg_text))
-        .map_err(|e| format!("ws send error: {}", e))?;
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    // Register pending call before sending so fast API responses cannot race us.
+    pending.insert(echo.clone(), resp_tx).await?;
+
+    if let Err(e) = ws_tx.send(Message::text(msg_text)) {
+        pending.remove(&echo).await;
+        return Err(format!("ws send error: {}", e));
+    }
 
     debug!("API call sent: {} (echo={})", action, echo);
 
@@ -72,7 +110,7 @@ pub async fn call_api(
     let result = timeout(Duration::from_secs(timeout_secs), resp_rx).await;
 
     // Clean up pending entry
-    pending.0.lock().await.remove(&echo);
+    pending.remove(&echo).await;
 
     match result {
         Ok(Ok(resp)) => validate_api_response(action, resp),
@@ -104,7 +142,7 @@ pub async fn try_resolve_api_response(
     pending: &PendingCalls,
 ) -> Option<()> {
     if let Some(echo) = msg.get("echo").and_then(|e| e.as_str()) {
-        if let Some(sender) = pending.0.lock().await.remove(echo) {
+        if let Some(sender) = pending.remove(echo).await {
             let response: ApiResponse = match serde_json::from_value(msg.clone()) {
                 Ok(r) => r,
                 Err(e) => {
@@ -291,13 +329,41 @@ pub async fn get_forward_msg(
     Ok(results)
 }
 
-/// Fetch a group title by group_id using the OneBot group list API.
+/// Fetch a group title by group_id using direct group info, with group list as fallback.
 pub async fn get_group_name(
     ws_tx: &mpsc::UnboundedSender<Message>,
     pending: &PendingCalls,
     group_id: i64,
     timeout_secs: u64,
 ) -> Result<Option<String>, String> {
+    match call_api(
+        ws_tx,
+        pending,
+        "get_group_info",
+        json!({
+            "group_id": group_id,
+            "no_cache": false
+        }),
+        timeout_secs,
+    )
+    .await
+    {
+        Ok(resp) => {
+            if let Some(data) = resp.data
+                && let Some(name) = parse_group_name(&data)
+            {
+                return Ok(Some(name));
+            }
+            return Ok(None);
+        }
+        Err(e) => {
+            debug!(
+                "get_group_info failed for group {}, falling back to get_group_list: {}",
+                group_id, e
+            );
+        }
+    }
+
     let resp = call_api(ws_tx, pending, "get_group_list", json!({}), timeout_secs).await?;
     let data = resp.data.ok_or("get_group_list: no data")?;
     let groups = data
@@ -310,16 +376,19 @@ pub async fn get_group_name(
             continue;
         }
 
-        let name = group
-            .get("group_name")
-            .and_then(|n| n.as_str())
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(|n| n.to_string());
-        return Ok(name);
+        return Ok(parse_group_name(group));
     }
 
     Ok(None)
+}
+
+fn parse_group_name(group: &serde_json::Value) -> Option<String> {
+    group
+        .get("group_name")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
 }
 
 fn parse_quoted_message(data: &serde_json::Value) -> QuotedMessage {
@@ -412,9 +481,12 @@ fn value_as_i64(value: &serde_json::Value) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_quoted_message, validate_api_response};
+    use super::{
+        PendingCalls, call_api, parse_group_name, parse_quoted_message, validate_api_response,
+    };
     use crate::onebot::event::ApiResponse;
     use serde_json::json;
+    use tokio::sync::mpsc;
 
     #[test]
     fn quoted_image_message_becomes_media_summary_not_cq_code() {
@@ -480,7 +552,6 @@ mod tests {
                 status: "failed".to_string(),
                 retcode: 1400,
                 data: None,
-                echo: Some("echo".to_string()),
                 message: Some("bad request".to_string()),
                 wording: None,
             },
@@ -490,5 +561,28 @@ mod tests {
         assert!(err.contains("send_msg"));
         assert!(err.contains("retcode=1400"));
         assert!(err.contains("bad request"));
+    }
+
+    #[test]
+    fn parse_group_name_rejects_empty_titles() {
+        assert_eq!(
+            parse_group_name(&json!({"group_id": 1, "group_name": "  测试群  "})),
+            Some("测试群".to_string())
+        );
+        assert_eq!(parse_group_name(&json!({"group_name": "   "})), None);
+    }
+
+    #[tokio::test]
+    async fn closed_pending_calls_fail_before_ws_send() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending = PendingCalls::new();
+        pending.close_all().await;
+
+        let err = call_api(&tx, &pending, "send_msg", json!({}), 30)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("connection closed"));
+        assert!(rx.try_recv().is_err());
     }
 }

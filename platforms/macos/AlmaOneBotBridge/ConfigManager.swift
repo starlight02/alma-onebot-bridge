@@ -3,11 +3,14 @@ import Combine
 import TOMLKit
 import os.log
 import Darwin
+import AppKit
 
 private let log = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "AlmaOneBotBridge",
     category: "ConfigManager"
 )
+private let maxBridgeLogBytes: UInt64 = 10 * 1024 * 1024
+private let bridgeLogBackupCount = 3
 
 enum BridgeApplyAction {
     case none
@@ -86,6 +89,10 @@ final class ConfigManager: ObservableObject {
             lastError = "未找到随 app 打包的桥接服务可执行文件，请使用 scripts/build-macos.sh 重新构建。"
             statusText = "缺少桥接服务"
             log.error("Bridge executable not found")
+            return
+        }
+
+        guard ensureBridgePortAvailable() else {
             return
         }
 
@@ -325,6 +332,95 @@ final class ConfigManager: ObservableObject {
         healthTask?.cancel()
     }
 
+    private func ensureBridgePortAvailable() -> Bool {
+        guard let port = UInt16(model.bridgePort) else {
+            return true
+        }
+
+        if isTCPPortAvailable(port) {
+            return true
+        }
+
+        let message = "端口 \(port) 已被占用。请关闭占用该端口的应用，或在设置中修改 Bridge 端口。"
+        lastError = message
+        statusText = "启动失败：端口 \(port) 被占用"
+        isBridgeRunning = false
+        isBridgeHealthy = false
+        bridgePID = nil
+
+        appendAppLogLine("Startup blocked: port \(port) is already in use.")
+        showPortOccupiedAlert(port: port, message: message)
+        return false
+    }
+
+    private func isTCPPortAvailable(_ port: UInt16) -> Bool {
+        if canConnectToLoopback(port) {
+            return false
+        }
+
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr = in_addr(s_addr: INADDR_ANY.bigEndian)
+
+        let result = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        return result == 0
+    }
+
+    private func canConnectToLoopback(_ port: UInt16) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let result = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        return result == 0
+    }
+
+    private func showPortOccupiedAlert(port: UInt16, message: String) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Alma Bridge 无法启动"
+        alert.informativeText = "\(message)\n\n当前配置端口：\(port)"
+        alert.addButton(withTitle: "打开设置")
+        alert.addButton(withTitle: "打开运行日志")
+        alert.addButton(withTitle: "好")
+
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            NotificationCenter.default.post(name: .almaOpenSettingsRequested, object: nil)
+        case .alertSecondButtonReturn:
+            ensureLogFileExists()
+            NSApp.activate(ignoringOtherApps: true)
+            NSWorkspace.shared.open(logFileURL)
+        default:
+            break
+        }
+    }
+
     // MARK: Load
 
     func load() {
@@ -464,9 +560,13 @@ final class ConfigManager: ObservableObject {
     }
 
     private func openLogFileForAppend() throws -> FileHandle {
-        if !FileManager.default.fileExists(atPath: logFileURL.path()) {
-            FileManager.default.createFile(atPath: logFileURL.path(), contents: nil)
-        }
+        try FileManager.default.createDirectory(
+            at: configDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        rotateLogFileIfNeeded()
+        ensureLogFileExists()
+
         let handle = try FileHandle(forWritingTo: logFileURL)
         handle.seekToEndOfFile()
         let header = "\n--- Alma OneBot Bridge launch \(Date()) ---\n"
@@ -484,6 +584,61 @@ final class ConfigManager: ObservableObject {
                 self?.logFileHandle?.write(data)
             }
         }
+    }
+
+    func ensureLogFileExists() {
+        try? FileManager.default.createDirectory(
+            at: configDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        rotateLogFileIfNeeded()
+        if !FileManager.default.fileExists(atPath: logFileURL.path()) {
+            _ = FileManager.default.createFile(atPath: logFileURL.path(), contents: nil)
+        }
+    }
+
+    private func appendAppLogLine(_ message: String) {
+        ensureLogFileExists()
+        guard let handle = try? FileHandle(forWritingTo: logFileURL) else {
+            log.warning("Failed to open bridge log for app diagnostic")
+            return
+        }
+        defer { try? handle.close() }
+
+        handle.seekToEndOfFile()
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "\(timestamp) [macOS app] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            handle.write(data)
+        }
+    }
+
+    private func rotateLogFileIfNeeded() {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: logFileURL.path()),
+              let fileSize = attributes[.size] as? UInt64,
+              fileSize > maxBridgeLogBytes else {
+            return
+        }
+
+        let oldest = rotatedLogFileURL(bridgeLogBackupCount)
+        if FileManager.default.fileExists(atPath: oldest.path()) {
+            try? FileManager.default.removeItem(at: oldest)
+        }
+
+        if bridgeLogBackupCount > 1 {
+            for index in stride(from: bridgeLogBackupCount - 1, through: 1, by: -1) {
+                let from = rotatedLogFileURL(index)
+                guard FileManager.default.fileExists(atPath: from.path()) else { continue }
+                try? FileManager.default.moveItem(at: from, to: rotatedLogFileURL(index + 1))
+            }
+        }
+
+        try? FileManager.default.moveItem(at: logFileURL, to: rotatedLogFileURL(1))
+    }
+
+    private func rotatedLogFileURL(_ index: Int) -> URL {
+        logFileURL.deletingLastPathComponent()
+            .appending(path: "\(logFileURL.lastPathComponent).\(index)")
     }
 
     private func currentBridgePID() -> pid_t? {

@@ -32,8 +32,6 @@ pub struct AlmaEvent {
     pub message_role: String, // "user" or "assistant"
     pub message_text: String,
     pub thinking_text: Option<String>,
-    #[allow(dead_code)]
-    pub message_id: String,
 }
 
 /// Tracks a single in-flight generation request.
@@ -262,7 +260,6 @@ impl AlmaWsClient {
     }
 
     /// Check if the WebSocket connection is alive.
-    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst) && !self.ws_tx.is_closed()
     }
@@ -768,7 +765,6 @@ async fn dispatch_event(
                     message_role: role.clone(),
                     message_text: text,
                     thinking_text,
-                    message_id,
                 };
 
                 if role == "assistant" && generating_threads.contains(&thread_id) {

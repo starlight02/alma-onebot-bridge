@@ -519,13 +519,14 @@ fn escape_frontmatter_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Get today's date as YYYY-MM-DD string (UTC+8).
+/// Get today's date as YYYY-MM-DD string using the local timezone when available.
 fn today_string() -> String {
     use time::{OffsetDateTime, UtcOffset, format_description};
     let utc = OffsetDateTime::now_utc();
-    let cst = utc.to_offset(UtcOffset::from_hms(8, 0, 0).unwrap());
+    let local = utc.to_offset(UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
     let format = format_description::parse_borrowed::<2>("[year]-[month]-[day]").unwrap();
-    cst.format(&format)
+    local
+        .format(&format)
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
