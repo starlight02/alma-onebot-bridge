@@ -2,16 +2,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/scripts/version-lib.sh"
 MACOS_DIR="$ROOT/platforms/macos"
 CONFIGURATION="${CONFIGURATION:-Release}"
-VERSION="${VERSION:-$(awk -F\" '/^version =/ {print $2; exit}' "$ROOT/Cargo.toml")}"
-IFS=. read -r VERSION_MAJOR VERSION_MINOR VERSION_PATCH _ <<< "$VERSION"
-VERSION_MAJOR="${VERSION_MAJOR:-0}"
-VERSION_MINOR="${VERSION_MINOR:-0}"
-VERSION_PATCH="${VERSION_PATCH:-0}"
-BUILD_NUMBER="${BUILD_NUMBER:-$((10#$VERSION_MAJOR * 10000 + 10#$VERSION_MINOR * 100 + 10#$VERSION_PATCH))}"
+VERSION_FROM_ENV="${VERSION+x}"
+VERSION="${VERSION:-$(read_cargo_version "$ROOT")}"
+validate_release_version "$VERSION"
+BUILD_NUMBER="${BUILD_NUMBER:-$(build_number_for_version "$VERSION")}"
 HOST_ARCH="$(uname -m)"
 BUILD_UNIVERSAL="${BUILD_UNIVERSAL:-0}"
+
+if [[ -z "$VERSION_FROM_ENV" && "${SKIP_VERSION_VERIFY:-0}" != "1" ]]; then
+    "$ROOT/scripts/verify-version.sh"
+fi
 
 if [[ -z "${GIT_COMMIT:-}" || -z "${GIT_VERSION:-}" || -z "${GIT_DIRTY:-}" ]]; then
     if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
