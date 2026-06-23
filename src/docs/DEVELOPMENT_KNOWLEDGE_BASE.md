@@ -877,6 +877,71 @@ BEFORE the WS upgrade. Use `warp::header::optional::<String>("authorization")` a
 filter composed with `warp::ws()`. The header is not accessible after the connection
 has been upgraded to WebSocket.
 
+### 5.23 macOS PKG Must Install from Root
+
+The working macOS installer layout is:
+
+```text
+pkgbuild --root <staging-root> --install-location /
+Payload/Applications/AlmaOneBotBridge.app
+```
+
+Do not package the app as `--component AlmaOneBotBridge.app --install-location /Applications`.
+That layout can interact badly with old receipts and bundle-version checks: Installer
+may write a receipt while skipping the actual app when it thinks the same version is
+already installed. The package script uses a component plist that sets:
+
+- `BundleIsVersionChecked=false`
+- `BundleIsRelocatable=false`
+- `BundleOverwriteAction=upgrade`
+- `RootRelativeBundlePath=Applications/AlmaOneBotBridge.app`
+
+After building, the script expands the PKG and verifies both `install-location="/"` and
+`path="./Applications/AlmaOneBotBridge.app"`.
+
+### 5.24 macOS App Icon Uses `.icns`, Not Asset Catalog App Icon
+
+Launchpad rendered the app icon as a smaller image inside a system base when the app
+used an asset-catalog app icon (`CFBundleIconName` / `Assets.car`). The stable path is a
+classic macOS icon resource:
+
+```text
+platforms/macos/AppIcon.iconset
+Contents/Resources/AppIcon.icns
+CFBundleIconFile = AppIcon.icns
+```
+
+The iconset must include all standard sizes, including `icon_512x512@2x.png` at
+1024x1024. `scripts/build-macos.sh` generates `AppIcon.icns`, deletes
+`CFBundleIconName`, sets `CFBundleIconFile`, and checks the generated icon with
+`iconutil -c iconset`.
+
+### 5.25 Version Tags Are Immutable
+
+Do not move release tags after publishing. If a released package needs a fix, bump the
+patch version, commit, create a new annotated tag, and push that tag. The macOS scripts
+derive `CFBundleVersion` from semantic version:
+
+```text
+major * 10000 + minor * 100 + patch
+```
+
+For example, `0.1.2` becomes build number `102`. This helps macOS notice upgrades and
+keeps GitHub Releases traceable.
+
+### 5.26 GitHub Actions Node Runtime Warnings
+
+GitHub-hosted runners warn when actions still target Node 20. Keep official actions on
+Node 24-compatible majors, currently:
+
+```yaml
+actions/checkout@v5
+actions/upload-artifact@v5
+```
+
+Do not silence this with `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION`; update the action
+major version instead.
+
 ---
 
 ## 6. Deployment
