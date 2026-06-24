@@ -1,6 +1,6 @@
 # Build artifacts
-/target/
-/dist/
+**/target/
+**/dist/
 *tmp*
 
 # Local config

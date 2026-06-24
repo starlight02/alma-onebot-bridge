@@ -491,6 +491,7 @@ impl SharedState {
         *self.alma_ws.write().await = Some(client);
     }
 
+    #[cfg(unix)]
     pub async fn clear_alma_ws(&self) {
         *self.alma_ws.write().await = None;
     }

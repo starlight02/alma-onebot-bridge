@@ -20,7 +20,7 @@ A bridge service that connects [Alma](https://github.com/anthropics/alma) to QQ 
 - **Persistent state**: Turso stores thread mappings, user profiles, QQ group titles, and group card metadata.
 - **Security**: WebSocket auth can require a `Bearer` token. HTTP send endpoints accept loopback or a valid token.
 - **Config**: Use TOML config or the macOS settings window.
-- **macOS app**: The menu bar app manages the bridge, settings, logs, start/stop/restart, and quit.
+- **Desktop apps**: macOS and Windows tray/menu bar apps manage the bridge, settings, logs, start/stop/restart, and quit.
 
 ## Architecture
 
@@ -88,6 +88,22 @@ Build a PKG installer with license acceptance:
 ```
 
 macOS guide: [platforms/macos/README.md](./platforms/macos/README.md).
+
+### Windows Tray App
+
+The Windows app is a Rust + WinUI tray app that runs the bridge in-process with
+no console window. Release packaging produces both a Velopack installer and a
+portable ZIP:
+
+```powershell
+.\scripts\package-windows-velopack.ps1
+.\scripts\package-windows-zip.ps1
+```
+
+The MSI is per-machine under Program Files. The ZIP contains the runnable WinUI
+payload for portable use.
+
+Windows guide: [platforms/windows/README.md](./platforms/windows/README.md).
 
 ### Configure
 

@@ -1031,8 +1031,8 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{Mutex, mpsc, oneshot};
     use tokio::time::timeout;
-    use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
 
     #[test]
     fn normalizes_html_breaks_and_separates_thinking() {

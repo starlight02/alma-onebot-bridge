@@ -67,11 +67,7 @@ fn extract_authorization_token(header: &str) -> Option<&str> {
         }
         None => trimmed,
     };
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
+    if token.is_empty() { None } else { Some(token) }
 }
 
 #[cfg(test)]

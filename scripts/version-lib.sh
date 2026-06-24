@@ -2,7 +2,12 @@
 
 read_cargo_version() {
     local root="$1"
-    awk -F\" '/^version =/ {print $2; exit}' "$root/Cargo.toml"
+    read_cargo_manifest_version "$root/Cargo.toml"
+}
+
+read_cargo_manifest_version() {
+    local manifest="$1"
+    awk -F\" '/^version =/ {print $2; exit}' "$manifest"
 }
 
 validate_release_version() {
@@ -24,14 +29,15 @@ build_number_for_version() {
 }
 
 read_lockfile_package_version() {
-    local root="$1"
+    local lockfile="$1"
+    local package_name="$2"
     awk '
         /^\[\[package\]\]/ {
             in_package = 1
             is_target = 0
             next
         }
-        in_package && /^name = "alma-onebot-bridge"/ {
+        in_package && $0 == "name = \"" package_name "\"" {
             is_target = 1
             next
         }
@@ -40,7 +46,7 @@ read_lockfile_package_version() {
             print $3
             exit
         }
-    ' "$root/Cargo.lock"
+    ' package_name="$package_name" "$lockfile"
 }
 
 read_xcode_build_setting_values() {
@@ -54,16 +60,34 @@ read_xcode_build_setting_values() {
 verify_repo_versions() {
     local root="$1"
     local expected_tag="${2:-}"
-    local version build_number lock_version value mismatch seen_marketing seen_build
+    local version build_number lock_version windows_version windows_lock_version value mismatch seen_marketing seen_build
 
     version="$(read_cargo_version "$root")"
     validate_release_version "$version"
     build_number="$(build_number_for_version "$version")"
 
-    lock_version="$(read_lockfile_package_version "$root")"
+    lock_version="$(read_lockfile_package_version "$root/Cargo.lock" "alma-onebot-bridge")"
     if [[ "$lock_version" != "$version" ]]; then
         echo "error: Cargo.lock alma-onebot-bridge version is $lock_version, expected $version" >&2
         return 1
+    fi
+
+    if [[ -f "$root/platforms/windows/Cargo.toml" ]]; then
+        windows_version="$(read_cargo_manifest_version "$root/platforms/windows/Cargo.toml")"
+        if [[ "$windows_version" != "$version" ]]; then
+            echo "error: Windows Cargo.toml version is $windows_version, expected $version" >&2
+            return 1
+        fi
+
+        if [[ -f "$root/platforms/windows/Cargo.lock" ]]; then
+            for package_name in alma-onebot-bridge alma-onebot-bridge-windows; do
+                windows_lock_version="$(read_lockfile_package_version "$root/platforms/windows/Cargo.lock" "$package_name")"
+                if [[ "$windows_lock_version" != "$version" ]]; then
+                    echo "error: Windows Cargo.lock $package_name version is $windows_lock_version, expected $version" >&2
+                    return 1
+                fi
+            done
+        fi
     fi
 
     mismatch=0

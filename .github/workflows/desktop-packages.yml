@@ -1,4 +1,4 @@
-name: macOS PKG
+name: Desktop Packages
 
 on:
   pull_request:
@@ -65,10 +65,12 @@ jobs:
 
       - name: Verify release tag matches package version
         if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         run: scripts/verify-version.sh --tag "$GITHUB_REF_NAME"
 
       - name: Verify package version metadata
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
         run: scripts/verify-version.sh
 
       - name: Select Xcode with macOS 26 SDK
@@ -230,3 +232,96 @@ jobs:
           fi
 
           gh release upload "$TAG_NAME" dist/macos/*.pkg dist/macos/*.pkg.sha256 --clobber
+
+  build-windows:
+    name: Build Windows installer and ZIP
+    runs-on: windows-latest
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Verify release tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: scripts/verify-version.sh --tag "$GITHUB_REF_NAME"
+
+      - name: Verify package version metadata
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
+        run: scripts/verify-version.sh
+
+      - name: Install Rust Windows GNU target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Install .NET SDK for Velopack
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install MSYS2 MinGW GNU tools
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-gcc
+
+      - name: Add MSYS2 GNU tools to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Run Rust tests on Windows GNU target
+        shell: pwsh
+        run: cargo test --target x86_64-pc-windows-gnu
+
+      - name: Check Windows tray app
+        shell: pwsh
+        run: cargo check --manifest-path platforms/windows/Cargo.toml --target x86_64-pc-windows-gnu
+
+      - name: Build Windows Velopack installer
+        shell: pwsh
+        run: scripts/package-windows-velopack.ps1
+
+      - name: Build Windows ZIP package
+        shell: pwsh
+        run: scripts/package-windows-zip.ps1 -SkipBuild
+
+      - name: Upload Windows installer artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: AlmaOneBotBridge-Windows-x86_64-Installer
+          path: |
+            dist/windows-velopack/*
+          if-no-files-found: error
+
+      - name: Upload Windows ZIP artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: AlmaOneBotBridge-Windows-x86_64-ZIP
+          path: |
+            dist/windows-zip/*
+          if-no-files-found: error
+
+      - name: Attach Windows artifacts to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tagName = $env:GITHUB_REF_NAME
+
+          gh release view $tagName *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tagName `
+              --title $tagName `
+              --generate-notes `
+              --notes "Windows installer and ZIP portable release for $tagName."
+          }
+
+          gh release upload $tagName dist/windows-velopack/* dist/windows-zip/* --clobber

@@ -27,7 +27,12 @@ pub async fn create_thread(state: &SharedState, title: &str) -> Result<String, S
             .send(),
     )
     .await
-    .map_err(|_| format!("Create thread timed out after {}s", ALMA_REST_TIMEOUT.as_secs()))?
+    .map_err(|_| {
+        format!(
+            "Create thread timed out after {}s",
+            ALMA_REST_TIMEOUT.as_secs()
+        )
+    })?
     .map_err(|e| format!("HTTP request failed: {}", e))?;
 
     if !resp.status().is_success() {
@@ -65,19 +70,16 @@ pub async fn fetch_thread_model(
         thread_id
     );
 
-    let resp = timeout(
-        ALMA_REST_TIMEOUT,
-        state.http_client.get(&url).send(),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "Fetch thread {} timed out after {}s",
-            thread_id,
-            ALMA_REST_TIMEOUT.as_secs()
-        )
-    })?
-    .map_err(|e| format!("Failed to fetch thread {}: {}", thread_id, e))?;
+    let resp = timeout(ALMA_REST_TIMEOUT, state.http_client.get(&url).send())
+        .await
+        .map_err(|_| {
+            format!(
+                "Fetch thread {} timed out after {}s",
+                thread_id,
+                ALMA_REST_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("Failed to fetch thread {}: {}", thread_id, e))?;
 
     if !resp.status().is_success() {
         return Err(format!(
@@ -105,13 +107,15 @@ pub async fn fetch_thread_model(
 pub async fn fetch_default_model(state: &SharedState) -> Result<String, String> {
     let url = format!("{}/api/settings", state.config.read().await.alma_api);
 
-    let resp = timeout(
-        ALMA_REST_TIMEOUT,
-        state.http_client.get(&url).send(),
-    )
-    .await
-    .map_err(|_| format!("Fetch settings timed out after {}s", ALMA_REST_TIMEOUT.as_secs()))?
-    .map_err(|e| format!("Failed to fetch settings: {}", e))?;
+    let resp = timeout(ALMA_REST_TIMEOUT, state.http_client.get(&url).send())
+        .await
+        .map_err(|_| {
+            format!(
+                "Fetch settings timed out after {}s",
+                ALMA_REST_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("Failed to fetch settings: {}", e))?;
 
     if !resp.status().is_success() {
         return Err(format!(
@@ -144,19 +148,16 @@ pub async fn thread_exists(state: &SharedState, thread_id: &str) -> Result<bool,
         thread_id
     );
 
-    let resp = timeout(
-        ALMA_REST_TIMEOUT,
-        state.http_client.get(&url).send(),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "Thread {} existence check timed out after {}s",
-            thread_id,
-            ALMA_REST_TIMEOUT.as_secs()
-        )
-    })?
-    .map_err(|e| format!("Failed to fetch thread {}: {}", thread_id, e))?;
+    let resp = timeout(ALMA_REST_TIMEOUT, state.http_client.get(&url).send())
+        .await
+        .map_err(|_| {
+            format!(
+                "Thread {} existence check timed out after {}s",
+                thread_id,
+                ALMA_REST_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("Failed to fetch thread {}: {}", thread_id, e))?;
 
     if resp.status().is_success() {
         return Ok(true);
