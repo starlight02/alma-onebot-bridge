@@ -288,7 +288,8 @@ jobs:
         with:
           name: AlmaOneBotBridge-Windows-x86_64-Installer
           path: |
-            dist/windows-velopack/*
+            dist/windows-velopack/*.msi
+            dist/windows-velopack/*.msi.sha256
           if-no-files-found: error
 
       - name: Upload Windows ZIP artifacts
@@ -312,7 +313,15 @@ jobs:
             gh release create $tagName `
               --title $tagName `
               --generate-notes `
-              --notes "Windows installer and ZIP portable release for $tagName."
+              --notes "Windows MSI installer and portable ZIP for $tagName."
           }
 
-          gh release upload $tagName dist/windows-velopack/* dist/windows-zip/* --clobber
+          # User-facing only: our ZIP + MSI (+ sha256). Skip Velopack update channel
+          # files (nupkg, RELEASES, assets*.json, *-Setup.exe, *-Portable.zip).
+          $releaseFiles = @(
+            Get-ChildItem dist/windows-zip -File -Filter 'AlmaOneBotBridge-*-windows-x86_64.zip' -ErrorAction Stop
+            Get-ChildItem dist/windows-zip -File -Filter 'AlmaOneBotBridge-*-windows-x86_64.zip.sha256' -ErrorAction Stop
+            Get-ChildItem dist/windows-velopack -File -Filter '*.msi' -ErrorAction Stop
+            Get-ChildItem dist/windows-velopack -File -Filter '*.msi.sha256' -ErrorAction Stop
+          )
+          gh release upload $tagName @($releaseFiles | ForEach-Object { $_.FullName }) --clobber

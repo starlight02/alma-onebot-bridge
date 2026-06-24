@@ -67,6 +67,9 @@ $IconPath = Join-Path $RepoRoot "platforms/windows/assets/app.ico"
 Remove-Item -Recurse -Force $DistDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 
+# Release packaging only needs the per-machine MSI. Portable ZIP is built separately
+# (package-windows-zip.ps1). These flags skip Velopack's update channel (nupkg,
+# RELEASES, json), portable zip, and setup.exe — faster pack and a clean dist dir.
 & vpk pack `
     --outputDir $DistDir `
     --packId $PackId `
@@ -78,7 +81,10 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
     --runtime win-x64 `
     --icon $IconPath `
     --msi `
-    --instLocation PerMachine
+    --instLocation PerMachine `
+    --noPortable `
+    --skipUpdates `
+    --noInst
 if ($LASTEXITCODE -ne 0) {
     throw "Velopack packaging failed"
 }
@@ -88,7 +94,7 @@ if ($msiFiles.Count -eq 0) {
     throw "Velopack did not produce a per-machine MSI in $DistDir"
 }
 
-Get-ChildItem $DistDir -File | Where-Object { $_.Name -notlike "*.sha256" } | ForEach-Object {
+$msiFiles | ForEach-Object {
     $hash = Get-FileHash -Algorithm SHA256 $_.FullName
     "$($hash.Hash.ToLowerInvariant())  $($_.Name)" | Set-Content -Path "$($_.FullName).sha256" -Encoding ASCII
 }

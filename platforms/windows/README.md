@@ -32,8 +32,12 @@ Release builds produce both formats:
 The MSI is built per-machine with:
 
 ```powershell
-vpk pack --msi --instLocation PerMachine
+vpk pack --msi --instLocation PerMachine --noPortable --skipUpdates --noInst
 ```
+
+`--noPortable` and `--skipUpdates` avoid duplicate portable ZIP and update-channel
+files (`nupkg`, `RELEASES`, `*.json`). `--noInst` skips Velopack's setup.exe.
+The portable ZIP for releases is built with `package-windows-zip.ps1` instead.
 
 Velopack uses the app id as the default application folder name. This project
 uses `AlmaOneBotBridge`, so the installer does not add an extra `Alma` directory
