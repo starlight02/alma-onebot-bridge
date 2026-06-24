@@ -11,7 +11,7 @@ validate_release_version "$VERSION"
 BUILD_NUMBER="${BUILD_NUMBER:-$(build_number_for_version "$VERSION")}"
 CONFIGURATION="${CONFIGURATION:-Release}"
 DIST_DIR="${DIST_DIR:-$ROOT/dist/macos}"
-BUILD_UNIVERSAL="${BUILD_UNIVERSAL:-1}"
+TARGET="${TARGET:-$(rustc -vV | awk '/host:/ {print $2}')}"
 PACKAGE_ARCH="${PACKAGE_ARCH:-}"
 WORK_DIR="$DIST_DIR/work"
 RESOURCES_DIR="$WORK_DIR/resources"
@@ -51,15 +51,11 @@ if [[ -z "${GIT_COMMIT:-}" || -z "${GIT_VERSION:-}" || -z "${GIT_DIRTY:-}" ]]; t
 fi
 
 if [[ -z "$PACKAGE_ARCH" ]]; then
-    if [[ "$BUILD_UNIVERSAL" == "1" ]]; then
-        PACKAGE_ARCH="universal"
-    else
-        case "${TARGET:-$(rustc -vV | awk '/host:/ {print $2}')}" in
-            aarch64-apple-darwin) PACKAGE_ARCH="arm64" ;;
-            x86_64-apple-darwin) PACKAGE_ARCH="amd64" ;;
-            *) PACKAGE_ARCH="native" ;;
-        esac
-    fi
+    case "$TARGET" in
+        aarch64-apple-darwin) PACKAGE_ARCH="arm64" ;;
+        x86_64-apple-darwin) PACKAGE_ARCH="amd64" ;;
+        *) PACKAGE_ARCH="native" ;;
+    esac
 fi
 
 if [[ -n "${INSTALLER_SIGN_IDENTITY:-}" ]]; then
@@ -72,8 +68,8 @@ rm -rf "$WORK_DIR"
 mkdir -p "$RESOURCES_DIR" "$SCRIPTS_DIR" "$DIST_DIR"
 
 echo "==> Building $PACKAGE_ARCH macOS app..."
-BUILD_UNIVERSAL="$BUILD_UNIVERSAL" \
 CONFIGURATION="$CONFIGURATION" \
+TARGET="$TARGET" \
 VERSION="$VERSION" \
 BUILD_NUMBER="$BUILD_NUMBER" \
 GIT_COMMIT="$GIT_COMMIT" \

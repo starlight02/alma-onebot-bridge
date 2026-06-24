@@ -135,22 +135,13 @@
 			shellScript = (
 				"set -euo pipefail",
 				"ROOT=\"${SRCROOT}/../..\"",
-				"TARGETS=\"${RUST_BRIDGE_TARGETS:-${RUST_BRIDGE_TARGET:-$(rustc -vV | awk '/host:/ {print $2}')}}\"",
+				"TARGET=\"${RUST_BRIDGE_TARGET:-$(rustc -vV | awk '/host:/ {print $2}')}\"",
 				"RESOURCE_DIR=\"${SRCROOT}/AlmaOneBotBridge/Resources\"",
 				"OUTPUT=\"${RESOURCE_DIR}/alma-onebot-bridge\"",
-				"target_list=(${=TARGETS})",
-				"binaries=()",
 				"cd \"$ROOT\"",
-				"for target in \"${target_list[@]}\"; do",
-				"    cargo build --release --target \"$target\"",
-				"    binaries+=(\"$ROOT/target/$target/release/alma-onebot-bridge\")",
-				"done",
+				"cargo build --release --target \"$TARGET\"",
 				"mkdir -p \"$RESOURCE_DIR\"",
-				"if (( ${#binaries[@]} == 1 )); then",
-				"    cp \"${binaries[1]}\" \"$OUTPUT\"",
-				"else",
-				"    lipo -create \"${binaries[@]}\" -output \"$OUTPUT\"",
-				"fi",
+				"cp \"$ROOT/target/$TARGET/release/alma-onebot-bridge\" \"$OUTPUT\"",
 				"chmod +x \"$OUTPUT\"",
 				"",
 			);
@@ -306,7 +297,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 					CODE_SIGN_STYLE = Automatic;
-					CURRENT_PROJECT_VERSION = 106;
+					CURRENT_PROJECT_VERSION = 107;
 					ENABLE_APP_INTENTS_METADATA_PROCESSOR = NO;
 					ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
@@ -326,7 +317,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MARKETING_VERSION = 0.1.6;
+				MARKETING_VERSION = 0.1.7;
 				PRODUCT_BUNDLE_IDENTIFIER = "moe.aili.alma-onebot-bridge";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -346,7 +337,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 					CODE_SIGN_STYLE = Automatic;
-					CURRENT_PROJECT_VERSION = 106;
+					CURRENT_PROJECT_VERSION = 107;
 					ENABLE_APP_INTENTS_METADATA_PROCESSOR = NO;
 					ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
@@ -366,7 +357,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MARKETING_VERSION = 0.1.6;
+				MARKETING_VERSION = 0.1.7;
 				PRODUCT_BUNDLE_IDENTIFIER = "moe.aili.alma-onebot-bridge";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;

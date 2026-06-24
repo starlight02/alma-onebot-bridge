@@ -38,17 +38,11 @@ jobs:
       matrix:
         include:
           - package_arch: arm64
-            build_universal: "0"
             target: aarch64-apple-darwin
             archs: arm64
           - package_arch: amd64
-            build_universal: "0"
             target: x86_64-apple-darwin
             archs: x86_64
-          - package_arch: universal
-            build_universal: "1"
-            target: ""
-            archs: "arm64 x86_64"
     env:
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
       MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -189,12 +183,9 @@ jobs:
           else
             unset APP_SIGN_IDENTITY INSTALLER_SIGN_IDENTITY
           fi
-          export BUILD_UNIVERSAL="${{ matrix.build_universal }}"
           export PACKAGE_ARCH="${{ matrix.package_arch }}"
           export ARCHS="${{ matrix.archs }}"
-          if [[ -n "${{ matrix.target }}" ]]; then
-            export TARGET="${{ matrix.target }}"
-          fi
+          export TARGET="${{ matrix.target }}"
           scripts/package-macos-pkg.sh
 
       - name: Upload PKG artifact

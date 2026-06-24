@@ -20,7 +20,6 @@ Download the latest macOS PKG from GitHub Releases:
 
 - `arm64`: Apple Silicon Macs
 - `amd64`: Intel Macs
-- `universal`: works on both Apple Silicon and Intel Macs
 
 Open the PKG and follow Installer. The installer asks you to accept the
 AGPL-3.0 license, then installs the app into `/Applications`.

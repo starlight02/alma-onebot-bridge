@@ -10,7 +10,7 @@ VERSION="${VERSION:-$(read_cargo_version "$ROOT")}"
 validate_release_version "$VERSION"
 BUILD_NUMBER="${BUILD_NUMBER:-$(build_number_for_version "$VERSION")}"
 HOST_ARCH="$(uname -m)"
-BUILD_UNIVERSAL="${BUILD_UNIVERSAL:-0}"
+TARGET="${TARGET:-$(rustc -vV | awk '/host:/ {print $2}')}"
 
 if [[ -z "$VERSION_FROM_ENV" && "${SKIP_VERSION_VERIFY:-0}" != "1" ]]; then
     "$ROOT/scripts/verify-version.sh"
@@ -37,24 +37,16 @@ if [[ -z "${GIT_COMMIT:-}" || -z "${GIT_VERSION:-}" || -z "${GIT_DIRTY:-}" ]]; t
     GIT_DIRTY="${GIT_DIRTY:-$RESOLVED_GIT_DIRTY}"
 fi
 
-if [[ "$BUILD_UNIVERSAL" == "1" ]]; then
-    RUST_BRIDGE_TARGETS="${RUST_BRIDGE_TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
-    ARCHS="${ARCHS:-arm64 x86_64}"
-    DESTINATION="${DESTINATION:-generic/platform=macOS}"
-    ONLY_ACTIVE_ARCH="${ONLY_ACTIVE_ARCH:-NO}"
-else
-    TARGET="${TARGET:-$(rustc -vV | awk '/host:/ {print $2}')}"
-    RUST_BRIDGE_TARGETS="${RUST_BRIDGE_TARGETS:-$TARGET}"
-    if [[ -z "${ARCHS:-}" ]]; then
-        case "$TARGET" in
-            aarch64-apple-darwin) ARCHS="arm64" ;;
-            x86_64-apple-darwin) ARCHS="x86_64" ;;
-            *) ARCHS="$HOST_ARCH" ;;
-        esac
-    fi
-    DESTINATION="${DESTINATION:-generic/platform=macOS}"
-    ONLY_ACTIVE_ARCH="${ONLY_ACTIVE_ARCH:-NO}"
+RUST_BRIDGE_TARGET="$TARGET"
+if [[ -z "${ARCHS:-}" ]]; then
+    case "$TARGET" in
+        aarch64-apple-darwin) ARCHS="arm64" ;;
+        x86_64-apple-darwin) ARCHS="x86_64" ;;
+        *) ARCHS="$HOST_ARCH" ;;
+    esac
 fi
+DESTINATION="${DESTINATION:-generic/platform=macOS}"
+ONLY_ACTIVE_ARCH="${ONLY_ACTIVE_ARCH:-NO}"
 
 echo "==> Building Xcode project..."
 cd "$MACOS_DIR"
@@ -64,7 +56,7 @@ xcodebuild_args=(
     -configuration "$CONFIGURATION" \
     -destination "$DESTINATION" \
     -derivedDataPath build/ \
-    RUST_BRIDGE_TARGETS="$RUST_BRIDGE_TARGETS" \
+    RUST_BRIDGE_TARGET="$RUST_BRIDGE_TARGET" \
     ARCHS="$ARCHS" \
     ONLY_ACTIVE_ARCH="$ONLY_ACTIVE_ARCH" \
     MARKETING_VERSION="$VERSION" \
@@ -121,20 +113,11 @@ set_plist_string "AlmaGitDirty" "$GIT_DIRTY"
 if [[ ! -x "$APP_RESOURCE" ]]; then
     echo "==> Xcode did not copy the bridge binary; installing it into app resources..."
     mkdir -p "$APP/Contents/Resources"
-    read -r -a bridge_targets <<< "$RUST_BRIDGE_TARGETS"
-    bridge_binaries=()
-    for bridge_target in "${bridge_targets[@]}"; do
-        bridge_binary="$ROOT/target/$bridge_target/release/alma-onebot-bridge"
-        if [[ ! -x "$bridge_binary" ]]; then
-            cargo build --release --target "$bridge_target"
-        fi
-        bridge_binaries+=("$bridge_binary")
-    done
-    if (( ${#bridge_binaries[@]} == 1 )); then
-        cp "${bridge_binaries[0]}" "$APP_RESOURCE"
-    else
-        lipo -create "${bridge_binaries[@]}" -output "$APP_RESOURCE"
+    bridge_binary="$ROOT/target/$RUST_BRIDGE_TARGET/release/alma-onebot-bridge"
+    if [[ ! -x "$bridge_binary" ]]; then
+        cargo build --release --target "$RUST_BRIDGE_TARGET"
     fi
+    cp "$bridge_binary" "$APP_RESOURCE"
     chmod +x "$APP_RESOURCE"
 fi
 
