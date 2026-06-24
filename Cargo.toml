@@ -1,6 +1,6 @@
 [package]
 name = "alma-onebot-bridge"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "AGPL-3.0-only"
 
