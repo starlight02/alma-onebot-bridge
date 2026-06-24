@@ -111,6 +111,19 @@ async fn main() {
 
     write_pid_file();
 
+    // ── Ensure the PID file is cleaned up on any exit path ────────────────
+    // A plain `return` from `main` (or the normal end of `warp::serve`) calls
+    // `remove_pid_file()` directly. But a panic bypasses that, leaving a stale
+    // PID file that the GUI misreads as "bridge running". Installing a panic
+    // hook guarantees cleanup in that case too. The hook runs on the panicking
+    // thread, which is acceptable because PID-file removal is fallible and
+    // non-critical (best-effort).
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        remove_pid_file();
+        original_hook(info);
+    }));
+
     // ── Initialize Alma WebSocket client ─────────────────────────────────
     // Connect to Alma's internal WS endpoint for the full chat pipeline.
     // This ensures messages are persisted in the thread and visible in the GUI.

@@ -98,10 +98,13 @@ final class ConfigModel: ObservableObject {
         && dbPath == o.dbPath
     }
 
+    /// Whether saving this change requires a full bridge restart.
+    ///
+    /// `bridgePort` rebinds the listening socket and `dbPath` reopens the
+    /// database, so neither can be hot-reloaded. `almaApi` and `accessToken`
+    /// are handled by the bridge's SIGHUP handler (`main.rs`), so they only
+    /// need a hot-reload signal rather than a full restart.
     func requiresBridgeRestart(to o: ConfigModel) -> Bool {
-        bridgePort != o.bridgePort
-        || almaApi != o.almaApi
-        || accessToken != o.accessToken
-        || dbPath != o.dbPath
+        bridgePort != o.bridgePort || dbPath != o.dbPath
     }
 }

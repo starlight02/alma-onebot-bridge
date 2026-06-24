@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import SwiftUI
 import TOMLKit
 import os.log
 import Darwin
@@ -39,6 +40,133 @@ enum BridgeApplyAction {
     case restart
 }
 
+enum BridgeStatus {
+    case stopped
+    case missingExecutable
+    case starting(port: String)
+    case startupFailed
+    case stopping
+    case restarting
+    case running(port: String)
+    case checkingStatus
+    case healthCheckFailed
+    case startupFailedPortInUse(port: String)
+
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .stopped:
+            return "已停止"
+        case .missingExecutable:
+            return "缺少桥接服务"
+        case .starting(let port):
+            return "正在启动：端口 \(port)"
+        case .startupFailed:
+            return "启动失败"
+        case .stopping:
+            return "正在停止..."
+        case .restarting:
+            return "正在重启..."
+        case .running(let port):
+            return "运行中：端口 \(port)"
+        case .checkingStatus:
+            return "运行中，正在检查状态..."
+        case .healthCheckFailed:
+            return "运行中，健康检查失败"
+        case .startupFailedPortInUse(let port):
+            return "启动失败：端口 \(port) 被占用"
+        }
+    }
+
+    var localizedDescription: String {
+        String(localized: localizationValue)
+    }
+
+    var aboutLocalizedDescription: String {
+        switch self {
+        case .starting:
+            return String(localized: "正在启动")
+        case .running:
+            return String(localized: "运行中")
+        case .startupFailedPortInUse:
+            return String(localized: "启动失败")
+        default:
+            return localizedDescription
+        }
+    }
+
+    private var localizationValue: String.LocalizationValue {
+        switch self {
+        case .stopped:
+            return "已停止"
+        case .missingExecutable:
+            return "缺少桥接服务"
+        case .starting(let port):
+            return "正在启动：端口 \(port)"
+        case .startupFailed:
+            return "启动失败"
+        case .stopping:
+            return "正在停止..."
+        case .restarting:
+            return "正在重启..."
+        case .running(let port):
+            return "运行中：端口 \(port)"
+        case .checkingStatus:
+            return "运行中，正在检查状态..."
+        case .healthCheckFailed:
+            return "运行中，健康检查失败"
+        case .startupFailedPortInUse(let port):
+            return "启动失败：端口 \(port) 被占用"
+        }
+    }
+}
+
+enum BridgeErrorMessage {
+    case missingExecutable
+    case startFailed(reason: String)
+    case bridgeExited(status: String)
+    case portOccupied(port: String)
+    case loadConfigFailed(reason: String)
+    case reloadConfigFailed(errno: String)
+
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .missingExecutable:
+            return "未找到随 app 打包的桥接服务可执行文件，请使用 scripts/build-macos.sh 重新构建。"
+        case .startFailed(let reason):
+            return "启动桥接服务失败：\(reason)"
+        case .bridgeExited(let status):
+            return "桥接服务退出，状态码 \(status)。请查看 bridge.log。"
+        case .portOccupied(let port):
+            return "端口 \(port) 已被占用。请关闭占用该端口的应用，或在设置中修改 Bridge 端口。"
+        case .loadConfigFailed(let reason):
+            return "加载配置失败：\(reason)"
+        case .reloadConfigFailed(let errno):
+            return "重载桥接服务配置失败：errno \(errno)"
+        }
+    }
+
+    var localizedDescription: String {
+        String(localized: localizationValue)
+    }
+
+    private var localizationValue: String.LocalizationValue {
+        switch self {
+        case .missingExecutable:
+            return "未找到随 app 打包的桥接服务可执行文件，请使用 scripts/build-macos.sh 重新构建。"
+        case .startFailed(let reason):
+            return "启动桥接服务失败：\(reason)"
+        case .bridgeExited(let status):
+            return "桥接服务退出，状态码 \(status)。请查看 bridge.log。"
+        case .portOccupied(let port):
+            return "端口 \(port) 已被占用。请关闭占用该端口的应用，或在设置中修改 Bridge 端口。"
+        case .loadConfigFailed(let reason):
+            return "加载配置失败：\(reason)"
+        case .reloadConfigFailed(let errno):
+            return "重载桥接服务配置失败：errno \(errno)"
+        }
+    }
+}
+
 @MainActor
 final class ConfigManager: ObservableObject {
     @Published var model = ConfigModel()
@@ -46,8 +174,8 @@ final class ConfigManager: ObservableObject {
     @Published var isBridgeHealthy = false
     @Published var isOperationInProgress = false
     @Published var bridgePID: pid_t?
-    @Published var statusText = "已停止"
-    @Published var lastError: String?
+    @Published private(set) var statusText = BridgeStatus.stopped.localizedKey
+    @Published var lastError: BridgeErrorMessage?
     @Published var lastSaveTime: Date?
     @Published var lastStartTime: Date?
     @Published var lastApplyAction: BridgeApplyAction = .none
@@ -63,6 +191,11 @@ final class ConfigManager: ObservableObject {
     private var stderrPipe: Pipe?
     private var statusTimer: Timer?
     private var healthTask: URLSessionDataTask?
+    private var bridgeStatus: BridgeStatus = .stopped {
+        didSet {
+            statusText = bridgeStatus.localizedKey
+        }
+    }
 
     init() {
         configDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
@@ -107,8 +240,8 @@ final class ConfigManager: ObservableObject {
         }
 
         guard let executableURL = bridgeExecutableURL() else {
-            lastError = "未找到随 app 打包的桥接服务可执行文件，请使用 scripts/build-macos.sh 重新构建。"
-            statusText = "缺少桥接服务"
+            lastError = .missingExecutable
+            setBridgeStatus(.missingExecutable)
             log.error("Bridge executable not found")
             return
         }
@@ -151,7 +284,7 @@ final class ConfigManager: ObservableObject {
             isBridgeRunning = true
             isBridgeHealthy = false
             bridgePID = task.processIdentifier
-            statusText = "正在启动：端口 \(model.bridgePort)"
+            setBridgeStatus(.starting(port: model.bridgePort))
             log.info("Started bridge pid=\(task.processIdentifier)")
         } catch {
             stdoutPipe?.fileHandleForReading.readabilityHandler = nil
@@ -160,8 +293,8 @@ final class ConfigManager: ObservableObject {
             stderrPipe = nil
             try? logFileHandle?.close()
             logFileHandle = nil
-            lastError = "启动桥接服务失败：\(error.localizedDescription)"
-            statusText = "启动失败"
+            lastError = .startFailed(reason: error.localizedDescription)
+            setBridgeStatus(.startupFailed)
             log.error("Failed to start bridge: \(error)")
         }
     }
@@ -173,7 +306,7 @@ final class ConfigManager: ObservableObject {
         }
 
         isOperationInProgress = true
-        statusText = "正在停止..."
+        setBridgeStatus(.stopping)
         requestStop(pid: pid)
         waitForExit(pid: pid) { [weak self] didExit in
             guard let self else { return }
@@ -193,7 +326,7 @@ final class ConfigManager: ObservableObject {
         }
 
         isOperationInProgress = true
-        statusText = "正在重启..."
+        setBridgeStatus(.restarting)
         requestStop(pid: pid)
         waitForExit(pid: pid) { [weak self] didExit in
             guard let self else { return }
@@ -241,7 +374,7 @@ final class ConfigManager: ObservableObject {
         if status == 0 || status == SIGTERM {
             log.info("Bridge exited with status \(status)")
         } else {
-            lastError = "桥接服务退出，状态码 \(status)。请查看 bridge.log。"
+            lastError = .bridgeExited(status: String(status))
             log.warning("Bridge exited with status \(status)")
         }
         refreshBridgeStatus()
@@ -301,15 +434,19 @@ final class ConfigManager: ObservableObject {
         bridgePID = running ? pid : nil
         if !running {
             isBridgeHealthy = false
-            statusText = isOperationInProgress ? statusText : "已停止"
+            if !isOperationInProgress {
+                setBridgeStatus(.stopped)
+            }
             healthTask?.cancel()
             return
         }
 
         probeHealth()
-        statusText = isBridgeHealthy
-            ? "运行中：端口 \(model.bridgePort)"
-            : "运行中，正在检查状态..."
+        setBridgeStatus(
+            isBridgeHealthy
+                ? .running(port: model.bridgePort)
+                : .checkingStatus
+        )
     }
 
     private func probeHealth() {
@@ -329,9 +466,11 @@ final class ConfigManager: ObservableObject {
             DispatchQueue.main.async {
                 self?.isBridgeHealthy = healthy
                 if self?.isBridgeRunning == true {
-                    self?.statusText = healthy
-                        ? "运行中：端口 \(self?.model.bridgePort ?? "")"
-                        : "运行中，健康检查失败"
+                    self?.setBridgeStatus(
+                        healthy
+                            ? .running(port: self?.model.bridgePort ?? "")
+                            : .healthCheckFailed
+                    )
                 }
             }
         }
@@ -349,7 +488,7 @@ final class ConfigManager: ObservableObject {
         isBridgeRunning = false
         isBridgeHealthy = false
         bridgePID = nil
-        statusText = "已停止"
+        setBridgeStatus(.stopped)
         healthTask?.cancel()
     }
 
@@ -362,15 +501,15 @@ final class ConfigManager: ObservableObject {
             return true
         }
 
-        let message = "端口 \(port) 已被占用。请关闭占用该端口的应用，或在设置中修改 Bridge 端口。"
+        let message = BridgeErrorMessage.portOccupied(port: String(port))
         lastError = message
-        statusText = "启动失败：端口 \(port) 被占用"
+        setBridgeStatus(.startupFailedPortInUse(port: String(port)))
         isBridgeRunning = false
         isBridgeHealthy = false
         bridgePID = nil
 
         appendAppLogLine("Startup blocked: port \(port) is already in use.")
-        showPortOccupiedAlert(port: port, message: message)
+        showPortOccupiedAlert(port: port, message: message.localizedDescription)
         return false
     }
 
@@ -423,11 +562,14 @@ final class ConfigManager: ObservableObject {
 
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = "Alma Bridge 无法启动"
-        alert.informativeText = "\(message)\n\n当前配置端口：\(port)"
-        alert.addButton(withTitle: "打开设置")
-        alert.addButton(withTitle: "打开运行日志")
-        alert.addButton(withTitle: "好")
+        alert.messageText = String(localized: "Alma Bridge 无法启动")
+        alert.informativeText = [
+            message,
+            String(localized: "当前配置端口：\(String(port))")
+        ].joined(separator: "\n\n")
+        alert.addButton(withTitle: String(localized: "打开设置"))
+        alert.addButton(withTitle: String(localized: "打开运行日志"))
+        alert.addButton(withTitle: String(localized: "好"))
 
         let response = alert.runModal()
         switch response {
@@ -451,8 +593,8 @@ final class ConfigManager: ObservableObject {
         alert.icon = NSApp.applicationIconImage
         alert.messageText = "\(applicationName) \(applicationVersionDisplay)"
         alert.accessoryView = aboutInformationView()
-        alert.addButton(withTitle: "好")
-        alert.addButton(withTitle: "复制信息")
+        alert.addButton(withTitle: String(localized: "好"))
+        alert.addButton(withTitle: String(localized: "复制信息"))
 
         let response = alert.runModal()
         if response == .alertSecondButtonReturn {
@@ -474,7 +616,7 @@ final class ConfigManager: ObservableObject {
         let version = Bundle.main.object(
             forInfoDictionaryKey: "CFBundleShortVersionString"
         ) as? String ?? "Unknown"
-        return "版本 \(version)"
+        return String(localized: "版本 \(version)")
     }
 
     private var sourceVersionDisplay: String {
@@ -485,17 +627,13 @@ final class ConfigManager: ObservableObject {
         ) == "true"
 
         if isDirty, commit != "Unknown" {
-            return "\(commit)（本地构建含未提交修改）"
+            return "\(commit)（\(String(localized: "本地构建含未提交修改"))）"
         }
         return commit
     }
 
     private var aboutStatusDisplay: String {
-        let portSuffix = "：端口 \(model.bridgePort)"
-        if statusText.hasSuffix(portSuffix) {
-            return String(statusText.dropLast(portSuffix.count))
-        }
-        return statusText
+        bridgeStatus.aboutLocalizedDescription
     }
 
     private func aboutInformationView() -> NSView {
@@ -552,28 +690,28 @@ final class ConfigManager: ObservableObject {
             appendLine()
         }
 
-        appendLine("提交版本：\(sourceVersionDisplay)")
-        appendLinkedLine(label: "项目地址：", value: projectName, urlString: projectURL)
-        appendLinkedLine(label: "作者：", value: projectAuthor, urlString: projectAuthorURL)
-        appendLinkedLine(label: "开源协议：", value: projectLicense, urlString: projectLicenseURL)
+        appendLine(String(localized: "提交版本：\(sourceVersionDisplay)"))
+        appendLinkedLine(label: String(localized: "项目地址："), value: projectName, urlString: projectURL)
+        appendLinkedLine(label: String(localized: "作者："), value: projectAuthor, urlString: projectAuthorURL)
+        appendLinkedLine(label: String(localized: "开源协议："), value: projectLicense, urlString: projectLicenseURL)
         appendLine()
-        appendLine("运行状态：\(aboutStatusDisplay)")
-        appendLine("监听端口：\(model.bridgePort)")
-        appendLine("Bridge PID：\(bridgePID.map(String.init) ?? "无")")
-        append("Alma API：\(model.almaApi)")
+        appendLine(String(localized: "运行状态：\(aboutStatusDisplay)"))
+        appendLine(String(localized: "监听端口：\(model.bridgePort)"))
+        appendLine(String(localized: "Bridge PID：\(bridgePID.map(String.init) ?? String(localized: "无"))"))
+        append(String(localized: "Alma API：\(model.almaApi)"))
 
         return text
     }
 
     private func aboutClipboardInformationText() -> String {
-        let pidText = bridgePID.map(String.init) ?? "无"
+        let pidText = bridgePID.map(String.init) ?? String(localized: "无")
 
         return """
-        提交版本：\(sourceVersionDisplay)
-        运行状态：\(aboutStatusDisplay)
-        监听端口：\(model.bridgePort)
-        Bridge PID：\(pidText)
-        Alma API：\(model.almaApi)
+        \(String(localized: "提交版本：\(sourceVersionDisplay)"))
+        \(String(localized: "运行状态：\(aboutStatusDisplay)"))
+        \(String(localized: "监听端口：\(model.bridgePort)"))
+        \(String(localized: "Bridge PID：\(pidText)"))
+        \(String(localized: "Alma API：\(model.almaApi)"))
         """
     }
 
@@ -590,7 +728,7 @@ final class ConfigManager: ObservableObject {
             applyTOML(toml)
             lastError = nil
         } catch {
-            lastError = "加载配置失败：\(error.localizedDescription)"
+            lastError = .loadConfigFailed(reason: error.localizedDescription)
             log.error("Failed to load config: \(error)")
         }
     }
@@ -667,9 +805,13 @@ final class ConfigManager: ObservableObject {
         if result == 0 {
             log.info("Sent SIGHUP to bridge pid=\(pid)")
         } else {
-            lastError = "重载桥接服务配置失败：errno \(errno)"
+            lastError = .reloadConfigFailed(errno: String(errno))
             log.warning("kill(SIGHUP) failed: errno=\(errno)")
         }
+    }
+
+    private func setBridgeStatus(_ status: BridgeStatus) {
+        bridgeStatus = status
     }
 
     // MARK: Paths and process helpers
@@ -916,11 +1058,33 @@ final class ConfigManager: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
+    /// Escape a string for inclusion in a TOML basic string (`"..."`).
+    ///
+    /// TOML basic strings disallow raw control characters (< 0x20 and 0x7F).
+    /// Escape `\`, `"`, and the named whitespace controls; emit any other
+    /// control character as a `\uXXXX` code point so the written file is
+    /// always valid TOML.
     private func esc(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "\t", with: "\\t")
+        var out = ""
+        out.reserveCapacity(s.count)
+        for char in s.unicodeScalars {
+            switch char {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\t": out += "\\t"
+            case "\r": out += "\\r"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
+            default:
+                if char.value < 0x20 || char.value == 0x7F {
+                    out += String(format: "\\u%04X", char.value)
+                } else {
+                    out.unicodeScalars.append(char)
+                }
+            }
+        }
+        return out
     }
 }
 
@@ -930,9 +1094,9 @@ enum ConfigError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .validationFailed(let message):
-            return "校验失败：\(message)"
+            return String(localized: "校验失败：\(message)")
         case .writeFailed(let message):
-            return "写入失败：\(message)"
+            return String(localized: "写入失败：\(message)")
         }
     }
 }

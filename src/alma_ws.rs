@@ -1031,6 +1031,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{Mutex, mpsc, oneshot};
     use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::accept_async;
 
     #[test]
@@ -1260,9 +1261,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         outbound_tx
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                "queued while reconnecting".into(),
-            ))
+            .send(Message::Text("queued while reconnecting".into()))
             .unwrap();
 
         let listener = TcpListener::bind(addr).await.unwrap();
@@ -1277,5 +1276,43 @@ mod tests {
         assert_eq!(received.to_text().unwrap(), "queued while reconnecting");
         drop(outbound_tx);
         supervisor.abort();
+    }
+
+    /// Regression: when the `AlmaWsClient` holder is dropped, the outbound
+    /// channel closes and the supervisor must stop — not spin forever trying
+    /// to reconnect to an Alma server it can no longer serve. This exercises
+    /// the exact "connect fails while outbound channel is closed" branch.
+    #[tokio::test]
+    async fn supervisor_exits_when_outbound_channel_closed_before_connect() {
+        // Bind + immediately drop so connect_async() to this address fails.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let url = format!("ws://{}", addr);
+        let (_outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Message>();
+        // Close the channel immediately — simulates the last AlmaWsClient clone
+        // being dropped before the supervisor ever establishes a session.
+        drop(_outbound_tx);
+
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let supervisor = tokio::spawn(super::connection_supervisor(
+            url,
+            None,
+            outbound_rx,
+            pending,
+            event_tx,
+            connected,
+        ));
+
+        // If the supervisor were to spin (the reviewed bug), this would hang
+        // until the test timeout. Instead it should return promptly.
+        timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("supervisor did not exit after outbound channel was closed")
+            .expect("supervisor task panicked");
     }
 }

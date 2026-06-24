@@ -240,8 +240,15 @@ impl SharedState {
         let (alma_event_tx, _) = tokio::sync::broadcast::channel(64);
 
         Ok(SharedState(Arc::new(AppState {
+            // No global request timeout: Alma control-plane REST calls
+            // (create_thread, fetch_thread_model, fetch_default_model) are
+            // individually cheap but can sit behind a loaded server, while
+            // media downloads already apply their own per-request timeout in
+            // `pipeline::download_media_as_file_part`. A global 10s timeout
+            // would cap REST calls below the configured generation timeout
+            // (alma_run_timeout_secs, default 120s) and cause spurious
+            // failures under load. Each call site applies the timeout it needs.
             http_client: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("Failed to build HTTP client"),
             config: RwLock::new(config),

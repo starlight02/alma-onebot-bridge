@@ -62,9 +62,9 @@ struct MenuBarView: View {
                 dismiss()
             }
 
-            if let error = configManager.lastError, !error.isEmpty {
+            if let error = configManager.lastError {
                 Divider()
-                Text(error)
+                Text(error.localizedKey)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
@@ -107,7 +107,9 @@ struct MenuBarView: View {
 }
 
 private struct MenuPanelButton: View {
-    let title: String
+    // LocalizedStringKey (not String) so literal titles like "启动" are
+    // resolved through Localizable.xcstrings instead of rendered verbatim.
+    let title: LocalizedStringKey
     let systemImage: String
     var shortcut: String?
     var isDisabled = false

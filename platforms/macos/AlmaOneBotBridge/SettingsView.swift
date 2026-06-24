@@ -110,6 +110,7 @@ struct SettingsView: View {
                 .keyboardShortcut(.defaultAction)
                 .controlSize(.large)
                 .liquidGlassProminentButtonStyle(reduceTransparency: reduceTransparency)
+                .disabled(!editing.isValid)
         }
     }
 
@@ -361,8 +362,6 @@ private extension View {
     func liquidGlassHeaderBackground(reduceTransparency: Bool) -> some View {
         if reduceTransparency {
             self.background(Color(nsColor: .windowBackgroundColor))
-        } else if #available(macOS 26.0, *) {
-            self.background(.regularMaterial)
         } else {
             self.background(.regularMaterial)
         }
@@ -409,7 +408,8 @@ private extension View {
 
 private struct ValidationMessage: View {
     let isVisible: Bool
-    let text: String
+    // LocalizedStringKey so literal text is resolved through the catalog.
+    let text: LocalizedStringKey
 
     var body: some View {
         if isVisible {

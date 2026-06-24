@@ -48,18 +48,30 @@ fn token_matches(
 
 fn extract_authorization_token(header: &str) -> Option<&str> {
     let trimmed = header.trim();
-    trimmed
-        .strip_prefix("Bearer ")
-        .or_else(|| trimmed.strip_prefix("bearer "))
-        .or_else(|| trimmed.strip_prefix("Token "))
-        .or_else(|| trimmed.strip_prefix("token "))
-        .or_else(|| {
-            if trimmed.contains(' ') {
-                None
-            } else {
-                Some(trimmed)
+    // RFC 7235: the auth scheme (Bearer, Token, …) is case-insensitive.
+    // Only `Bearer` and `Token` carry a credential we understand; headers
+    // with no space (raw token) are accepted for compatibility with OneBot
+    // clients that send the bare token without a scheme.
+    let token = match trimmed.find(' ') {
+        Some(space) => {
+            let scheme = trimmed[..space].trim();
+            let value = trimmed[space..].trim();
+            if value.is_empty() {
+                return None;
             }
-        })
+            if scheme.eq_ignore_ascii_case("Bearer") || scheme.eq_ignore_ascii_case("Token") {
+                value
+            } else {
+                return None;
+            }
+        }
+        None => trimmed,
+    };
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
 }
 
 #[cfg(test)]
@@ -85,6 +97,49 @@ mod tests {
             &HashMap::new()
         ));
         assert!(is_ws_authorized(Some("secret"), None, &query));
+    }
+
+    #[test]
+    fn ws_auth_scheme_is_case_insensitive() {
+        // RFC 7235: scheme is case-insensitive.
+        assert!(is_ws_authorized(
+            Some("secret"),
+            Some("bearer secret"),
+            &HashMap::new()
+        ));
+        assert!(is_ws_authorized(
+            Some("secret"),
+            Some("BEARER secret"),
+            &HashMap::new()
+        ));
+        assert!(is_ws_authorized(
+            Some("secret"),
+            Some("TOKEN secret"),
+            &HashMap::new()
+        ));
+        assert!(is_ws_authorized(
+            Some("secret"),
+            Some("token secret"),
+            &HashMap::new()
+        ));
+        // Unknown scheme is rejected even if it looks like a token.
+        assert!(!is_ws_authorized(
+            Some("secret"),
+            Some("Basic secret"),
+            &HashMap::new()
+        ));
+        // Empty token after scheme is rejected.
+        assert!(!is_ws_authorized(
+            Some("secret"),
+            Some("Bearer "),
+            &HashMap::new()
+        ));
+        // Bare token without scheme still accepted (OneBot compatibility).
+        assert!(is_ws_authorized(
+            Some("secret"),
+            Some("secret"),
+            &HashMap::new()
+        ));
     }
 
     #[test]

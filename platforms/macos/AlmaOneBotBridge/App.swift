@@ -46,7 +46,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard !isTerminating else { return .terminateLater }
+        // Re-entrant call (user invoked Quit again while shutdown is already in
+        // flight). Returning `.terminateLater` here would hang the app forever
+        // because we never call `reply(toApplicationShouldTerminate:)` for the
+        // second request — cancel it instead so AppKit lets the user back in.
+        guard !isTerminating else { return .terminateCancel }
         isTerminating = true
 
         guard let configManager = Self.configManager else {
