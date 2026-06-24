@@ -276,6 +276,12 @@ async fn connection_supervisor(
     let mut reconnect_attempt: u32 = 0;
 
     loop {
+        if outbound_rx.is_closed() && outbound_rx.is_empty() {
+            connected.store(false, Ordering::SeqCst);
+            debug!("[AlmaWS] outbound channel closed before reconnect");
+            return;
+        }
+
         let ws_stream = match initial_stream.take() {
             Some(stream) => stream,
             None => match tokio_tungstenite::connect_async(&url).await {
