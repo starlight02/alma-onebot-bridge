@@ -8,7 +8,7 @@
 //! Also forwards `message_added` events for bidirectional communication
 //! (Alma GUI → QQ).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -71,6 +71,13 @@ struct PendingGeneration {
     text: String,
     /// Full visible prefix already emitted as stage events.
     stage_sent_prefix: String,
+    /// Next inferred assistant message part index. Alma's `part_add` deltas do
+    /// not include `partIndex`, but later tool input/output deltas do.
+    next_part_index: usize,
+    /// In-flight tool calls keyed by assistant message part index.
+    tool_calls: HashMap<usize, PendingToolCall>,
+    /// Optional lookup for `part_update` deltas that identify a tool by call id.
+    tool_call_id_to_part_index: HashMap<String, usize>,
     /// Optional per-generation channel for Telegram-style progress messages.
     progress_tx: Option<channel::Sender<AlmaProgressEvent>>,
     /// Local signal to reset the generation idle timeout after a stage message.
@@ -86,6 +93,15 @@ struct PendingGeneration {
     empty_response_grace_started: bool,
     /// Channel to send the final result: (response_text, user_message_id, thinking_content)
     result_tx: channel::Sender<GenerationResult>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingToolCall {
+    tool_name: String,
+    explicit_parameters: Option<Value>,
+    streamed_inputs: BTreeMap<String, String>,
+    state: Option<String>,
+    sent: bool,
 }
 
 /// Shared map of thread_id -> pending generation.
@@ -245,6 +261,9 @@ impl AlmaWsClient {
                     generation_id,
                     text: String::new(),
                     stage_sent_prefix: String::new(),
+                    next_part_index: 0,
+                    tool_calls: HashMap::new(),
+                    tool_call_id_to_part_index: HashMap::new(),
                     progress_tx,
                     activity_tx,
                     awaiting_tool_continuation: false,
@@ -727,27 +746,167 @@ fn is_tool_invocation_delta(delta: &Value) -> bool {
     part_type == "tool-invocation" || part_type.starts_with("tool-")
 }
 
-fn extract_tool_call_event(thread_id: &str, delta: &Value) -> Option<AlmaToolCallEvent> {
-    if !is_tool_invocation_delta(delta) {
+fn track_delta_part_index(pg: &mut PendingGeneration, delta: &Value) -> Option<usize> {
+    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    if delta_type != "part_add" {
+        if let Some(index) = delta
+            .get("partIndex")
+            .and_then(|i| i.as_i64())
+            .filter(|i| *i >= 0)
+        {
+            pg.next_part_index = pg.next_part_index.max((index as usize).saturating_add(1));
+        } else if matches!(delta_type, "text_append" | "text-delta") {
+            pg.next_part_index = pg.next_part_index.max(1);
+        }
         return None;
     }
 
-    let part = delta.get("part")?;
+    let index = delta
+        .get("partIndex")
+        .and_then(|i| i.as_i64())
+        .filter(|i| *i >= 0)
+        .map(|i| i as usize)
+        .unwrap_or(pg.next_part_index);
+    pg.next_part_index = pg.next_part_index.max(index.saturating_add(1));
+    Some(index)
+}
+
+fn record_tool_part_add(pg: &mut PendingGeneration, part_index: usize, delta: &Value) {
+    let Some(part) = delta.get("part") else {
+        return;
+    };
+
+    let tool_name = extract_tool_name_from_part(part);
+    let explicit_parameters = extract_tool_parameters_from_part(part);
+    let state = extract_state(part);
+    let tool_call_id = extract_tool_call_id(delta).or_else(|| extract_tool_call_id(part));
+
+    let tool = pg
+        .tool_calls
+        .entry(part_index)
+        .or_insert_with(|| PendingToolCall {
+            tool_name: tool_name.clone(),
+            explicit_parameters: None,
+            streamed_inputs: BTreeMap::new(),
+            state: None,
+            sent: false,
+        });
+
+    if tool.tool_name == "unknown" && tool_name != "unknown" {
+        tool.tool_name = tool_name;
+    }
+    if let Some(parameters) = explicit_parameters {
+        tool.explicit_parameters = Some(parameters);
+    }
+    if let Some(state) = state {
+        tool.state = Some(state);
+    }
+    if let Some(tool_call_id) = tool_call_id {
+        pg.tool_call_id_to_part_index
+            .insert(tool_call_id, part_index);
+    }
+}
+
+fn apply_tool_progress_delta(pg: &mut PendingGeneration, delta: &Value) -> Option<(usize, bool)> {
+    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    match delta_type {
+        "tool_input_append" => {
+            let part_index = delta_part_index(pg, delta)?;
+            let input_key = delta.get("inputKey").and_then(|v| v.as_str())?;
+            let text = delta.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let tool = pg.tool_calls.get_mut(&part_index)?;
+            tool.streamed_inputs
+                .entry(input_key.to_string())
+                .or_default()
+                .push_str(text);
+            let _ = pg.activity_tx.try_send(());
+            None
+        }
+        "tool_output_set" => {
+            let part_index = delta_part_index(pg, delta)?;
+            if let Some(tool) = pg.tool_calls.get_mut(&part_index)
+                && let Some(state) = extract_state(delta)
+            {
+                tool.state = Some(state);
+            }
+            let _ = pg.activity_tx.try_send(());
+            Some((part_index, true))
+        }
+        "part_update" => {
+            let part_index = delta_part_index(pg, delta)?;
+            let updates = delta.get("updates").unwrap_or(delta);
+            let tool_name = extract_tool_name_from_part(updates);
+            let tool = pg
+                .tool_calls
+                .entry(part_index)
+                .or_insert_with(|| PendingToolCall {
+                    tool_name: tool_name.clone(),
+                    explicit_parameters: None,
+                    streamed_inputs: BTreeMap::new(),
+                    state: None,
+                    sent: false,
+                });
+
+            if tool.tool_name == "unknown" && tool_name != "unknown" {
+                tool.tool_name = tool_name;
+            }
+            if let Some(parameters) = extract_tool_parameters_from_part(updates) {
+                tool.explicit_parameters = Some(parameters);
+            }
+            if let Some(state) = extract_state(updates) {
+                tool.state = Some(state);
+            }
+            if let Some(tool_call_id) =
+                extract_tool_call_id(delta).or_else(|| extract_tool_call_id(updates))
+            {
+                pg.tool_call_id_to_part_index
+                    .insert(tool_call_id, part_index);
+            }
+            let _ = pg.activity_tx.try_send(());
+            Some((part_index, false))
+        }
+        _ => None,
+    }
+}
+
+fn delta_part_index(pg: &PendingGeneration, delta: &Value) -> Option<usize> {
+    if let Some(index) = delta
+        .get("partIndex")
+        .and_then(|i| i.as_i64())
+        .filter(|i| *i >= 0)
+    {
+        return Some(index as usize);
+    }
+
+    let tool_call_id = extract_tool_call_id(delta)?;
+    pg.tool_call_id_to_part_index.get(&tool_call_id).copied()
+}
+
+fn extract_tool_name_from_part(part: &Value) -> String {
     let invocation = part
         .get("toolInvocation")
         .or_else(|| part.get("tool_invocation"))
         .unwrap_or(part);
     let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-    let tool_name = first_string_field(
+    first_string_field(
         invocation,
         &["toolName", "tool_name", "name", "tool", "toolId", "tool_id"],
     )
     .or_else(|| first_string_field(part, &["toolName", "tool_name", "name", "tool"]))
     .or_else(|| part_type.strip_prefix("tool-").map(str::to_string))
-    .unwrap_or_else(|| "unknown".to_string());
+    .unwrap_or_else(|| "unknown".to_string())
+}
 
-    let parameters = first_value_field(
+fn extract_tool_parameters_from_part(part: &Value) -> Option<Value> {
+    let invocation = part
+        .get("toolInvocation")
+        .or_else(|| part.get("tool_invocation"))
+        .unwrap_or(part);
+
+    first_value_field(
         invocation,
         &[
             "args",
@@ -773,14 +932,33 @@ fn extract_tool_call_event(thread_id: &str, delta: &Value) -> Option<AlmaToolCal
             ],
         )
     })
-    .map(format_tool_parameters)
-    .unwrap_or_else(|| "无".to_string());
+    .cloned()
+}
 
-    Some(AlmaToolCallEvent {
-        thread_id: thread_id.to_string(),
-        tool_name,
-        parameters_text: parameters,
-    })
+fn extract_state(value: &Value) -> Option<String> {
+    first_string_field(value, &["state", "status"])
+}
+
+fn extract_tool_call_id(value: &Value) -> Option<String> {
+    first_string_field(value, &["toolCallId", "tool_call_id", "id"])
+}
+
+fn tool_parameters_text(tool: &PendingToolCall) -> Option<String> {
+    if !tool.streamed_inputs.is_empty() {
+        let mut object = serde_json::Map::new();
+        for (key, value) in &tool.streamed_inputs {
+            object.insert(key.clone(), Value::String(value.clone()));
+        }
+        return Some(format_tool_parameters(&Value::Object(object)));
+    }
+
+    tool.explicit_parameters
+        .as_ref()
+        .map(format_tool_parameters)
+}
+
+fn tool_input_is_complete(tool: &PendingToolCall) -> bool {
+    !matches!(tool.state.as_deref(), Some("input-streaming"))
 }
 
 fn first_string_field(value: &Value, keys: &[&str]) -> Option<String> {
@@ -875,18 +1053,39 @@ fn emit_stage_text_if_needed(thread_id: &str, pg: &mut PendingGeneration) {
     }
 }
 
-fn emit_tool_call_if_needed(thread_id: &str, pg: &mut PendingGeneration, delta: &Value) {
-    let _ = pg.activity_tx.try_send(());
-
+fn emit_tool_call_if_ready(
+    thread_id: &str,
+    pg: &mut PendingGeneration,
+    part_index: usize,
+    allow_empty_parameters: bool,
+) {
     let Some(progress_tx) = pg.progress_tx.as_ref() else {
         return;
     };
-    let Some(event) = extract_tool_call_event(thread_id, delta) else {
+
+    let Some(tool) = pg.tool_calls.get_mut(&part_index) else {
         return;
+    };
+    if tool.sent || !tool_input_is_complete(tool) {
+        return;
+    }
+
+    let parameters_text = match tool_parameters_text(tool) {
+        Some(parameters_text) => parameters_text,
+        None if allow_empty_parameters => "无".to_string(),
+        None => return,
+    };
+
+    let event = AlmaToolCallEvent {
+        thread_id: thread_id.to_string(),
+        tool_name: tool.tool_name.clone(),
+        parameters_text,
     };
 
     match progress_tx.try_send(AlmaProgressEvent::ToolCall(event)) {
         Ok(()) => {
+            tool.sent = true;
+            let _ = pg.activity_tx.try_send(());
             debug!(
                 "[AlmaWS] Emitted tool-call progress for thread {}",
                 thread_id
@@ -899,6 +1098,17 @@ fn emit_tool_call_if_needed(thread_id: &str, pg: &mut PendingGeneration, delta: 
             );
         }
     }
+}
+
+fn emit_tool_call_after_part_add(thread_id: &str, pg: &mut PendingGeneration, part_index: usize) {
+    let Some(tool) = pg.tool_calls.get(&part_index) else {
+        return;
+    };
+    if tool_parameters_text(tool).is_none() {
+        return;
+    };
+
+    emit_tool_call_if_ready(thread_id, pg, part_index, false);
 }
 
 fn resolve_pending_generation(thread_id: &str, pg: PendingGeneration) -> Option<String> {
@@ -1186,6 +1396,8 @@ async fn dispatch_event(
 
             if let Some(deltas) = data.get("deltas").and_then(|d| d.as_array()) {
                 for delta in deltas {
+                    let part_add_index = track_delta_part_index(pg, delta);
+
                     if append_text_delta(pg, delta) {
                         continue;
                     }
@@ -1193,7 +1405,18 @@ async fn dispatch_event(
                     if is_tool_invocation_delta(delta) {
                         pg.awaiting_tool_continuation = true;
                         emit_stage_text_if_needed(thread_id, pg);
-                        emit_tool_call_if_needed(thread_id, pg, delta);
+                        if let Some(part_index) = part_add_index {
+                            record_tool_part_add(pg, part_index, delta);
+                            let _ = pg.activity_tx.try_send(());
+                            emit_tool_call_after_part_add(thread_id, pg, part_index);
+                        }
+                        continue;
+                    }
+
+                    if let Some((part_index, allow_empty_parameters)) =
+                        apply_tool_progress_delta(pg, delta)
+                    {
+                        emit_tool_call_if_ready(thread_id, pg, part_index, allow_empty_parameters);
                     }
                 }
             }
@@ -1745,6 +1968,9 @@ mod tests {
             generation_id,
             text: text.to_string(),
             stage_sent_prefix: String::new(),
+            next_part_index: 0,
+            tool_calls: HashMap::new(),
+            tool_call_id_to_part_index: HashMap::new(),
             progress_tx: None,
             activity_tx,
             awaiting_tool_continuation: false,
@@ -1909,6 +2135,9 @@ mod tests {
                 generation_id: 7,
                 text: String::new(),
                 stage_sent_prefix: String::new(),
+                next_part_index: 0,
+                tool_calls: HashMap::new(),
+                tool_call_id_to_part_index: HashMap::new(),
                 progress_tx: Some(progress_tx),
                 activity_tx,
                 awaiting_tool_continuation: false,
@@ -1931,15 +2160,20 @@ mod tests {
                 "data": {
                     "threadId": "thread-stage",
                     "deltas": [
-                        {"type": "text_append", "partType": "text", "text": "我先查一下"},
+                        {
+                            "type": "text_append",
+                            "partIndex": 0,
+                            "partType": "text",
+                            "text": "我先查一下"
+                        },
                         {
                             "type": "part_add",
                             "part": {
-                                "type": "tool-invocation",
-                                "toolInvocation": {
-                                    "toolName": "WebSearch",
-                                    "args": {"query": "alma onebot"}
-                                }
+                                "type": "tool-Bash",
+                                "toolCallId": "call-1",
+                                "toolName": "Bash",
+                                "input": {},
+                                "state": "input-streaming"
                             }
                         }
                     ]
@@ -1963,6 +2197,58 @@ mod tests {
         };
         assert_eq!(stage.message_text, "我先查一下");
         assert_eq!(stage.visible_prefix, "我先查一下");
+        assert!(progress_rx.try_recv().is_err());
+
+        dispatch_event(
+            &json!({
+                "type": "message_delta",
+                "data": {
+                    "threadId": "thread-stage",
+                    "deltas": [
+                        {
+                            "type": "tool_input_append",
+                            "partIndex": 1,
+                            "inputKey": "command",
+                            "text": "echo alma"
+                        }
+                    ]
+                }
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+            &bridge_owned_assistant_messages,
+        )
+        .await;
+        assert!(progress_rx.try_recv().is_err());
+
+        dispatch_event(
+            &json!({
+                "type": "message_delta",
+                "data": {
+                    "threadId": "thread-stage",
+                    "deltas": [
+                        {
+                            "type": "tool_output_set",
+                            "partIndex": 1,
+                            "state": "input-available",
+                            "output": null
+                        }
+                    ]
+                }
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+            &bridge_owned_assistant_messages,
+        )
+        .await;
 
         let progress = progress_rx
             .try_recv()
@@ -1970,8 +2256,34 @@ mod tests {
         let AlmaProgressEvent::ToolCall(tool_call) = progress else {
             panic!("expected tool-call progress");
         };
-        assert_eq!(tool_call.tool_name, "WebSearch");
-        assert_eq!(tool_call.parameters_text, r#"{"query":"alma onebot"}"#);
+        assert_eq!(tool_call.tool_name, "Bash");
+        assert_eq!(tool_call.parameters_text, r#"{"command":"echo alma"}"#);
+
+        dispatch_event(
+            &json!({
+                "type": "message_delta",
+                "data": {
+                    "threadId": "thread-stage",
+                    "deltas": [
+                        {
+                            "type": "tool_output_set",
+                            "partIndex": 1,
+                            "state": "output-available",
+                            "output": "alma\n"
+                        }
+                    ]
+                }
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+            &bridge_owned_assistant_messages,
+        )
+        .await;
+        assert!(progress_rx.try_recv().is_err());
 
         dispatch_event(
             &json!({

@@ -14,7 +14,7 @@ A bridge service that connects [Alma](https://github.com/anthropics/alma) to QQ 
 - **Group chat history**: The bridge injects recent group messages into context and writes logs under `~/.config/alma/groups`.
 - **Alma group CLI compatibility**: `alma group list/history/search/context` can read QQ group logs. Active QQ sends use bridge HTTP endpoints because `alma group send` targets Telegram.
 - **Rich message handling**: The bridge converts QQ face emojis to text, labels images/voice/video, and extracts forwarded message content.
-- **Reply and @mention**: Incoming quotes and outgoing reply references work. Group replies mention the sender.
+- **Reply and @mention**: Incoming quotes and outgoing reply references work. In QQ, the first visible bridge response for a turn carries the reply reference; group replies mention the sender.
 - **People Profiles**: The bridge creates Alma People Profile files for QQ users with `qq_id` and `telegram_id` frontmatter so Telegram-compatible Alma matching keeps working.
 - **Message splitting**: Long replies split by paragraph, then by QQ's 4500-character limit.
 - **Persistent state**: Turso stores thread mappings, user profiles, QQ group titles, and group card metadata.
@@ -132,7 +132,7 @@ api_timeout = 30
 [chat]
 group_history_size = 30        # Recent group messages for AI context (0 = disabled)
 # thinking_message = "思考中..."  # Optional message before AI generation
-show_tool_calls = false     # Show tool invocation status messages in QQ
+show_tool_calls = false        # Show tool invocation status messages in QQ after parameters are available
 segmented_replies = false      # Split replies by paragraphs when enabled
 ```
 
@@ -197,7 +197,7 @@ chooses the first available port starting at `18090`.
 | `chat.group_history_size` | `30` | Group history context size (0 = disabled) |
 | `chat.thinking_message` | *(none)* | Pre-generation indicator message |
 | `chat.show_thinking` | `false` | Send thinking blocks as separate QQ messages |
-| `chat.show_tool_calls` | `false` | Send `正在调用工具：...` status messages when Alma starts tool invocations |
+| `chat.show_tool_calls` | `false` | Send `正在调用工具：...` status messages after Alma tool parameters are available |
 | `chat.segmented_replies` | `false` | Split each assistant reply by paragraphs before QQ length chunking |
 
 ## How It Works
@@ -212,7 +212,7 @@ chooses the first available port starting at `18090`.
 6. Bridge finds or creates an Alma thread (keyed by `private:{user_id}` or `group:{group_id}`)
 7. Bridge sends `generate_response` via Alma WebSocket with sender identity and ephemeral context
 8. Alma processes with full pipeline (SOUL + Memory + People Profiles)
-9. Bridge sends visible text before tool calls as stage messages, optionally sends tool-call status messages, resets the generation idle timeout for the next stage, then sends the final remaining response back to QQ (with reply reference and @mention for groups)
+9. Bridge sends visible text before tool calls as stage messages, optionally sends tool-call status messages after parameters are available, resets the generation idle timeout for the next stage, and sends the final remaining response back to QQ. The first successfully sent visible stage/tool/final message carries the reply reference and group @mention.
 
 ### Bidirectional Sync (Alma GUI → QQ)
 

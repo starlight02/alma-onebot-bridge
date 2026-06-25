@@ -456,6 +456,19 @@ pub async fn process_message_event(
         }
     }
 
+    let user_message_id = event.message_id.map(|id| id.to_string());
+    let at_user_id = if is_group {
+        Some(user_id.to_string())
+    } else {
+        None
+    };
+    let reply_target = Arc::new(Mutex::new(user_message_id.clone().map(|reply_to_id| {
+        ReplyTarget {
+            reply_to_id,
+            at_user_id: at_user_id.clone(),
+        }
+    })));
+
     let (progress_tx, progress_rx) = channel::unbounded::<AlmaProgressEvent>();
     let sent_stage_prefix = Arc::new(Mutex::new(String::new()));
     let progress_forward_task = SmolRuntime::default().spawn(forward_alma_progress_events(
@@ -473,6 +486,7 @@ pub async fn process_message_event(
             segmented_replies,
             show_tool_calls,
             sent_stage_prefix: sent_stage_prefix.clone(),
+            reply_target: reply_target.clone(),
         },
     ));
 
@@ -587,13 +601,8 @@ pub async fn process_message_event(
         }
     }
 
-    let user_message_id = event.message_id.map(|id| id.to_string());
-    let at_user_id = if is_group {
-        Some(user_id.to_string())
-    } else {
-        None
-    };
-    send_assistant_text_to_qq(SendAssistantText {
+    let reply_target_snapshot = reply_target.lock().await.clone();
+    let final_send = send_assistant_text_to_qq(SendAssistantText {
         state,
         ws_tx,
         pending,
@@ -605,11 +614,16 @@ pub async fn process_message_event(
         is_group,
         group_id_value,
         segmented_replies,
-        reply_to_id: user_message_id.as_deref(),
-        at_user_id: at_user_id.as_deref(),
+        reply_to_id: reply_target_snapshot
+            .as_ref()
+            .map(|target| target.reply_to_id.as_str()),
+        at_user_id: reply_target_snapshot
+            .as_ref()
+            .and_then(|target| target.at_user_id.as_deref()),
         log_label: "Reply",
     })
     .await;
+    consume_reply_target_if_sent(&reply_target, final_send.reply_sent).await;
 
     Ok(())
 }
@@ -627,6 +641,20 @@ struct StageForwardContext {
     segmented_replies: bool,
     show_tool_calls: bool,
     sent_stage_prefix: Arc<Mutex<String>>,
+    reply_target: Arc<Mutex<Option<ReplyTarget>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ReplyTarget {
+    reply_to_id: String,
+    at_user_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SendTextResult {
+    any_sent: bool,
+    all_sent: bool,
+    reply_sent: bool,
 }
 
 async fn forward_alma_progress_events(
@@ -655,7 +683,8 @@ async fn forward_stage_text_event(stage: AlmaStageEvent, ctx: &StageForwardConte
         return;
     }
 
-    let (any_sent, all_sent) = send_assistant_text_to_qq(SendAssistantText {
+    let reply_target = ctx.reply_target.lock().await.clone();
+    let send_result = send_assistant_text_to_qq(SendAssistantText {
         state: &ctx.state,
         ws_tx: &ctx.ws_tx,
         pending: &ctx.pending,
@@ -667,13 +696,18 @@ async fn forward_stage_text_event(stage: AlmaStageEvent, ctx: &StageForwardConte
         is_group: ctx.is_group,
         group_id_value: ctx.group_id_value,
         segmented_replies: ctx.segmented_replies,
-        reply_to_id: None,
-        at_user_id: None,
+        reply_to_id: reply_target
+            .as_ref()
+            .map(|target| target.reply_to_id.as_str()),
+        at_user_id: reply_target
+            .as_ref()
+            .and_then(|target| target.at_user_id.as_deref()),
         log_label: "Stage",
     })
     .await;
+    consume_reply_target_if_sent(&ctx.reply_target, send_result.reply_sent).await;
 
-    if any_sent && all_sent {
+    if send_result.any_sent && send_result.all_sent {
         *ctx.sent_stage_prefix.lock().await = stage.visible_prefix;
     }
 }
@@ -684,18 +718,55 @@ async fn forward_tool_call_event(tool_call: AlmaToolCallEvent, ctx: &StageForwar
     }
 
     let text = format_tool_call_message(&tool_call);
+    let reply_target = ctx.reply_target.lock().await.clone();
+    let mut is_first = true;
+    let mut reply_sent = false;
+
     for chunk in split_text(&text, QQ_MSG_LIMIT) {
-        match send_text_message(
-            &ctx.ws_tx,
-            &ctx.pending,
-            &ctx.target_type,
-            ctx.target_id,
-            &chunk,
-            ctx.onebot_timeout,
-        )
-        .await
-        {
+        let mut sent_with_reply = false;
+        let result = if is_first {
+            is_first = false;
+            if let Some(target) = reply_target.as_ref() {
+                sent_with_reply = true;
+                send_reply_message(
+                    &ctx.ws_tx,
+                    &ctx.pending,
+                    &ctx.target_type,
+                    ctx.target_id,
+                    &chunk,
+                    &target.reply_to_id,
+                    target.at_user_id.as_deref(),
+                    ctx.onebot_timeout,
+                )
+                .await
+            } else {
+                send_text_message(
+                    &ctx.ws_tx,
+                    &ctx.pending,
+                    &ctx.target_type,
+                    ctx.target_id,
+                    &chunk,
+                    ctx.onebot_timeout,
+                )
+                .await
+            }
+        } else {
+            send_text_message(
+                &ctx.ws_tx,
+                &ctx.pending,
+                &ctx.target_type,
+                ctx.target_id,
+                &chunk,
+                ctx.onebot_timeout,
+            )
+            .await
+        };
+
+        match result {
             Ok(resp) => {
+                if sent_with_reply {
+                    reply_sent = true;
+                }
                 let msg_id = resp
                     .data
                     .as_ref()
@@ -714,6 +785,8 @@ async fn forward_tool_call_event(tool_call: AlmaToolCallEvent, ctx: &StageForwar
             }
         }
     }
+
+    consume_reply_target_if_sent(&ctx.reply_target, reply_sent).await;
 }
 
 fn format_tool_call_message(tool_call: &AlmaToolCallEvent) -> String {
@@ -721,6 +794,15 @@ fn format_tool_call_message(tool_call: &AlmaToolCallEvent) -> String {
         "正在调用工具：{}\n参数：{}",
         tool_call.tool_name, tool_call.parameters_text
     )
+}
+
+async fn consume_reply_target_if_sent(
+    reply_target: &Arc<Mutex<Option<ReplyTarget>>>,
+    reply_sent: bool,
+) {
+    if reply_sent {
+        *reply_target.lock().await = None;
+    }
 }
 
 struct SendAssistantText<'a> {
@@ -740,16 +822,19 @@ struct SendAssistantText<'a> {
     log_label: &'static str,
 }
 
-async fn send_assistant_text_to_qq(args: SendAssistantText<'_>) -> (bool, bool) {
+async fn send_assistant_text_to_qq(args: SendAssistantText<'_>) -> SendTextResult {
     let chunks = reply_chunks(args.text, args.segmented_replies);
     let mut is_first = true;
     let mut any_sent = false;
     let mut all_sent = true;
+    let mut reply_sent = false;
 
     for chunk in &chunks {
+        let mut sent_with_reply = false;
         let result = if is_first {
             is_first = false;
             if let Some(reply_id) = args.reply_to_id {
+                sent_with_reply = true;
                 send_reply_message(
                     args.ws_tx,
                     args.pending,
@@ -787,6 +872,9 @@ async fn send_assistant_text_to_qq(args: SendAssistantText<'_>) -> (bool, bool) 
         match result {
             Ok(resp) => {
                 any_sent = true;
+                if sent_with_reply {
+                    reply_sent = true;
+                }
                 args.state.register_sent_reply(args.thread_id, chunk).await;
                 let msg_id = resp
                     .data
@@ -824,7 +912,11 @@ async fn send_assistant_text_to_qq(args: SendAssistantText<'_>) -> (bool, bool) 
             .await;
     }
 
-    (any_sent, all_sent)
+    SendTextResult {
+        any_sent,
+        all_sent,
+        reply_sent,
+    }
 }
 
 fn reply_chunks(text: &str, segmented_replies: bool) -> Vec<String> {
@@ -1672,25 +1764,31 @@ async fn download_media_as_file_part(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_recent_chat_history_context, build_telegram_like_channel_system_context,
-        build_telegram_like_message_text, cleaned_command_for_group, download_media_as_file_part,
-        resolve_thread_for_session, retry_delay_ms, single_line_preview, split_text,
-        truncate_with_ellipsis,
+        ReplyTarget, SendAssistantText, build_recent_chat_history_context,
+        build_telegram_like_channel_system_context, build_telegram_like_message_text,
+        cleaned_command_for_group, consume_reply_target_if_sent, download_media_as_file_part,
+        resolve_thread_for_session, retry_delay_ms, send_assistant_text_to_qq, single_line_preview,
+        split_text, truncate_with_ellipsis,
     };
     use crate::alma_ws::normalize_assistant_text;
     use crate::config::Config;
+    use crate::onebot::{PendingCalls, try_resolve_api_response};
     use crate::state::SharedState;
     use futures_lite::{AsyncReadExt, AsyncWriteExt};
     use macro_rules_attribute::apply;
+    use serde_json::json;
     use smol::channel;
+    use smol::lock::Mutex;
     use smol::net::TcpListener;
     use smol_macros::test;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use trillium_client::Client;
     use trillium_rustls::{RustlsClientConfig, RustlsConfig};
     use trillium_smol::ClientConfig as SmolClientConfig;
     use trillium_smol::SmolRuntime;
+    use trillium_websockets::Message;
 
     fn temp_db_path(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1961,12 +2059,114 @@ mod tests {
         assert!(ctx.contains("did not include a valid QQ group id"));
     }
 
+    #[apply(test!)]
+    async fn first_visible_bridge_message_consumes_reply_reference() {
+        let db_path = temp_db_path("first-visible-reply");
+        let mut config = Config::load();
+        config.db_path = db_path.clone();
+        let state = SharedState::new(config).await.unwrap();
+
+        let (ws_tx, ws_rx) = channel::unbounded::<Message>();
+        let pending = PendingCalls::new();
+        let pending_for_responder = pending.clone();
+
+        let responder = SmolRuntime::default().spawn(async move {
+            for (index, expected_reply) in [true, false].into_iter().enumerate() {
+                let message = ws_rx.recv().await.unwrap();
+                let Message::Text(text) = message else {
+                    panic!("expected text API request");
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(request["action"], "send_msg");
+
+                let segments = request["params"]["message"].as_array().unwrap();
+                if expected_reply {
+                    assert_eq!(segments[0]["type"], "reply");
+                    assert_eq!(segments[0]["data"]["id"], "msg-100");
+                    assert_eq!(segments[1]["type"], "at");
+                    assert_eq!(segments[1]["data"]["qq"], "42");
+                    assert_eq!(segments[2]["type"], "text");
+                } else {
+                    assert_eq!(segments[0]["type"], "text");
+                }
+
+                let echo = request["echo"].as_str().unwrap();
+                let response = json!({
+                    "status": "ok",
+                    "retcode": 0,
+                    "echo": echo,
+                    "data": {"message_id": 9000 + index}
+                });
+                try_resolve_api_response(&response, &pending_for_responder)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let reply_target = Arc::new(Mutex::new(Some(ReplyTarget {
+            reply_to_id: "msg-100".to_string(),
+            at_user_id: Some("42".to_string()),
+        })));
+
+        let first_snapshot = reply_target.lock().await.clone();
+        let first_send = send_assistant_text_to_qq(SendAssistantText {
+            state: &state,
+            ws_tx: &ws_tx,
+            pending: &pending,
+            thread_id: "thread-first-visible",
+            target_type: "group",
+            target_id: 706968284,
+            text: "阶段文本",
+            onebot_timeout: 5,
+            is_group: true,
+            group_id_value: 706968284,
+            segmented_replies: false,
+            reply_to_id: first_snapshot
+                .as_ref()
+                .map(|target| target.reply_to_id.as_str()),
+            at_user_id: first_snapshot
+                .as_ref()
+                .and_then(|target| target.at_user_id.as_deref()),
+            log_label: "TestStage",
+        })
+        .await;
+        assert!(first_send.reply_sent);
+        consume_reply_target_if_sent(&reply_target, first_send.reply_sent).await;
+        assert!(reply_target.lock().await.is_none());
+
+        let second_snapshot = reply_target.lock().await.clone();
+        let second_send = send_assistant_text_to_qq(SendAssistantText {
+            state: &state,
+            ws_tx: &ws_tx,
+            pending: &pending,
+            thread_id: "thread-first-visible",
+            target_type: "group",
+            target_id: 706968284,
+            text: "最终文本",
+            onebot_timeout: 5,
+            is_group: true,
+            group_id_value: 706968284,
+            segmented_replies: false,
+            reply_to_id: second_snapshot
+                .as_ref()
+                .map(|target| target.reply_to_id.as_str()),
+            at_user_id: second_snapshot
+                .as_ref()
+                .and_then(|target| target.at_user_id.as_deref()),
+            log_label: "TestReply",
+        })
+        .await;
+        assert!(!second_send.reply_sent);
+
+        responder.await;
+        let _ = std::fs::remove_file(db_path);
+    }
+
     /// Regression: one `generate_response` must not also forward the same turn via
     /// `message_updated` (see bridge.log 2026-06-25 06:21–06:22).
     #[apply(test!)]
     async fn handle_alma_event_dedups_preregistered_pipeline_reply() {
         use crate::alma_ws::AlmaEvent;
-        use crate::onebot::PendingCalls;
 
         let db_path = temp_db_path("dedup-handle-alma");
         let mut config = Config::load();

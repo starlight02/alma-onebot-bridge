@@ -187,6 +187,11 @@ each emitted stage/tool-call progress event resets the wait window for the next
 stage, because tool execution can legitimately take longer than one initial
 request window.
 
+Alma streams tool parameters after the initial tool `part_add`: the bridge tracks
+assistant part indexes locally, accumulates `tool_input_append` deltas, and emits
+optional `chat.show_tool_calls` status only after the parameters are available or
+the tool state leaves `input-streaming`.
+
 #### `<think>...</think>` Blocks
 
 Some models emit thinking blocks in accumulated text. The bridge strips these with
@@ -635,7 +640,7 @@ port = 8090
 [alma]
 api = "http://localhost:23001"
 model = "anthropic:claude-sonnet-4-20250514"  # Override Alma's default model
-timeout = 120                                  # Generation idle timeout in seconds; resets after each stage text
+timeout = 120                                  # Generation idle timeout in seconds; resets after each stage/tool-call progress event
 max_retries = 2                                # Retry attempts for failed generations
 retry_delay_ms = 3000                          # Base delay between retries (exponential backoff)
 
@@ -652,7 +657,7 @@ api_timeout = 30
 [chat]
 group_history_size = 30        # Number of recent group messages for context (0 = disabled)
 # thinking_message = "思考中..."  # Optional message sent before AI generation starts
-show_tool_calls = false     # Show tool invocation status messages in QQ
+show_tool_calls = false     # Show tool invocation status messages in QQ after parameters are available
 segmented_replies = false      # Split replies by paragraphs when enabled
 ```
 
@@ -683,7 +688,7 @@ The macOS app starts the bridge in `~/.config/alma/bridge`, so the GUI-managed
 | `chat.group_history_size` | `30` | Number of recent group messages for context (0 = disabled) |
 | `chat.thinking_message` | *(none)* | Optional "thinking" message sent before generation |
 | `chat.show_thinking` | `false` | Send thinking blocks as separate QQ messages |
-| `chat.show_tool_calls` | `false` | Send `正在调用工具：...` status messages when Alma starts tool invocations |
+| `chat.show_tool_calls` | `false` | Send `正在调用工具：...` status messages after Alma tool parameters are available |
 | `chat.segmented_replies` | `false` | Split each assistant reply by paragraphs before QQ length chunking |
 
 ### Model Priority
@@ -1187,10 +1192,11 @@ Built-in bridges always reply to the triggering user message:
 The QQ bridge additionally includes an `at` segment in group replies to @mention the
 triggering user, ensuring they receive a notification. Private chats omit the `at` segment.
 
-Only the first final-reply chunk includes the reply reference (and @mention). Stage
-messages sent before tool calls are plain messages, matching Alma's built-in Telegram
-bridge. `chat.segmented_replies=true` restores paragraph-level splitting; otherwise a
-reply is only split when it exceeds QQ's message length limit.
+Only the first successfully sent visible message in a bridge-owned turn includes the
+reply reference (and group @mention). That message can be a stage message, a tool-call
+status message, or the final reply. Later chunks and later progress/final messages are
+plain messages. `chat.segmented_replies=true` restores paragraph-level splitting;
+otherwise a reply is only split when it exceeds QQ's message length limit.
 
 ### 8.8 Outgoing Routing and Local Bridge Mapping
 
