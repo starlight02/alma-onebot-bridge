@@ -540,7 +540,7 @@ impl SharedState {
         let mut map = self.sent_replies.write().await;
         if let Some(deque) = map.get_mut(thread_id) {
             while let Some(front) = deque.front() {
-                if front.sent_at.elapsed() > Duration::from_secs(15) {
+                if front.sent_at.elapsed() > Duration::from_secs(120) {
                     deque.pop_front();
                 } else {
                     break;
@@ -844,7 +844,7 @@ fn normalize_timestamp(timestamp_secs: u64) -> u64 {
 }
 
 fn sent_reply_matches(sent: &str, candidate: &str) -> bool {
-    sent == candidate
+    crate::alma_ws::visible_assistant_text_matches_for_dedup(sent, candidate)
 }
 
 #[cfg(test)]
@@ -877,6 +877,32 @@ mod tests {
         let text = "这是一个足够长的回复，用来验证前缀匹配在长文本场景下仍然有效，而且不会被 UTF-8 截断搞坏。";
         let prefix_equivalent = "这是一个足够长的回复，用来验证前缀匹配在长文本场景下仍然有效，而且不会被 UTF-8 截断搞坏。后续补充";
         assert!(!sent_reply_matches(text, prefix_equivalent));
+    }
+
+    #[test]
+    fn sent_reply_matches_normalized_whitespace_and_breaks() {
+        assert!(sent_reply_matches(
+            "line one\nline two",
+            "line one<br/>line two"
+        ));
+    }
+
+    /// Reproduces log case: pipeline registers sanitize'd text; Alma WS sends
+    /// `message_updated` with `<br/>` — must still dedup (835 vs 836 char class).
+    #[tokio::test]
+    async fn was_sent_recently_matches_after_normalize_mismatch() {
+        let db_path = temp_db_path("dedup-normalize");
+        let mut config = Config::load();
+        config.db_path = db_path.clone();
+        let state = SharedState::new(config).await.unwrap();
+
+        state.register_sent_reply("thread-dedup", "A\n\nB").await;
+        assert!(
+            state.was_sent_recently("thread-dedup", "A<br/>B").await,
+            "message_updated text must match preregistered pipeline reply"
+        );
+
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[tokio::test]

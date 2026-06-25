@@ -725,7 +725,7 @@ final class ConfigManager: ObservableObject {
         do {
             let content = try String(contentsOf: configFileURL, encoding: .utf8)
             let toml = try TOMLTable(string: content)
-            applyTOML(toml)
+            model = model(from: toml)
             lastError = nil
         } catch {
             lastError = .loadConfigFailed(reason: error.localizedDescription)
@@ -771,7 +771,7 @@ final class ConfigManager: ObservableObject {
             throw ConfigError.writeFailed(error.localizedDescription)
         }
 
-        model.copyValues(from: editing)
+        model = editing.copy()
         lastSaveTime = Date()
         lastError = nil
 
@@ -984,32 +984,36 @@ final class ConfigManager: ObservableObject {
 
     // MARK: TOML parsing
 
-    private func applyTOML(_ t: TOMLTable) {
-        if let b = t["bridge"] as? TOMLTable {
-            if let v = b["port"] as? Int { model.bridgePort = "\(v)" }
+    private func model(from t: TOMLTable) -> ConfigModel {
+        let loaded = ConfigModel()
+
+        if let b = t["bridge"]?.table {
+            if let v = b["port"]?.int { loaded.bridgePort = "\(v)" }
         }
-        if let a = t["alma"] as? TOMLTable {
-            if let v = a["api"] as? String { model.almaApi = v }
-            if let v = a["model"] as? String { model.almaModel = v }
-            if let v = a["timeout"] as? Int { model.almaTimeout = "\(v)" }
-            if let v = a["max_retries"] as? Int { model.almaMaxRetries = "\(v)" }
-            if let v = a["retry_delay_ms"] as? Int { model.almaRetryDelayMs = "\(v)" }
+        if let a = t["alma"]?.table {
+            if let v = a["api"]?.string { loaded.almaApi = v }
+            if let v = a["model"]?.string { loaded.almaModel = v }
+            if let v = a["timeout"]?.int { loaded.almaTimeout = "\(v)" }
+            if let v = a["max_retries"]?.int { loaded.almaMaxRetries = "\(v)" }
+            if let v = a["retry_delay_ms"]?.int { loaded.almaRetryDelayMs = "\(v)" }
         }
-        if let o = t["onebot"] as? TOMLTable {
-            if let v = o["api_timeout"] as? Int { model.onebotApiTimeout = "\(v)" }
-            if let v = o["access_token"] as? String { model.accessToken = v }
+        if let o = t["onebot"]?.table {
+            if let v = o["api_timeout"]?.int { loaded.onebotApiTimeout = "\(v)" }
+            if let v = o["access_token"]?.string { loaded.accessToken = v }
         }
-        if let c = t["chat"] as? TOMLTable {
-            if let v = c["group_history_size"] as? Int { model.groupHistorySize = "\(v)" }
-            if let v = c["thinking_message"] as? String { model.thinkingMessage = v }
-            if let v = c["show_thinking"] as? Bool { model.showThinking = v }
+        if let c = t["chat"]?.table {
+            if let v = c["group_history_size"]?.int { loaded.groupHistorySize = "\(v)" }
+            if let v = c["thinking_message"]?.string { loaded.thinkingMessage = v }
+            if let v = c["show_thinking"]?.bool { loaded.showThinking = v }
         }
-        if let d = t["database"] as? TOMLTable {
-            if let v = d["path"] as? String { model.dbPath = v }
+        if let d = t["database"]?.table {
+            if let v = d["path"]?.string { loaded.dbPath = v }
         }
-        if let p = t["people"] as? TOMLTable {
-            if let v = p["dir"] as? String { model.peopleDir = v }
+        if let p = t["people"]?.table {
+            if let v = p["dir"]?.string { loaded.peopleDir = v }
         }
+
+        return loaded
     }
 
     // MARK: TOML generation

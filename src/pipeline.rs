@@ -83,6 +83,13 @@ pub async fn process_message_event(
     let user_id = event
         .user_id
         .ok_or_else(|| "OneBot message event missing user_id".to_string())?;
+    if user_id == bot_id {
+        debug!(
+            "[Message] Ignoring bot's own QQ message (echo), msg_id={:?}",
+            event.message_id
+        );
+        return Ok(());
+    }
     let group_id = if is_group {
         Some(
             event
@@ -489,6 +496,11 @@ pub async fn process_message_event(
         }
     };
     let reply = crate::alma_ws::sanitize_visible_assistant_text(&reply);
+    // Register the full reply before any QQ send so Alma `message_updated` cannot
+    // race through and duplicate the same assistant turn via Alma→QQ forwarding.
+    if !reply.is_empty() {
+        state.register_sent_reply(&thread_id, &reply).await;
+    }
     let thinking = thinking
         .map(|t| {
             crate::alma_ws::normalize_assistant_text(&t)
@@ -875,15 +887,17 @@ pub async fn handle_alma_event(
         }
     };
 
-    // Dedup: skip if we already sent this text ourselves
+    let forward_text = crate::alma_ws::sanitize_visible_assistant_text(&event.message_text);
+
+    // Dedup: skip if the bridge pipeline already delivered this assistant turn to QQ.
     if state
-        .was_sent_recently(&event.thread_id, &event.message_text)
+        .was_sent_recently(&event.thread_id, &forward_text)
         .await
     {
         info!(
-            "[Alma→QQ] Dedup hit for thread {} (exact sent reply match, {} chars)",
+            "[Alma→QQ] Dedup hit for thread {} (bridge already sent this reply, {} chars)",
             event.thread_id,
-            event.message_text.len()
+            forward_text.len()
         );
         return Ok(());
     }
@@ -893,7 +907,7 @@ pub async fn handle_alma_event(
         target.target_type,
         target.target_id,
         event.thread_id,
-        event.message_text.len()
+        forward_text.len()
     );
 
     if show_thinking
@@ -918,12 +932,12 @@ pub async fn handle_alma_event(
         }
     }
 
-    if event.message_text.is_empty() {
+    if forward_text.is_empty() {
         return Ok(());
     }
 
     // Forward the Alma GUI assistant message to QQ
-    let chunks = split_text(&event.message_text, QQ_MSG_LIMIT);
+    let chunks = split_text(&forward_text, QQ_MSG_LIMIT);
     let mut any_chunk_sent = false;
     let mut all_chunks_sent = true;
     for chunk in &chunks {
@@ -971,7 +985,7 @@ pub async fn handle_alma_event(
     }
     if any_chunk_sent && all_chunks_sent {
         state
-            .register_sent_reply(&event.thread_id, &event.message_text)
+            .register_sent_reply(&event.thread_id, &forward_text)
             .await;
     }
 
@@ -1710,5 +1724,46 @@ mod tests {
 
         assert!(!ctx.contains("chatId: 0"));
         assert!(ctx.contains("did not include a valid QQ group id"));
+    }
+
+    /// Regression: one `generate_response` must not also forward the same turn via
+    /// `message_updated` (see bridge.log 2026-06-25 06:21–06:22).
+    #[tokio::test]
+    async fn handle_alma_event_dedups_preregistered_pipeline_reply() {
+        use crate::alma_ws::AlmaEvent;
+        use crate::onebot::PendingCalls;
+        use tokio::sync::mpsc;
+
+        let db_path = temp_db_path("dedup-handle-alma");
+        let mut config = Config::load();
+        config.db_path = db_path.clone();
+        let state = SharedState::new(config).await.unwrap();
+        state
+            .set_thread_id(
+                "group:540730311".to_string(),
+                "thread-regression".to_string(),
+            )
+            .await
+            .unwrap();
+
+        state
+            .register_sent_reply("thread-regression", "段落一\n\n段落二")
+            .await;
+
+        let event = AlmaEvent {
+            event_type: "message_updated".to_string(),
+            thread_id: "thread-regression".to_string(),
+            message_role: "assistant".to_string(),
+            message_text: "段落一<br/>段落二".to_string(),
+            thinking_text: None,
+        };
+
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel();
+        let pending = PendingCalls::new();
+        super::handle_alma_event(&event, &state, &ws_tx, &pending)
+            .await
+            .expect("dedup should succeed without calling OneBot");
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

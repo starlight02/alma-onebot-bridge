@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -36,6 +36,10 @@ pub struct AlmaEvent {
 
 /// Tracks a single in-flight generation request.
 struct PendingGeneration {
+    /// Local bridge-owned generation id. Alma does not currently echo a request
+    /// id in stream events, so this protects timeout cleanup from removing a
+    /// newer retry's pending slot.
+    generation_id: u64,
     /// Accumulated assistant text (text_append with partType "text")
     text: String,
     /// User message ID captured from message_added event (for retry support)
@@ -52,9 +56,13 @@ type PendingMap = Arc<Mutex<HashMap<String, PendingGeneration>>>;
 
 /// Per-thread mutex to serialize generate() calls for the same thread.
 type GenerationGuards = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+type BridgeSuppressions = Arc<Mutex<HashMap<String, Instant>>>;
 
 const RECENT_BRIDGE_GENERATION_TTL: Duration = Duration::from_secs(30);
 const RECENT_BRIDGE_GENERATION_LIMIT: usize = 8;
+const STOP_GENERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+const STOP_GENERATION_DRAIN_POLL: Duration = Duration::from_millis(100);
+const STALE_BRIDGE_GENERATION_SUPPRESSION_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
 struct RecentBridgeGeneration {
@@ -73,6 +81,11 @@ pub struct AlmaWsClient {
     event_rx: Arc<Mutex<mpsc::UnboundedReceiver<AlmaEvent>>>,
     /// Per-thread guards to serialize generate() calls
     guards: GenerationGuards,
+    /// Monotonic local id for bridge-owned generation attempts.
+    generation_seq: Arc<AtomicU64>,
+    /// Threads with bridge-owned generation activity whose Alma updates should
+    /// not be treated as GUI-authored outbound messages.
+    bridge_suppressions: BridgeSuppressions,
     /// Current transport state. The client object survives reconnects.
     connected: Arc<AtomicBool>,
 }
@@ -104,6 +117,8 @@ impl AlmaWsClient {
 
         // Per-thread generation guards
         let guards: GenerationGuards = Arc::new(Mutex::new(HashMap::new()));
+        let generation_seq = Arc::new(AtomicU64::new(1));
+        let bridge_suppressions: BridgeSuppressions = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
 
         tokio::spawn(connection_supervisor(
@@ -112,6 +127,7 @@ impl AlmaWsClient {
             ws_rx,
             pending.clone(),
             event_tx,
+            bridge_suppressions.clone(),
             connected.clone(),
         ));
 
@@ -120,6 +136,8 @@ impl AlmaWsClient {
             pending,
             event_rx: Arc::new(Mutex::new(event_rx)),
             guards,
+            generation_seq,
+            bridge_suppressions,
             connected,
         })
     }
@@ -160,6 +178,7 @@ impl AlmaWsClient {
         }
 
         let (tx, rx) = oneshot::channel();
+        let generation_id = self.generation_seq.fetch_add(1, Ordering::Relaxed);
 
         // Register this generation request
         {
@@ -177,6 +196,7 @@ impl AlmaWsClient {
             map.insert(
                 thread_id.to_string(),
                 PendingGeneration {
+                    generation_id,
                     text: String::new(),
                     user_message_id: None,
                     empty_response_grace_started: false,
@@ -184,7 +204,8 @@ impl AlmaWsClient {
                 },
             );
             debug!(
-                "[AlmaWS] Registered pending generation for thread {} (pending count: {})",
+                "[AlmaWS] Registered pending generation {} for thread {} (pending count: {})",
+                generation_id,
                 thread_id,
                 map.len()
             );
@@ -228,21 +249,60 @@ impl AlmaWsClient {
         );
 
         if let Err(e) = self.ws_tx.send(Message::Text(request.to_string().into())) {
-            self.pending.lock().await.remove(thread_id);
+            remove_pending_generation_if_matches(&self.pending, thread_id, generation_id).await;
             return Err(format!("WebSocket send failed: {}", e));
         }
 
         debug!("[AlmaWS] generate_response sent, awaiting result...");
+        remember_bridge_activity(
+            &self.bridge_suppressions,
+            thread_id,
+            Duration::from_secs(timeout_secs)
+                .saturating_add(STOP_GENERATION_DRAIN_TIMEOUT)
+                .saturating_add(RECENT_BRIDGE_GENERATION_TTL),
+        )
+        .await;
 
         // Wait for the response with timeout
         let generation_result = match timeout(Duration::from_secs(timeout_secs), rx).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                remember_bridge_activity(
+                    &self.bridge_suppressions,
+                    thread_id,
+                    RECENT_BRIDGE_GENERATION_TTL,
+                )
+                .await;
+                result
+            }
             Ok(Err(_)) => {
-                self.pending.lock().await.remove(thread_id);
+                remove_pending_generation_if_matches(&self.pending, thread_id, generation_id).await;
                 Err("Generation channel closed unexpectedly".to_string())
             }
             Err(_) => {
-                self.pending.lock().await.remove(thread_id);
+                warn!(
+                    "[AlmaWS] Generation {} for thread {} timed out after {}s; sending stop_generation before retry",
+                    generation_id, thread_id, timeout_secs
+                );
+                request_stop_generation(&self.ws_tx, thread_id);
+                remember_bridge_activity(
+                    &self.bridge_suppressions,
+                    thread_id,
+                    STALE_BRIDGE_GENERATION_SUPPRESSION_TTL,
+                )
+                .await;
+                if wait_for_generation_drain(&self.pending, thread_id, generation_id).await {
+                    info!(
+                        "[AlmaWS] Stale generation {} for thread {} drained after stop_generation",
+                        generation_id, thread_id
+                    );
+                } else {
+                    warn!(
+                        "[AlmaWS] Stale generation {} for thread {} did not drain after stop_generation; dropping local pending slot",
+                        generation_id, thread_id
+                    );
+                    remove_pending_generation_if_matches(&self.pending, thread_id, generation_id)
+                        .await;
+                }
                 Err(format!("Generation timed out after {}s", timeout_secs))
             }
         };
@@ -271,6 +331,7 @@ async fn connection_supervisor(
     mut outbound_rx: mpsc::UnboundedReceiver<Message>,
     pending: PendingMap,
     event_tx: mpsc::UnboundedSender<AlmaEvent>,
+    bridge_suppressions: BridgeSuppressions,
     connected: Arc<AtomicBool>,
 ) {
     let mut reconnect_attempt: u32 = 0;
@@ -309,7 +370,15 @@ async fn connection_supervisor(
         };
 
         connected.store(true, Ordering::SeqCst);
-        if !run_connected_session(ws_stream, &mut outbound_rx, &pending, &event_tx).await {
+        if !run_connected_session(
+            ws_stream,
+            &mut outbound_rx,
+            &pending,
+            &event_tx,
+            &bridge_suppressions,
+        )
+        .await
+        {
             connected.store(false, Ordering::SeqCst);
             break;
         }
@@ -331,6 +400,7 @@ async fn run_connected_session(
     outbound_rx: &mut mpsc::UnboundedReceiver<Message>,
     pending: &PendingMap,
     event_tx: &mpsc::UnboundedSender<AlmaEvent>,
+    bridge_suppressions: &BridgeSuppressions,
 ) -> bool {
     let (mut sink, mut stream) = ws_stream.split();
     let mut generating_threads: HashSet<String> = HashSet::new();
@@ -379,6 +449,7 @@ async fn run_connected_session(
                             &mut generating_threads,
                             &mut pending_assistant_updates,
                             &mut recent_bridge_generations,
+                            bridge_suppressions,
                         )
                         .await;
                     }
@@ -411,6 +482,61 @@ async fn fail_pending_generations(pending: &PendingMap, reason: &str) {
             "Pending generation for thread {} failed: {}",
             thread_id, reason
         );
+    }
+}
+
+fn request_stop_generation(ws_tx: &mpsc::UnboundedSender<Message>, thread_id: &str) {
+    let request = json!({
+        "type": "stop_generation",
+        "data": { "threadId": thread_id }
+    });
+    if let Err(e) = ws_tx.send(Message::Text(request.to_string().into())) {
+        warn!(
+            "[AlmaWS] Failed to send stop_generation for thread {}: {}",
+            thread_id, e
+        );
+    }
+}
+
+async fn wait_for_generation_drain(
+    pending: &PendingMap,
+    thread_id: &str,
+    generation_id: u64,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        {
+            let map = pending.lock().await;
+            let still_pending = map
+                .get(thread_id)
+                .map(|pg| pg.generation_id == generation_id)
+                .unwrap_or(false);
+            if !still_pending {
+                return true;
+            }
+        }
+
+        if start.elapsed() >= STOP_GENERATION_DRAIN_TIMEOUT {
+            return false;
+        }
+        tokio::time::sleep(STOP_GENERATION_DRAIN_POLL).await;
+    }
+}
+
+async fn remove_pending_generation_if_matches(
+    pending: &PendingMap,
+    thread_id: &str,
+    generation_id: u64,
+) -> Option<PendingGeneration> {
+    let mut map = pending.lock().await;
+    let should_remove = map
+        .get(thread_id)
+        .map(|pg| pg.generation_id == generation_id)
+        .unwrap_or(false);
+    if should_remove {
+        map.remove(thread_id)
+    } else {
+        None
     }
 }
 
@@ -536,7 +662,10 @@ fn remember_bridge_generation(
     thread_id: &str,
     text: Option<String>,
 ) {
-    let Some(text) = text.filter(|text| !text.is_empty()) else {
+    let Some(text) = text
+        .map(|text| canonical_visible_assistant_text_for_dedup(&text))
+        .filter(|text| !text.is_empty())
+    else {
         return;
     };
 
@@ -550,7 +679,7 @@ fn remember_bridge_generation(
     }
 }
 
-fn is_recent_bridge_generation(
+fn is_recent_bridge_generation_update(
     recent: &mut HashMap<String, VecDeque<RecentBridgeGeneration>>,
     thread_id: &str,
     text: &str,
@@ -567,7 +696,42 @@ fn is_recent_bridge_generation(
         }
     }
 
-    deque.iter().any(|generation| generation.text == text)
+    let candidate = canonical_visible_assistant_text_for_dedup(text);
+    if candidate.is_empty() {
+        return false;
+    }
+
+    deque.iter().any(|generation| {
+        generation.text == candidate || is_generation_text_overlap(&generation.text, &candidate)
+    })
+}
+
+fn is_generation_text_overlap(completed: &str, candidate: &str) -> bool {
+    let min_len = completed.len().min(candidate.len());
+    min_len >= 80 && (completed.starts_with(candidate) || candidate.starts_with(completed))
+}
+
+async fn remember_bridge_activity(
+    bridge_suppressions: &BridgeSuppressions,
+    thread_id: &str,
+    ttl: Duration,
+) {
+    let suppress_until = Instant::now() + ttl;
+    let mut map = bridge_suppressions.lock().await;
+    let entry = map.entry(thread_id.to_string()).or_insert(suppress_until);
+    if *entry < suppress_until {
+        *entry = suppress_until;
+    }
+}
+
+async fn is_bridge_activity_suppressed(
+    bridge_suppressions: &BridgeSuppressions,
+    thread_id: &str,
+) -> bool {
+    let now = Instant::now();
+    let mut map = bridge_suppressions.lock().await;
+    map.retain(|_, suppress_until| *suppress_until > now);
+    map.contains_key(thread_id)
 }
 
 /// Dispatch a parsed WebSocket event to pending generations and/or event channel.
@@ -578,6 +742,7 @@ async fn dispatch_event(
     generating_threads: &mut HashSet<String>,
     pending_assistant_updates: &mut HashMap<String, AlmaEvent>,
     recent_bridge_generations: &mut HashMap<String, VecDeque<RecentBridgeGeneration>>,
+    bridge_suppressions: &BridgeSuppressions,
 ) {
     let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let data = match msg.get("data") {
@@ -655,6 +820,14 @@ async fn dispatch_event(
                 generating_threads.remove(thread_id);
                 let (had_pending_generation, _, completed_text) =
                     complete_pending_or_start_empty_grace(pending, thread_id).await;
+                if had_pending_generation {
+                    remember_bridge_activity(
+                        bridge_suppressions,
+                        thread_id,
+                        RECENT_BRIDGE_GENERATION_TTL,
+                    )
+                    .await;
+                }
                 remember_bridge_generation(recent_bridge_generations, thread_id, completed_text);
 
                 if let Some(event) = pending_assistant_updates.remove(thread_id) {
@@ -687,19 +860,64 @@ async fn dispatch_event(
                 .to_string();
 
             let mut map = pending.lock().await;
-            if let Some(pg) = map.remove(thread_id) {
+            let had_pending_generation = if let Some(pg) = map.remove(thread_id) {
                 error!(
                     "[AlmaWS] Generation error for thread {}: {}",
                     thread_id, error_msg
                 );
                 let _ = pg.result_tx.send(Err(error_msg));
+                true
             } else {
                 warn!(
                     "[AlmaWS] Generation error for thread {} — no pending: {}",
                     thread_id, error_msg
                 );
-            }
+                false
+            };
             drop(map);
+            if had_pending_generation {
+                remember_bridge_activity(
+                    bridge_suppressions,
+                    thread_id,
+                    STALE_BRIDGE_GENERATION_SUPPRESSION_TTL,
+                )
+                .await;
+            }
+
+            generating_threads.remove(thread_id);
+            pending_assistant_updates.remove(thread_id);
+        }
+
+        "generation_stopped" => {
+            let thread_id = match data
+                .get("threadId")
+                .or_else(|| data.get("id"))
+                .and_then(|t| t.as_str())
+            {
+                Some(id) => id,
+                None => return,
+            };
+
+            let mut map = pending.lock().await;
+            let had_pending_generation = if let Some(pg) = map.remove(thread_id) {
+                info!(
+                    "[AlmaWS] Generation stopped for thread {} (generation={})",
+                    thread_id, pg.generation_id
+                );
+                let _ = pg.result_tx.send(Err("Generation stopped".to_string()));
+                true
+            } else {
+                false
+            };
+            drop(map);
+            if had_pending_generation {
+                remember_bridge_activity(
+                    bridge_suppressions,
+                    thread_id,
+                    STALE_BRIDGE_GENERATION_SUPPRESSION_TTL,
+                )
+                .await;
+            }
 
             generating_threads.remove(thread_id);
             pending_assistant_updates.remove(thread_id);
@@ -778,7 +996,7 @@ async fn dispatch_event(
                 }
 
                 if role == "assistant"
-                    && is_recent_bridge_generation(
+                    && is_recent_bridge_generation_update(
                         recent_bridge_generations,
                         &thread_id,
                         &event.message_text,
@@ -786,6 +1004,16 @@ async fn dispatch_event(
                 {
                     debug!(
                         "[AlmaWS] message_updated: suppressing post-completion update for bridge-owned generation in thread {}",
+                        thread_id
+                    );
+                    return;
+                }
+
+                if role == "assistant"
+                    && is_bridge_activity_suppressed(bridge_suppressions, &thread_id).await
+                {
+                    debug!(
+                        "[AlmaWS] message_updated: suppressing assistant update in bridge-owned generation window for thread {}",
                         thread_id
                     );
                     return;
@@ -838,6 +1066,14 @@ async fn dispatch_event(
                 generating_threads.remove(thread_id);
                 let (had_pending_generation, _, completed_text) =
                     complete_pending_or_start_empty_grace(pending, thread_id).await;
+                if had_pending_generation {
+                    remember_bridge_activity(
+                        bridge_suppressions,
+                        thread_id,
+                        RECENT_BRIDGE_GENERATION_TTL,
+                    )
+                    .await;
+                }
                 remember_bridge_generation(recent_bridge_generations, thread_id, completed_text);
                 if let Some(event) = pending_assistant_updates.remove(thread_id) {
                     if had_pending_generation {
@@ -1023,14 +1259,31 @@ pub(crate) fn sanitize_visible_assistant_text(text: &str) -> String {
     clean.trim().to_string()
 }
 
+pub(crate) fn canonical_visible_assistant_text_for_dedup(text: &str) -> String {
+    sanitize_visible_assistant_text(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) fn visible_assistant_text_matches_for_dedup(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+
+    let left = canonical_visible_assistant_text_for_dedup(left);
+    let right = canonical_visible_assistant_text_for_dedup(right);
+    !left.is_empty() && left == right
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         PendingGeneration, PendingMap, dispatch_event, extract_think_blocks,
         normalize_assistant_text, sanitize_visible_assistant_text,
     };
-    use futures_util::StreamExt;
-    use serde_json::json;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1039,6 +1292,10 @@ mod tests {
     use tokio::time::timeout;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    fn bridge_suppressions() -> super::BridgeSuppressions {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     #[test]
     fn normalizes_html_breaks_and_separates_thinking() {
@@ -1090,6 +1347,7 @@ mod tests {
         pending.lock().await.insert(
             "thread-1".to_string(),
             PendingGeneration {
+                generation_id: 1,
                 text: String::new(),
                 user_message_id: Some("user-msg-1".to_string()),
                 empty_response_grace_started: false,
@@ -1101,6 +1359,7 @@ mod tests {
         let mut generating_threads = HashSet::from(["thread-1".to_string()]);
         let mut pending_assistant_updates = HashMap::new();
         let mut recent_bridge_generations = HashMap::new();
+        let bridge_suppressions = bridge_suppressions();
 
         dispatch_event(
             &json!({
@@ -1112,6 +1371,7 @@ mod tests {
             &mut generating_threads,
             &mut pending_assistant_updates,
             &mut recent_bridge_generations,
+            &bridge_suppressions,
         )
         .await;
 
@@ -1127,6 +1387,7 @@ mod tests {
             &mut generating_threads,
             &mut pending_assistant_updates,
             &mut recent_bridge_generations,
+            &bridge_suppressions,
         )
         .await;
 
@@ -1145,6 +1406,7 @@ mod tests {
         pending.lock().await.insert(
             "thread-2".to_string(),
             PendingGeneration {
+                generation_id: 2,
                 text: "hello".to_string(),
                 user_message_id: Some("user-msg-2".to_string()),
                 empty_response_grace_started: false,
@@ -1156,6 +1418,7 @@ mod tests {
         let mut generating_threads = HashSet::from(["thread-2".to_string()]);
         let mut pending_assistant_updates = HashMap::new();
         let mut recent_bridge_generations = HashMap::new();
+        let bridge_suppressions = bridge_suppressions();
 
         dispatch_event(
             &json!({
@@ -1167,6 +1430,7 @@ mod tests {
             &mut generating_threads,
             &mut pending_assistant_updates,
             &mut recent_bridge_generations,
+            &bridge_suppressions,
         )
         .await;
 
@@ -1188,6 +1452,7 @@ mod tests {
         pending.lock().await.insert(
             "thread-3".to_string(),
             PendingGeneration {
+                generation_id: 3,
                 text: "同一条回复".to_string(),
                 user_message_id: Some("user-msg-3".to_string()),
                 empty_response_grace_started: false,
@@ -1199,6 +1464,7 @@ mod tests {
         let mut generating_threads = HashSet::from(["thread-3".to_string()]);
         let mut pending_assistant_updates = HashMap::new();
         let mut recent_bridge_generations = HashMap::new();
+        let bridge_suppressions = bridge_suppressions();
 
         dispatch_event(
             &json!({
@@ -1210,6 +1476,7 @@ mod tests {
             &mut generating_threads,
             &mut pending_assistant_updates,
             &mut recent_bridge_generations,
+            &bridge_suppressions,
         )
         .await;
 
@@ -1238,10 +1505,234 @@ mod tests {
             &mut generating_threads,
             &mut pending_assistant_updates,
             &mut recent_bridge_generations,
+            &bridge_suppressions,
         )
         .await;
 
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn post_completion_message_updated_for_bridge_generation_is_suppressed_after_break_normalize()
+     {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (result_tx, result_rx) = oneshot::channel();
+        pending.lock().await.insert(
+            "thread-4".to_string(),
+            PendingGeneration {
+                generation_id: 4,
+                text: "段落一\n\n段落二".to_string(),
+                user_message_id: Some("user-msg-4".to_string()),
+                empty_response_grace_started: false,
+                result_tx,
+            },
+        );
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut generating_threads = HashSet::from(["thread-4".to_string()]);
+        let mut pending_assistant_updates = HashMap::new();
+        let mut recent_bridge_generations = HashMap::new();
+        let bridge_suppressions = bridge_suppressions();
+
+        dispatch_event(
+            &json!({
+                "type": "generation_completed",
+                "data": {"threadId": "thread-4"}
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(1), result_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0, "段落一\n\n段落二");
+
+        dispatch_event(
+            &json!({
+                "type": "message_updated",
+                "data": {
+                    "threadId": "thread-4",
+                    "id": "assistant-msg-4",
+                    "message": {
+                        "id": "assistant-msg-4",
+                        "role": "assistant",
+                        "parts": [{"type": "text", "text": "段落一<br/>段落二"}]
+                    }
+                }
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+        )
+        .await;
+
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn post_completion_incremental_message_updated_prefix_is_suppressed() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (result_tx, result_rx) = oneshot::channel();
+        let completed = "这是同一轮桥接生成的完整回复，长度足够超过前缀抑制阈值，用来模拟 Alma 在完成后继续发出递增 message_updated 的情况。最后一句是完整内容。";
+        let prefix = "这是同一轮桥接生成的完整回复，长度足够超过前缀抑制阈值，用来模拟 Alma 在完成后继续发出递增 message_updated 的情况。";
+        pending.lock().await.insert(
+            "thread-5".to_string(),
+            PendingGeneration {
+                generation_id: 5,
+                text: completed.to_string(),
+                user_message_id: Some("user-msg-5".to_string()),
+                empty_response_grace_started: false,
+                result_tx,
+            },
+        );
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut generating_threads = HashSet::from(["thread-5".to_string()]);
+        let mut pending_assistant_updates = HashMap::new();
+        let mut recent_bridge_generations = HashMap::new();
+        let bridge_suppressions = bridge_suppressions();
+
+        dispatch_event(
+            &json!({
+                "type": "generation_completed",
+                "data": {"threadId": "thread-5"}
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+        )
+        .await;
+
+        let result = timeout(Duration::from_secs(1), result_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0, completed);
+
+        dispatch_event(
+            &json!({
+                "type": "message_updated",
+                "data": {
+                    "threadId": "thread-5",
+                    "id": "assistant-msg-5",
+                    "message": {
+                        "id": "assistant-msg-5",
+                        "role": "assistant",
+                        "parts": [{"type": "text", "text": prefix}]
+                    }
+                }
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+        )
+        .await;
+
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn timed_out_generation_sends_stop_and_suppresses_late_update() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let first = ws.next().await.unwrap().unwrap();
+            let first_json: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+            assert_eq!(
+                first_json.get("type").and_then(|v| v.as_str()),
+                Some("generate_response")
+            );
+
+            let stop = ws.next().await.unwrap().unwrap();
+            let stop_json: Value = serde_json::from_str(stop.to_text().unwrap()).unwrap();
+            assert_eq!(
+                stop_json.get("type").and_then(|v| v.as_str()),
+                Some("stop_generation")
+            );
+            assert_eq!(
+                stop_json
+                    .get("data")
+                    .and_then(|d| d.get("threadId"))
+                    .and_then(|v| v.as_str()),
+                Some("thread-timeout")
+            );
+
+            ws.send(Message::Text(
+                json!({
+                    "type": "generation_stopped",
+                    "data": {"threadId": "thread-timeout"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "type": "message_updated",
+                    "data": {
+                        "threadId": "thread-timeout",
+                        "id": "late-assistant",
+                        "message": {
+                            "id": "late-assistant",
+                            "role": "assistant",
+                            "parts": [{"type": "text", "text": "late stale response"}]
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let client = super::AlmaWsClient::connect(&format!("http://{}", addr))
+            .await
+            .unwrap();
+        let result = client
+            .generate(
+                "thread-timeout",
+                None,
+                "hello",
+                Vec::new(),
+                1,
+                "telegram",
+                "",
+            )
+            .await;
+
+        assert_eq!(result.unwrap_err(), "Generation timed out after 1s");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(client.try_recv_event().await.is_none());
     }
 
     #[tokio::test]
@@ -1255,6 +1746,7 @@ mod tests {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bridge_suppressions = bridge_suppressions();
 
         let supervisor = tokio::spawn(super::connection_supervisor(
             url,
@@ -1262,6 +1754,7 @@ mod tests {
             outbound_rx,
             pending,
             event_tx,
+            bridge_suppressions,
             connected,
         ));
 
@@ -1304,6 +1797,7 @@ mod tests {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bridge_suppressions = bridge_suppressions();
 
         let supervisor = tokio::spawn(super::connection_supervisor(
             url,
@@ -1311,6 +1805,7 @@ mod tests {
             outbound_rx,
             pending,
             event_tx,
+            bridge_suppressions,
             connected,
         ));
 
