@@ -38,7 +38,7 @@ Portable ZIP packaging is available from macOS/Linux:
   ./scripts/package-windows-zip.sh
 
 The Windows script uses:
-  vpk pack --msi --instLocation PerMachine --noPortable --skipUpdates --noInst
+  vpk pack --msi --instLocation PerMachine --noPortable --skip-updates
 
 Default MSI scope:
   Per-machine under Program Files, using app id AlmaOneBotBridge as the default folder name.

@@ -22,6 +22,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            platforms/windows -> platforms/windows
+
       - name: Verify release version metadata
         run: scripts/verify-version.sh
 
@@ -102,6 +109,14 @@ jobs:
       - name: Install Rust macOS targets
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            platforms/windows -> platforms/windows
+          cache-targets: true
 
       - name: Select signing mode
         run: |
@@ -246,6 +261,14 @@ jobs:
 
       - name: Install Rust Windows GNU target
         run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            platforms/windows -> platforms/windows
+          cache-targets: true
 
       - name: Install .NET SDK for Velopack
         uses: actions/setup-dotnet@v5

@@ -32,11 +32,11 @@ Release builds produce both formats:
 The MSI is built per-machine with:
 
 ```powershell
-vpk pack --msi --instLocation PerMachine --noPortable --skipUpdates --noInst
+vpk pack --msi --instLocation PerMachine --noPortable --skip-updates
 ```
 
-`--noPortable` and `--skipUpdates` avoid duplicate portable ZIP and update-channel
-files (`nupkg`, `RELEASES`, `*.json`). `--noInst` skips Velopack's setup.exe.
+`--noPortable` skips Velopack's portable ZIP; `--skip-updates` skips `nupkg`,
+`RELEASES`, and `*.json`. Do not pass `--noInst` together with `--noPortable` (vpk 1.2.0 rejects that).
 The portable ZIP for releases is built with `package-windows-zip.ps1` instead.
 
 Velopack uses the app id as the default application folder name. This project

@@ -68,8 +68,8 @@ Remove-Item -Recurse -Force $DistDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 
 # Release packaging only needs the per-machine MSI. Portable ZIP is built separately
-# (package-windows-zip.ps1). These flags skip Velopack's update channel (nupkg,
-# RELEASES, json), portable zip, and setup.exe — faster pack and a clean dist dir.
+# (package-windows-zip.ps1). vpk 1.2.0: use kebab-case; --noPortable and --noInst
+# cannot be combined (CLI rejects both). --skip-updates drops nupkg/RELEASES/json.
 & vpk pack `
     --outputDir $DistDir `
     --packId $PackId `
@@ -83,8 +83,7 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
     --msi `
     --instLocation PerMachine `
     --noPortable `
-    --skipUpdates `
-    --noInst
+    --skip-updates
 if ($LASTEXITCODE -ne 0) {
     throw "Velopack packaging failed"
 }
