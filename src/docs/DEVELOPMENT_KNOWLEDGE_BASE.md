@@ -61,7 +61,8 @@ flowchart LR
 | `onebot/event.rs` | OneBot v11 event/message serde types + helpers for text, media, face, forward extraction |
 | `onebot/api.rs` | Echo-based WS API call mechanism + `send_text_message`, `send_reply_message`, `get_msg`, `get_forward_msg` helpers |
 | `handlers/ws.rs` | Reverse WS connection lifecycle + access token validation + recall event logging + bidirectional forwarding |
-| `handlers/http.rs` | Health check endpoint |
+| `handlers/http.rs` | Health check and HTTP command endpoint responses |
+| `server.rs` | Trillium router + HTTP endpoints + OneBot WebSocket upgrade |
 | `alma.rs` | Alma REST API: thread creation (`POST /api/threads`) + settings fetch |
 | `alma_ws.rs` | Alma WebSocket client: `generate_response` + event dispatch + bidirectional events |
 | `people.rs` | Auto-create People Profile files in `~/.config/alma/people/` |
@@ -243,19 +244,25 @@ The `echo` field disambiguates:
 - Messages WITH `echo` + `retcode` → **API responses** (correlated to pending calls)
 - Messages WITH `post_type` → **Events** (dispatched to event handlers)
 
-Implementation: `HashMap<String, oneshot::Sender<ApiResponse>>` protected by `Arc<Mutex<>>`.
-Each API call gets a unique echo ID (`bridge-{uuid}-{action}`), stores a oneshot sender,
-and awaits the response with configurable timeout.
+Implementation: `HashMap<String, smol::channel::Sender<ApiResponse>>` protected by
+`smol::lock::Mutex`. Each API call gets a unique echo ID (`bridge-{uuid}-{action}`),
+stores a bounded response sender, and awaits the response with configurable timeout.
 
-### 2.6 Warp 0.4.3 Specifics
+### 2.6 Runtime, HTTP, and WebSocket Stack
 
-| Item | Detail |
-|------|--------|
-| `server` feature | **Must be explicitly enabled** — not default in 0.4.x |
-| `websocket` feature | Must be explicitly enabled for WS support |
-| `warp::ws()` filter | Performs WS handshake upgrade on same HTTP port |
-| `warp::ws::Message` | Has `is_text()`, `to_str()`, `is_close()`, `Message::text()` |
-| Route composition | `.or()` chains filters; HTTP and WS coexist on same port |
+The bridge does not run a Tokio/Warp server. The current runtime stack is:
+
+| Layer | Crate | Detail |
+|------|-------|--------|
+| Runtime | `smol` + `trillium-smol` | Main async executor; use `trillium_smol::SmolRuntime` for spawn/delay/timeout and `smol::unblock` for blocking work |
+| HTTP/WebSocket server | `trillium-smol` + `trillium-router` + `trillium-websockets` | Binds the shared port, routes `/health`, `/qq/groups`, active send endpoints, and OneBot reverse WS paths |
+| Alma WebSocket client | `trillium_websockets::async_tungstenite` | Outbound connection to Alma's `/ws/threads`; the direct dependency only enables the smol runtime feature |
+| HTTP client | `trillium-client` + `trillium-rustls` | Alma REST calls and media downloads |
+| Channels | `smol::channel`, `async-broadcast` | API correlation, shutdown, and Alma event fan-out |
+
+`tokio`, `warp`, `reqwest`, `tokio-tungstenite`, `tokio-stream`, `async-h1`, and
+`http-types` must not be used directly in project code. They may still appear as
+transitive dependencies of other crates; that is not a runtime contract for this bridge.
 
 ### 2.7 People Profiles
 
@@ -336,10 +343,10 @@ Alma WS reader task
   ↓ (message_updated events)
 AlmaWsClient internal channel
   ↓ (drain task polls every 500ms)
-tokio::sync::broadcast channel (capacity: 64)
+async-broadcast channel (capacity: 64, overflow enabled)
   ↓ (each OneBot connection subscribes)
 handle_alma_event()
-  ↓ (dedup check: exact recently sent text)
+  ↓ (dedup check: normalized visible text)
 OneBot send_msg → QQ
 ```
 
@@ -349,9 +356,10 @@ the thread is NOT generating. This prevents:
 - Forwarding partial text during active generation
 - Duplicate messages (bridge pipeline sends directly, Alma event would re-send)
 
-**Dedup mechanism**: `register_sent_reply()` + `was_sent_recently()` compare exact
-recently sent text. This prevents echo loops without suppressing different messages
-that happen to share a long prefix.
+**Dedup mechanism**: `register_sent_reply()` + `was_sent_recently()` compare normalized
+visible text. HTML breaks, whitespace, system reminders, and thinking blocks are normalized
+before comparison. This prevents echo loops without suppressing different messages that
+happen to share a long prefix.
 
 ### 2.10 Reply/Quoting Protocol
 
@@ -588,13 +596,12 @@ The bridge supports OneBot's `access_token` authentication mechanism. When confi
 incoming WebSocket connections must provide a valid token or they are rejected.
 
 **Token delivery**: The OneBot client sends the token via the `Authorization: Bearer <token>`
-HTTP header during the WebSocket handshake. Some clients also support `?access_token=<token>`
-as a query parameter, but the bridge only validates the header.
+HTTP header during the WebSocket handshake. The bridge also accepts query tokens
+(`?access_token=<token>` or `?token=<token>`) for clients that cannot set headers.
 
 **Validation flow**:
 
-1. Warp extracts `Authorization` header as `Option<String>` before WS upgrade
-   (using `warp::header::optional::<String>("authorization")`)
+1. `server.rs` reads the `Authorization` header and query parameters from Trillium's `WebSocketConn`
 2. Handler compares the extracted token against the configured `access_token`
 3. Without `access_token`, the bridge accepts all connections
 4. If configured and the header is missing, malformed, or doesn't match, the connection
@@ -705,14 +712,19 @@ for bidirectional forwarding (Alma GUI → QQ). Populated on `get_thread_id()` a
 
 ## 5. Common Pitfalls
 
-### 5.1 Warp 0.4.x `server` Feature
+### 5.1 Do Not Reintroduce Tokio/Warp/Reqwest Direct Usage
 
-The `warp::serve()` function requires the `server` feature flag. In warp 0.4.x this
-is NOT enabled by default (unlike 0.3.x). Add it to Cargo.toml:
+The bridge is standardized on `smol`, Trillium (`trillium-smol`, `trillium-router`,
+`trillium-websockets`, `trillium-client`, `trillium-rustls`), and Alma-side
+`trillium_websockets::async_tungstenite`. Do not add
+direct `tokio`, `warp`, `reqwest`, `tokio-tungstenite`, `tokio-stream`, `async-h1`, or
+`http-types` dependencies back to project code. Use:
 
-```toml
-warp = { version = "0.4", features = ["server", "websocket"] }
-```
+- `trillium_smol::SmolRuntime` for async runtime helpers
+- `smol::unblock` for blocking work from async contexts
+- `server.rs` for Trillium HTTP routing and OneBot WebSocket upgrade
+- `trillium-client` + `trillium-rustls` for outbound HTTP
+- `smol::channel::bounded(1)` when a single-response channel is needed
 
 ### 5.2 `message_added` Has Empty Text for Assistant Messages
 
@@ -752,11 +764,11 @@ does not exist. Use the Alma WebSocket protocol (`generate_response`) or the
 
 ### 5.6 WebSocket Split Pattern
 
-In Warp, `ws.split()` returns `(SplitSink, SplitStream)`. You cannot use the
-`SplitSink` from multiple tasks directly. The correct pattern is:
+`async_tungstenite` WebSocket streams split into a sink and stream. You cannot use the
+sink from multiple tasks directly. The correct pattern is:
 
 1. Split the WS into sink + stream
-2. Create an `mpsc::unbounded_channel`
+2. Create a `smol::channel::unbounded`
 3. Spawn a writer task that reads from the channel and writes to the sink
 4. Any task can send to the channel
 
@@ -773,7 +785,9 @@ by paragraphs first (double newline), then by character limit within each paragr
 ### 5.9 Edition 2024 Compatibility
 
 This project uses Rust edition 2024 (default for `cargo init` on Rust 1.85+).
-All dependencies (warp 0.4.3, tokio 1.52, reqwest 0.13) are compatible.
+The direct runtime/networking dependencies are `smol`, Trillium (`trillium-smol`,
+`trillium-router`, `trillium-websockets`, `trillium-client`, `trillium-rustls`), and
+Alma-side `trillium_websockets::async_tungstenite`.
 
 ### 5.10 OneBot Message Segment Format
 
@@ -870,12 +884,12 @@ Forwarded messages can contain hundreds of nodes. The bridge limits extraction t
 being overwhelmed by a single massive forward. If the user needs full content, they should
 paste it directly.
 
-### 5.22 Warp Header Extraction Before WS Upgrade
+### 5.22 Header Extraction for WS Auth
 
-To validate an `Authorization` header on WebSocket connections, you must extract it
-BEFORE the WS upgrade. Use `warp::header::optional::<String>("authorization")` as a
-filter composed with `warp::ws()`. The header is not accessible after the connection
-has been upgraded to WebSocket.
+To validate an `Authorization` header on WebSocket connections, read it from
+`trillium_websockets::WebSocketConn::headers()` and read query tokens from
+`WebSocketConn::querystring()`. The bridge passes both into `handle_ws_connection()`
+before registering the OneBot connection in shared state.
 
 ### 5.23 macOS PKG Must Install from Root
 
@@ -1004,7 +1018,6 @@ cargo run --release
 
 - **Outgoing image segments**: Alma AI may generate image URLs or markdown images in replies;
   convert these to OneBot `image` segments for native QQ rendering
-- **Alma WS reconnection**: Currently the bridge does not auto-reconnect if the Alma WS drops
 - **Streaming to QQ**: Forward partial replies as they arrive (QQ rate-limits messages, so this
   would need throttling)
 - **Message edit/delete from Alma**: When Alma deletes or edits a message in the GUI, call

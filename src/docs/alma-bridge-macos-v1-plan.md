@@ -758,81 +758,39 @@ struct PathField: View {
 
 ## 7. Rust 侧改动
 
-### 7.1 PID 文件写入（`src/main.rs`）
+### 7.1 PID 文件写入（已落地）
 
-在 `main()` 函数中，`warp::serve()` 之前添加：
+当前实现已从 `src/main.rs` 下沉到 `src/lib.rs`：
+
+- `pid_file_path()`
+- `write_pid_file()`
+- `remove_pid_file()`
+- `BridgeRunOptions { write_pid_file }`
+
+桌面 app 启动桥程时通过 `run_bridge_until_with_hooks()` 控制 PID 文件生命周期。
+
+### 7.2 优雅关闭与运行时（已落地）
+
+当前桥程不使用 Tokio/Warp。入口为：
 
 ```rust
-// ── PID 文件 ──
-#[cfg(unix)]
-{
-    use std::io::Write;
-    let pid_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config").join("alma").join("bridge");
-    std::fs::create_dir_all(&pid_dir).ok();
-    let pid_path = pid_dir.join("bridge.pid");
-    let pid = std::process::id();
-    if let Ok(mut f) = std::fs::File::create(&pid_path) {
-        let _ = write!(f, "{}", pid);
-        tracing::info!("PID file written: {:?} (pid={})", pid_path, pid);
-    }
-    // 进程退出时清理 PID 文件
-    let pid_path_clone = pid_path.clone();
-    let _ = ctrlc::set_handler(move || {
-        std::fs::remove_file(&pid_path_clone).ok();
-        std::process::exit(0);
-    });
+fn main() {
+    smol::block_on(alma_onebot_bridge::async_main());
 }
 ```
 
-需要在 `Cargo.toml` 添加依赖：
+服务端由 `src/server.rs` 提供：
 
-```toml
-ctrlc = { version = "3", features = ["termination"] }
-```
+- `trillium-smol` 绑定 HTTP/WebSocket 端口
+- `trillium-router` 路由 HTTP 请求
+- `trillium-websockets` 处理 OneBot WebSocket upgrade
+- `async-tungstenite` 处理 Alma 侧出站 WebSocket
+- `signal-hook` + `smol` 处理 SIGINT/SIGTERM
 
-### 7.2 SIGHUP 热重载（`src/main.rs`）
+### 7.3 `state.rs`：Config 使用异步 RwLock
 
-```rust
-#[cfg(unix)]
-{
-    use tokio::signal::unix::{signal, SignalKind};
-    let state_hup = state.clone();
-    tokio::spawn(async move {
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => { tracing::warn!("SIGHUP handler failed: {}", e); return; }
-        };
-        loop {
-            hup.recv().await;
-            tracing::info!("SIGHUP received, reloading config");
-            let new_cfg = Config::from_env();
-            let mut cfg = state_hup.config.write().await;
-            cfg.group_history_size = new_cfg.group_history_size;
-            cfg.thinking_message = new_cfg.thinking_message;
-            cfg.show_thinking = new_cfg.show_thinking;
-            cfg.alma_run_timeout_secs = new_cfg.alma_run_timeout_secs;
-            cfg.alma_max_retries = new_cfg.alma_max_retries;
-            cfg.alma_retry_delay_ms = new_cfg.alma_retry_delay_ms;
-            cfg.access_token = new_cfg.access_token;
-            cfg.onebot_api_timeout_secs = new_cfg.onebot_api_timeout_secs;
-            tracing::info!("Config hot-reload complete");
-        }
-    });
-}
-```
-
-### 7.3 `state.rs`：Config 改为 RwLock
-
-```rust
-pub struct AppState {
-    pub config: Arc<tokio::sync::RwLock<Config>>,
-    // ... 其余不变
-}
-```
-
-所有 `state.config.xxx` 改为 `state.config.read().await.xxx`。
+当前 `SharedState` 已使用 `smol::lock::RwLock<Config>`。读取配置时使用
+`state.config.read().await`，写入配置时使用 `state.config.write().await`。
 
 ### 7.4 `config.rs`：新增 GUI 配置路径
 

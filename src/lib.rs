@@ -8,9 +8,9 @@ mod handlers;
 mod onebot;
 mod people;
 mod pipeline;
+mod server;
 mod state;
 
-use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -19,11 +19,11 @@ use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
-use warp::Filter;
-
 use crate::alma_ws::AlmaWsClient;
 pub use crate::config::Config;
 use crate::state::SharedState;
+use smol::channel;
+use trillium_smol::SmolRuntime;
 
 const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 const LOG_BACKUP_COUNT: u8 = 3;
@@ -150,7 +150,6 @@ where
         apply_debugger_defaults(&mut config);
     }
 
-    let bind_addr = ([0, 0, 0, 0], config.bridge_port);
     let preflight_addr = format!("0.0.0.0:{}", config.bridge_port);
     match TcpListener::bind(&preflight_addr) {
         Ok(listener) => drop(listener),
@@ -218,15 +217,17 @@ where
 
     {
         let state = state.clone();
-        tokio::spawn(async move {
+        SmolRuntime::default().spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                SmolRuntime::default()
+                    .delay(std::time::Duration::from_millis(500))
+                    .await;
                 let client = match state.get_alma_ws().await {
                     Some(c) => c,
                     None => continue,
                 };
                 while let Some(event) = client.try_recv_event().await {
-                    let _ = state.alma_event_tx.send(event);
+                    let _ = state.alma_event_tx.broadcast(event).await;
                 }
             }
         });
@@ -235,12 +236,22 @@ where
     #[cfg(unix)]
     {
         let state = state.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sighup =
-                signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
-            loop {
-                sighup.recv().await;
+        let (sighup_tx, sighup_rx) = channel::unbounded::<()>();
+        std::thread::spawn(move || {
+            let mut signals =
+                match signal_hook::iterator::Signals::new([signal_hook::consts::SIGHUP]) {
+                    Ok(signals) => signals,
+                    Err(e) => {
+                        tracing::warn!("failed to install SIGHUP handler: {}", e);
+                        return;
+                    }
+                };
+            for _ in signals.forever() {
+                let _ = sighup_tx.send_blocking(());
+            }
+        });
+        SmolRuntime::default().spawn(async move {
+            while sighup_rx.recv().await.is_ok() {
                 tracing::info!("[SIGHUP] Reloading config from disk...");
                 let new_config = Config::load();
                 let mut cfg = state.config.write().await;
@@ -268,88 +279,6 @@ where
         });
     }
 
-    let health = warp::path("health")
-        .and(warp::get())
-        .and_then(handlers::http::health_handler);
-
-    let state_filter = {
-        let state = state.clone();
-        warp::any().map(move || state.clone())
-    };
-
-    let qq_groups = warp::path!("qq" / "groups")
-        .and(warp::get())
-        .and(state_filter.clone())
-        .and(warp::header::optional::<String>("authorization"))
-        .and(warp::query::<HashMap<String, String>>())
-        .and(warp::addr::remote())
-        .and_then(handlers::http::list_groups_handler);
-
-    let qq_group_send = warp::path!("qq" / "group" / i64 / "send")
-        .and(warp::post())
-        .and(warp::body::content_length_limit(64 * 1024))
-        .and(warp::body::json())
-        .and(state_filter.clone())
-        .and(warp::header::optional::<String>("authorization"))
-        .and(warp::query::<HashMap<String, String>>())
-        .and(warp::addr::remote())
-        .and_then(handlers::http::send_group_message_handler);
-
-    let qq_private_send = warp::path!("qq" / "private" / i64 / "send")
-        .and(warp::post())
-        .and(warp::body::content_length_limit(64 * 1024))
-        .and(warp::body::json())
-        .and(state_filter)
-        .and(warp::header::optional::<String>("authorization"))
-        .and(warp::query::<HashMap<String, String>>())
-        .and(warp::addr::remote())
-        .and_then(handlers::http::send_private_message_handler);
-
-    let ws_handler = {
-        let state = state.clone();
-        move |auth: Option<String>, query: HashMap<String, String>, ws: warp::ws::Ws| {
-            let state = state.clone();
-            ws.on_upgrade(move |socket| {
-                handlers::ws::handle_ws_connection(socket, state, auth, query)
-            })
-        }
-    };
-
-    let ws_root = warp::path::end()
-        .and(warp::header::optional::<String>("authorization"))
-        .and(warp::query::<HashMap<String, String>>())
-        .and(warp::ws())
-        .map(ws_handler.clone());
-
-    let ws_path = warp::path("ws")
-        .and(warp::path::end())
-        .and(warp::header::optional::<String>("authorization"))
-        .and(warp::query::<HashMap<String, String>>())
-        .and(warp::ws())
-        .map(ws_handler.clone());
-
-    let ws_onebot = warp::path("onebot")
-        .and(warp::path("v11"))
-        .and(warp::path("ws"))
-        .and(warp::path::end())
-        .and(warp::header::optional::<String>("authorization"))
-        .and(warp::query::<HashMap<String, String>>())
-        .and(warp::ws())
-        .map(ws_handler);
-
-    let routes = health
-        .or(qq_groups)
-        .or(qq_group_send)
-        .or(qq_private_send)
-        .or(ws_root)
-        .or(ws_path)
-        .or(ws_onebot);
-
-    let server = warp::serve(routes)
-        .bind(bind_addr)
-        .await
-        .graceful(shutdown_signal);
-
     tracing::info!(
         "Listening on {} — waiting for OneBot reverse WS connection...",
         preflight_addr
@@ -358,7 +287,7 @@ where
         on_listening();
     }
 
-    server.run().await;
+    server::run_server_until(config.bridge_port, state, shutdown_signal).await?;
 
     if options.write_pid_file {
         remove_pid_file();
@@ -390,22 +319,15 @@ fn first_available_port(start: u16, attempts: u16) -> Option<u16> {
 }
 
 pub async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut terminate =
-            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    let _ = smol::unblock(|| {
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+        ])?;
+        let _ = signals.forever().next();
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
 
     tracing::info!("Shutdown signal received; stopping HTTP/WebSocket server");
 }

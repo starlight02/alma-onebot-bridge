@@ -759,13 +759,21 @@ final class ConfigManager: ObservableObject {
         let tempURL = dir.appending(path: ".config.toml.tmp")
 
         do {
-            try tomlContent.write(to: tempURL, atomically: false, encoding: .utf8)
-            _ = try FileManager.default.replaceItemAt(
-                configFileURL,
-                withItemAt: tempURL,
-                backupItemName: nil,
-                options: .usingNewMetadataOnly
+            try FileManager.default.createDirectory(
+                at: dir,
+                withIntermediateDirectories: true
             )
+            try tomlContent.write(to: tempURL, atomically: false, encoding: .utf8)
+            if FileManager.default.fileExists(atPath: configFileURL.path()) {
+                _ = try FileManager.default.replaceItemAt(
+                    configFileURL,
+                    withItemAt: tempURL,
+                    backupItemName: nil,
+                    options: .usingNewMetadataOnly
+                )
+            } else {
+                try FileManager.default.moveItem(at: tempURL, to: configFileURL)
+            }
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
             throw ConfigError.writeFailed(error.localizedDescription)
@@ -853,6 +861,7 @@ final class ConfigManager: ObservableObject {
         }
         environment["RUST_LOG"] = "info"
         environment["BRIDGE_LOG_FILE"] = logFileURL.path()
+        environment["ALMA_ONEBOT_BRIDGE_CONFIG"] = configFileURL.path()
         environment["ALMA_ONEBOT_BRIDGE_MANAGED_BY"] = "macos"
         return environment
     }

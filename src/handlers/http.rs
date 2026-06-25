@@ -2,18 +2,42 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
-use warp::http::StatusCode;
+use trillium::{Conn, Status};
 
 use crate::auth::is_http_command_authorized;
 use crate::onebot::{send_reply_message, send_text_message};
 use crate::pipeline::{QQ_MSG_LIMIT, record_alma_group_output, split_text};
 use crate::state::{GroupDirectoryEntry, SharedState};
 
-pub async fn health_handler() -> Result<impl warp::Reply, warp::Rejection> {
-    Ok(warp::reply::json(&serde_json::json!({
-        "status": "ok",
-        "service": "alma-onebot-bridge"
-    })))
+pub struct JsonResponse {
+    status: Status,
+    body: String,
+}
+
+impl JsonResponse {
+    pub fn new(status: Status, value: serde_json::Value) -> Self {
+        Self {
+            status,
+            body: value.to_string(),
+        }
+    }
+
+    pub fn into_conn(self, conn: Conn) -> Conn {
+        conn.with_status(self.status)
+            .with_response_header("content-type", "application/json; charset=utf-8")
+            .with_body(self.body)
+            .halt()
+    }
+}
+
+pub fn health_response() -> JsonResponse {
+    json_status(
+        &serde_json::json!({
+            "status": "ok",
+            "service": "alma-onebot-bridge"
+        }),
+        Status::Ok,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,7 +74,7 @@ pub async fn list_groups_handler(
     auth_header: Option<String>,
     query: HashMap<String, String>,
     remote: Option<SocketAddr>,
-) -> Result<impl warp::Reply, warp::Rejection> {
+) -> JsonResponse {
     let access_token = state.config.read().await.access_token.clone();
     if !is_http_command_authorized(
         access_token.as_deref(),
@@ -58,28 +82,28 @@ pub async fn list_groups_handler(
         &query,
         remote,
     ) {
-        return Ok(json_status(
+        return json_status(
             &ErrorResponse {
                 status: "error",
                 error: "unauthorized".to_string(),
             },
-            StatusCode::UNAUTHORIZED,
-        ));
+            Status::Unauthorized,
+        );
     }
 
     let groups = match state.group_directory_snapshot().await {
         Ok(groups) => groups,
         Err(e) => {
-            return Ok(json_status(
+            return json_status(
                 &ErrorResponse {
                     status: "error",
                     error: e,
                 },
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ));
+                Status::InternalServerError,
+            );
         }
     };
-    Ok(json_status(
+    json_status(
         &GroupsResponse {
             status: "ok",
             onebot_connected: state.has_onebot_api_handle().await,
@@ -87,8 +111,8 @@ pub async fn list_groups_handler(
                 .map(|dir| dir.join("README.md").to_string_lossy().to_string()),
             groups,
         },
-        StatusCode::OK,
-    ))
+        Status::Ok,
+    )
 }
 
 pub async fn send_group_message_handler(
@@ -98,7 +122,7 @@ pub async fn send_group_message_handler(
     auth_header: Option<String>,
     query: HashMap<String, String>,
     remote: Option<SocketAddr>,
-) -> Result<impl warp::Reply, warp::Rejection> {
+) -> JsonResponse {
     send_message_handler("group", group_id, body, state, auth_header, query, remote).await
 }
 
@@ -109,7 +133,7 @@ pub async fn send_private_message_handler(
     auth_header: Option<String>,
     query: HashMap<String, String>,
     remote: Option<SocketAddr>,
-) -> Result<impl warp::Reply, warp::Rejection> {
+) -> JsonResponse {
     send_message_handler("private", user_id, body, state, auth_header, query, remote).await
 }
 
@@ -121,7 +145,7 @@ async fn send_message_handler(
     auth_header: Option<String>,
     query: HashMap<String, String>,
     remote: Option<SocketAddr>,
-) -> Result<warp::reply::WithStatus<warp::reply::Json>, warp::Rejection> {
+) -> JsonResponse {
     let (access_token, onebot_timeout) = {
         let cfg = state.config.read().await;
         (cfg.access_token.clone(), cfg.onebot_api_timeout_secs)
@@ -132,34 +156,34 @@ async fn send_message_handler(
         &query,
         remote,
     ) {
-        return Ok(json_status(
+        return json_status(
             &ErrorResponse {
                 status: "error",
                 error: "unauthorized".to_string(),
             },
-            StatusCode::UNAUTHORIZED,
-        ));
+            Status::Unauthorized,
+        );
     }
 
     let message = body.message.trim();
     if message.is_empty() {
-        return Ok(json_status(
+        return json_status(
             &ErrorResponse {
                 status: "error",
                 error: "message must not be empty".to_string(),
             },
-            StatusCode::BAD_REQUEST,
-        ));
+            Status::BadRequest,
+        );
     }
 
     let Some(handle) = state.get_onebot_api_handle().await else {
-        return Ok(json_status(
+        return json_status(
             &ErrorResponse {
                 status: "error",
                 error: "no active OneBot reverse WebSocket connection".to_string(),
             },
-            StatusCode::SERVICE_UNAVAILABLE,
-        ));
+            Status::ServiceUnavailable,
+        );
     };
 
     let chunks = split_text(message, QQ_MSG_LIMIT);
@@ -167,13 +191,13 @@ async fn send_message_handler(
     let thread_id = match state.get_thread_id(&session_key).await {
         Ok(thread_id) => thread_id,
         Err(e) => {
-            return Ok(json_status(
+            return json_status(
                 &ErrorResponse {
                     status: "error",
                     error: format!("failed to resolve bridge thread mapping: {}", e),
                 },
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ));
+                Status::InternalServerError,
+            );
         }
     };
     let mut message_ids = Vec::new();
@@ -218,13 +242,13 @@ async fn send_message_handler(
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
-                return Ok(json_status(
+                return json_status(
                     &ErrorResponse {
                         status: "error",
                         error: e,
                     },
-                    StatusCode::BAD_GATEWAY,
-                ));
+                    Status::BadGateway,
+                );
             }
         };
         let msg_id = resp
@@ -245,22 +269,30 @@ async fn send_message_handler(
         state.register_sent_reply(thread_id, message).await;
     }
 
-    Ok(json_status(
+    json_status(
         &SendMessageResponse {
             status: "ok",
             target_type,
             target_id,
             message_ids,
         },
-        StatusCode::OK,
-    ))
+        Status::Ok,
+    )
 }
 
-fn json_status<T: Serialize>(
-    value: &T,
-    status: StatusCode,
-) -> warp::reply::WithStatus<warp::reply::Json> {
-    warp::reply::with_status(warp::reply::json(value), status)
+fn json_status<T: Serialize>(value: &T, status: Status) -> JsonResponse {
+    let (status, body) = match serde_json::to_string(value) {
+        Ok(body) => (status, body),
+        Err(e) => (
+            Status::InternalServerError,
+            serde_json::json!({
+                "status": "error",
+                "error": format!("failed to serialize response: {}", e),
+            })
+            .to_string(),
+        ),
+    };
+    JsonResponse { status, body }
 }
 
 fn current_unix_timestamp() -> u64 {

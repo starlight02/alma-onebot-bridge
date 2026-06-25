@@ -24,8 +24,14 @@ final class ConfigModel: ObservableObject {
     @Published var showThinking: Bool = false
 
     // MARK: Paths
-    @Published var peopleDir: String = ""
+    @Published var peopleDir: String = ConfigModel.defaultPeopleDir()
     @Published var dbPath: String = "bridge-state.db"
+
+    private static func defaultPeopleDir() -> String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".config/alma/people")
+            .path()
+    }
 
     // MARK: Validation
 

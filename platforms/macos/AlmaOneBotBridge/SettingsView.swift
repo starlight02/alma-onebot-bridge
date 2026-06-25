@@ -32,7 +32,10 @@ struct SettingsView: View {
         .frame(minWidth: 720, idealWidth: 820, minHeight: 620, idealHeight: 760)
         .liquidGlassWindowBackground(reduceTransparency: reduceTransparency)
         .background(SettingsWindowConfigurator(reduceTransparency: reduceTransparency))
-        .onAppear { editing.copyValues(from: configManager.model) }
+        .onAppear {
+            configManager.load()
+            editing.copyValues(from: configManager.model)
+        }
         .alert("放弃更改？", isPresented: $showDiscardAlert) {
             Button("放弃", role: .destructive) { dismiss() }
             Button("继续编辑", role: .cancel) {}

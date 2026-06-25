@@ -15,7 +15,7 @@ A bridge service that connects [Alma](https://github.com/anthropics/alma) to QQ 
 - **Alma group CLI compatibility**: `alma group list/history/search/context` can read QQ group logs. Active QQ sends use bridge HTTP endpoints because `alma group send` targets Telegram.
 - **Rich message handling**: The bridge converts QQ face emojis to text, labels images/voice/video, and extracts forwarded message content.
 - **Reply and @mention**: Incoming quotes and outgoing reply references work. Group replies mention the sender.
-- **People Profiles**: The bridge creates Alma People Profile files for QQ users with `qq_id` frontmatter.
+- **People Profiles**: The bridge creates Alma People Profile files for QQ users with `qq_id` and `telegram_id` frontmatter so Telegram-compatible Alma matching keeps working.
 - **Message splitting**: Long replies split by paragraph, then by QQ's 4500-character limit.
 - **Persistent state**: Turso stores thread mappings, user profiles, QQ group titles, and group card metadata.
 - **Security**: WebSocket auth can require a `Bearer` token. HTTP send endpoints accept loopback or a valid token.
@@ -39,7 +39,7 @@ flowchart LR
     onebot -->|"QQ delivery"| qq
 ```
 
-The bridge acts as a **WebSocket server** for the OneBot client and a **WebSocket client** for Alma's internal chat pipeline (`ws://localhost:23001/ws/threads`).
+The bridge acts as a **WebSocket server** for the OneBot client and a **WebSocket client** for Alma's internal chat pipeline (`ws://localhost:23001/ws/threads`). The runtime stack is `smol` + Trillium (`trillium-smol`, `trillium-router`, `trillium-websockets`, `trillium-client`, `trillium-rustls`); Alma's outbound WS client uses the `async-tungstenite` re-export from `trillium-websockets`.
 
 ## Quick Start
 
@@ -212,7 +212,7 @@ chooses the first available port starting at `18090`.
 
 ### Bidirectional Sync (Alma GUI → QQ)
 
-Messages typed in the Alma GUI for a tracked thread are forwarded to QQ. A dedup mechanism (first 100 characters) prevents echo loops when the bridge itself generates replies.
+Messages typed in the Alma GUI for a tracked thread are forwarded to QQ. A normalized visible-text dedup mechanism prevents echo loops when the bridge itself generates replies without suppressing distinct messages that merely share a long prefix.
 
 ### Alma Group Commands and Active Sends
 

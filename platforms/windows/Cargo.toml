@@ -13,7 +13,7 @@ path = "src/main.rs"
 alma-onebot-bridge = { path = "../.." }
 dirs = "6.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.52.3", features = ["full"] }
+smol = "2.0.2"
 toml = "0.8"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"

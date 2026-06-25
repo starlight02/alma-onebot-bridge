@@ -1,7 +1,8 @@
 use futures_util::future::join_all;
-use tokio::sync::mpsc;
+use smol::channel;
 use tracing::{debug, info, warn};
-use warp::ws::Message;
+use trillium_smol::SmolRuntime;
+use trillium_websockets::Message;
 
 use crate::alma;
 use crate::alma_ws::{AlmaEvent, AlmaWsClient};
@@ -31,7 +32,7 @@ const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 pub async fn process_message_event(
     event: &OneBotEvent,
     state: &SharedState,
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
 ) -> Result<(), String> {
     let message_type = event.message_type.as_deref().unwrap_or("unknown");
@@ -451,7 +452,9 @@ pub async fn process_message_event(
                     "[Alma] Retry {}/{} for thread {} in {}ms",
                     attempt, max_retries, thread_id, delay
                 );
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                SmolRuntime::default()
+                    .delay(std::time::Duration::from_millis(delay))
+                    .await;
             }
 
             let alma_ws = match ensure_alma_ws_client(state).await {
@@ -640,7 +643,7 @@ pub async fn process_message_event(
 
 async fn resolve_group_title(
     state: &SharedState,
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
     is_group: bool,
     group_id: i64,
@@ -858,7 +861,7 @@ async fn build_ephemeral_context(state: &SharedState, input: EphemeralContextInp
 pub async fn handle_alma_event(
     event: &AlmaEvent,
     state: &SharedState,
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
 ) -> Result<(), String> {
     if event.event_type != "message_updated" || event.message_role != "assistant" {
@@ -1355,32 +1358,44 @@ fn build_telegram_like_channel_system_context(
 
 /// Download a media URL and encode it as a Base64 data URI in an Alma file part JSON object.
 async fn download_media_as_file_part(
-    client: &reqwest::Client,
+    client: &trillium_client::Client,
     url: &str,
     default_filename: &str,
 ) -> Result<serde_json::Value, String> {
     use base64::prelude::*;
 
-    let parsed_url = reqwest::Url::parse(url).map_err(|e| format!("Invalid media URL: {}", e))?;
+    let parsed_url = url::Url::parse(url).map_err(|e| format!("Invalid media URL: {}", e))?;
     match parsed_url.scheme() {
         "http" | "https" => {}
         scheme => return Err(format!("Unsupported media URL scheme: {}", scheme)),
     }
 
     debug!("[Alma] Downloading media from URL: {}", url);
-    let resp = tokio::time::timeout(
-        tokio::time::Duration::from_secs(30),
-        client.get(parsed_url.clone()).send(),
-    )
-    .await
-    .map_err(|_| "Timed out fetching media URL".to_string())?
-    .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+    let media_timeout = std::time::Duration::from_secs(30);
+    let mut response = client
+        .get(parsed_url.as_str())
+        .with_timeout(media_timeout)
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("HTTP status error: {}", resp.status()));
+    let status = response
+        .status()
+        .map(u16::from)
+        .ok_or_else(|| "HTTP response missing status".to_string())?;
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP status error: {}", status));
     }
 
-    if let Some(len) = resp.content_length()
+    let content_type = response
+        .response_headers()
+        .get_str("content-type")
+        .map(ToString::to_string);
+    let content_length = response
+        .response_headers()
+        .get_str("content-length")
+        .and_then(|value| value.parse::<u64>().ok());
+
+    if let Some(len) = content_length
         && len > MAX_MEDIA_BYTES
     {
         return Err(format!(
@@ -1389,38 +1404,35 @@ async fn download_media_as_file_part(
         ));
     }
 
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            let path = parsed_url.path();
-            if path.ends_with(".png") {
-                "image/png".to_string()
-            } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-                "image/jpeg".to_string()
-            } else if path.ends_with(".gif") {
-                "image/gif".to_string()
-            } else {
-                "application/octet-stream".to_string()
-            }
-        });
-
-    let mut bytes = Vec::new();
-    let mut resp = resp;
-    while let Some(chunk) = tokio::time::timeout(tokio::time::Duration::from_secs(30), resp.chunk())
-        .await
-        .map_err(|_| "Timed out reading media response".to_string())?
-        .map_err(|e| format!("Failed to read response bytes: {}", e))?
-    {
-        if bytes.len() as u64 + chunk.len() as u64 > MAX_MEDIA_BYTES {
-            return Err(format!(
-                "Media too large: response exceeds {} byte limit",
-                MAX_MEDIA_BYTES
-            ));
+    let content_type = content_type.unwrap_or_else(|| {
+        let path = parsed_url.path();
+        if path.ends_with(".png") {
+            "image/png".to_string()
+        } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+            "image/jpeg".to_string()
+        } else if path.ends_with(".gif") {
+            "image/gif".to_string()
+        } else {
+            "application/octet-stream".to_string()
         }
-        bytes.extend_from_slice(&chunk);
+    });
+
+    let bytes = SmolRuntime::default()
+        .timeout(
+            media_timeout,
+            response
+                .response_body()
+                .with_max_len(MAX_MEDIA_BYTES.saturating_add(1))
+                .read_bytes(),
+        )
+        .await
+        .ok_or_else(|| "Timed out reading response body".to_string())?
+        .map_err(|e| format!("Failed to read media response body: {}", e))?;
+    if bytes.len() as u64 > MAX_MEDIA_BYTES {
+        return Err(format!(
+            "Media too large: response exceeds {} byte limit",
+            MAX_MEDIA_BYTES
+        ));
     }
 
     let b64_data = BASE64_STANDARD.encode(&bytes);
@@ -1459,10 +1471,17 @@ mod tests {
     use crate::alma_ws::normalize_assistant_text;
     use crate::config::Config;
     use crate::state::SharedState;
+    use futures_lite::{AsyncReadExt, AsyncWriteExt};
+    use macro_rules_attribute::apply;
+    use smol::channel;
+    use smol::net::TcpListener;
+    use smol_macros::test;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::oneshot;
+    use trillium_client::Client;
+    use trillium_rustls::{RustlsClientConfig, RustlsConfig};
+    use trillium_smol::ClientConfig as SmolClientConfig;
+    use trillium_smol::SmolRuntime;
 
     fn temp_db_path(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1474,17 +1493,17 @@ mod tests {
 
     async fn spawn_create_thread_server(
         thread_id: &'static str,
-    ) -> (String, oneshot::Receiver<String>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    ) -> (String, channel::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (req_tx, req_rx) = oneshot::channel();
+        let (req_tx, req_rx) = channel::bounded(1);
 
-        tokio::spawn(async move {
+        SmolRuntime::default().spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = vec![0_u8; 4096];
             let n = stream.read(&mut buf).await.unwrap();
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            let _ = req_tx.send(request);
+            let _ = req_tx.send(request).await;
 
             let body = format!(r#"{{"id":"{}"}}"#, thread_id);
             let response = format!(
@@ -1627,9 +1646,12 @@ mod tests {
         assert_eq!(chunks, vec!["你", "好"]);
     }
 
-    #[tokio::test]
+    #[apply(test!)]
     async fn download_media_rejects_non_http_urls() {
-        let client = reqwest::Client::new();
+        let client = Client::new(RustlsConfig::new(
+            RustlsClientConfig::default(),
+            SmolClientConfig::new().with_nodelay(true),
+        ));
         let err = download_media_as_file_part(&client, "file:///tmp/a.png", "a.png")
             .await
             .unwrap_err();
@@ -1637,7 +1659,7 @@ mod tests {
         assert!(err.contains("Unsupported media URL scheme"));
     }
 
-    #[tokio::test]
+    #[apply(test!)]
     async fn resolving_thread_does_not_touch_locked_alma_database() {
         let locked_alma_db_path = temp_db_path("locked-alma");
         let bridge_db_path = temp_db_path("bridge-state");
@@ -1679,7 +1701,11 @@ mod tests {
             Some("thread-from-rest")
         );
         assert!(
-            req_rx.await.unwrap().starts_with("POST /api/threads "),
+            req_rx
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("POST /api/threads "),
             "thread resolution should create threads through Alma REST only"
         );
 
@@ -1728,11 +1754,10 @@ mod tests {
 
     /// Regression: one `generate_response` must not also forward the same turn via
     /// `message_updated` (see bridge.log 2026-06-25 06:21–06:22).
-    #[tokio::test]
+    #[apply(test!)]
     async fn handle_alma_event_dedups_preregistered_pipeline_reply() {
         use crate::alma_ws::AlmaEvent;
         use crate::onebot::PendingCalls;
-        use tokio::sync::mpsc;
 
         let db_path = temp_db_path("dedup-handle-alma");
         let mut config = Config::load();
@@ -1758,7 +1783,7 @@ mod tests {
             thinking_text: None,
         };
 
-        let (ws_tx, _ws_rx) = mpsc::unbounded_channel();
+        let (ws_tx, _ws_rx) = channel::unbounded();
         let pending = PendingCalls::new();
         super::handle_alma_event(&event, &state, &ws_tx, &pending)
             .await

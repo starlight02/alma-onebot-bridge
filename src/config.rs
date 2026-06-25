@@ -1,3 +1,4 @@
+use std::env;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -124,6 +125,26 @@ impl Config {
     }
 
     fn load_config_file() -> FileConfig {
+        if let Some(path) = env::var_os("ALMA_ONEBOT_BRIDGE_CONFIG")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match toml::from_str::<FileConfig>(&content) {
+                    Ok(config) => {
+                        tracing::info!("Loaded config from {:?}", path);
+                        return config;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse explicit config {:?}: {}", path, e);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to read explicit config {:?}: {}", path, e);
+                }
+            }
+        }
+
         // Try multiple locations for config.toml
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let candidates = [

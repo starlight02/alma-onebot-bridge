@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use smol::channel;
 use tracing::{debug, info, warn};
 
 use crate::onebot::event::Sender;
 use crate::onebot::{PendingCalls, call_api};
 use crate::state::SharedState;
-use tokio::sync::mpsc;
-use warp::ws::Message;
+use trillium_websockets::Message;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GroupCardInfo {
@@ -24,7 +24,7 @@ pub async fn ensure_people_profile(
     sender: Option<&Sender>,
     group_id: Option<i64>,
     state: &SharedState,
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
 ) {
     let user_id_str = user_id.to_string();
@@ -171,16 +171,11 @@ async fn resolve_profile_path_for_user(state: &SharedState, user_id: i64) -> Pat
 
     let people_dir = state.config.read().await.people_dir.clone();
     let fallback = people_dir.join(format!("{}.md", user_id));
-    let people_dir_for_fallback = people_dir.clone();
     let user_id_for_scan = user_id.clone();
-    let path = tokio::task::spawn_blocking(move || {
+    let path = smol::unblock(move || {
         find_profile_path_by_qq_id(&people_dir, &user_id_for_scan).unwrap_or(fallback)
     })
-    .await
-    .unwrap_or_else(|e| {
-        warn!("[People] Profile path scan task failed: {}", e);
-        people_dir_for_fallback.join(format!("{}.md", user_id))
-    });
+    .await;
 
     state
         .people_profile_paths
@@ -247,11 +242,7 @@ async fn create_profile_file_async(
     nickname: String,
     group_cards: HashMap<String, GroupCardInfo>,
 ) -> Result<(), std::io::Error> {
-    tokio::task::spawn_blocking(move || {
-        create_profile_file(&path, user_id, &nickname, &group_cards)
-    })
-    .await
-    .map_err(std::io::Error::other)?
+    smol::unblock(move || create_profile_file(&path, user_id, &nickname, &group_cards)).await
 }
 
 /// Sync an existing profile file with bridge-managed metadata.
@@ -317,7 +308,7 @@ async fn sync_profile_file_async(
     group_id: Option<String>,
     card: Option<String>,
 ) -> Result<(), std::io::Error> {
-    tokio::task::spawn_blocking(move || {
+    smol::unblock(move || {
         sync_profile_file(
             &path,
             user_id,
@@ -327,7 +318,6 @@ async fn sync_profile_file_async(
         )
     })
     .await
-    .map_err(std::io::Error::other)?
 }
 
 fn extract_group_cards_from_body(body: &str) -> HashMap<String, GroupCardInfo> {
@@ -545,7 +535,7 @@ pub async fn find_sender_profile(
     let cached_path = state.people_profile_paths.read().await.get(&qq_id).cloned();
     let qq_id_for_scan = qq_id.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = smol::unblock(move || {
         find_sender_profile_block(
             &people_dir,
             &qq_id_for_scan,
@@ -553,9 +543,7 @@ pub async fn find_sender_profile(
             cached_path.as_deref(),
         )
     })
-    .await
-    .ok()
-    .flatten();
+    .await;
 
     if let Some((path, block)) = result {
         state.people_profile_paths.write().await.insert(qq_id, path);
@@ -630,9 +618,7 @@ fn profile_block_from_path(path: &Path, qq_id: &str, display_name: &str) -> Opti
 /// Count total .md profile files in the people directory.
 pub async fn count_profiles(state: &SharedState) -> usize {
     let people_dir = state.config.read().await.people_dir.clone();
-    tokio::task::spawn_blocking(move || count_profiles_in_dir(&people_dir))
-        .await
-        .unwrap_or(0)
+    smol::unblock(move || count_profiles_in_dir(&people_dir)).await
 }
 
 fn count_profiles_in_dir(people_dir: &std::path::Path) -> usize {

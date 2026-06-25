@@ -3,10 +3,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::timeout;
+use smol::channel;
+use smol::lock::Mutex;
 use tracing::{debug, warn};
-use warp::ws::Message;
+use trillium_smol::SmolRuntime;
+use trillium_websockets::Message;
 
 use super::event::{
     ApiRequest, ApiResponse, MessageSegment, extract_files, extract_images, extract_media_summary,
@@ -19,7 +20,7 @@ pub struct PendingCalls(Arc<PendingCallsInner>);
 
 struct PendingCallsInner {
     closed: AtomicBool,
-    calls: Mutex<std::collections::HashMap<String, oneshot::Sender<ApiResponse>>>,
+    calls: Mutex<std::collections::HashMap<String, channel::Sender<ApiResponse>>>,
 }
 
 impl PendingCalls {
@@ -42,7 +43,7 @@ impl PendingCalls {
     async fn insert(
         &self,
         echo: String,
-        sender: oneshot::Sender<ApiResponse>,
+        sender: channel::Sender<ApiResponse>,
     ) -> Result<(), String> {
         if self.is_closed() {
             return Err("OneBot connection closed".to_string());
@@ -56,7 +57,7 @@ impl PendingCalls {
         Ok(())
     }
 
-    async fn remove(&self, echo: &str) -> Option<oneshot::Sender<ApiResponse>> {
+    async fn remove(&self, echo: &str) -> Option<channel::Sender<ApiResponse>> {
         self.0.calls.lock().await.remove(echo)
     }
 }
@@ -67,7 +68,7 @@ impl PendingCalls {
 /// be sent back through the currently connected WebSocket and correlated by echo.
 #[derive(Clone)]
 pub struct OneBotApiHandle {
-    pub ws_tx: mpsc::UnboundedSender<Message>,
+    pub ws_tx: channel::Sender<Message>,
     pub pending: PendingCalls,
     pub connection_id: u64,
 }
@@ -76,7 +77,7 @@ pub struct OneBotApiHandle {
 ///
 /// Uses the `echo` field to match request → response.
 pub async fn call_api(
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
     action: &str,
     params: serde_json::Value,
@@ -94,12 +95,12 @@ pub async fn call_api(
     let msg_text =
         serde_json::to_string(&request).map_err(|e| format!("serialize error: {}", e))?;
 
-    let (resp_tx, resp_rx) = oneshot::channel();
+    let (resp_tx, resp_rx) = channel::bounded(1);
 
     // Register pending call before sending so fast API responses cannot race us.
     pending.insert(echo.clone(), resp_tx).await?;
 
-    if let Err(e) = ws_tx.send(Message::text(msg_text)) {
+    if let Err(e) = ws_tx.send(Message::Text(msg_text.into())).await {
         pending.remove(&echo).await;
         return Err(format!("ws send error: {}", e));
     }
@@ -107,15 +108,17 @@ pub async fn call_api(
     debug!("API call sent: {} (echo={})", action, echo);
 
     // Wait for response with timeout
-    let result = timeout(Duration::from_secs(timeout_secs), resp_rx).await;
+    let result = SmolRuntime::default()
+        .timeout(Duration::from_secs(timeout_secs), resp_rx.recv())
+        .await;
 
     // Clean up pending entry
     pending.remove(&echo).await;
 
     match result {
-        Ok(Ok(resp)) => validate_api_response(action, resp),
-        Ok(Err(_)) => Err("response channel closed".to_string()),
-        Err(_) => Err(format!("API call timeout: {} ({}s)", action, timeout_secs)),
+        Some(Ok(resp)) => validate_api_response(action, resp),
+        Some(Err(_)) => Err("response channel closed".to_string()),
+        None => Err(format!("API call timeout: {} ({}s)", action, timeout_secs)),
     }
 }
 
@@ -154,7 +157,7 @@ pub async fn try_resolve_api_response(
                 "API response resolved: echo={}, status={}",
                 echo, response.status
             );
-            let _ = sender.send(response);
+            let _ = sender.send(response).await;
             return Some(());
         } else {
             debug!("No pending call for echo: {}", echo);
@@ -166,7 +169,7 @@ pub async fn try_resolve_api_response(
 /// Convenience: send a text message via OneBot send_msg API.
 /// Automatically converts `[emoji:NAME]` patterns to face segments.
 pub async fn send_text_message(
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
     message_type: &str,
     target_id: i64,
@@ -197,7 +200,7 @@ pub async fn send_text_message(
 /// If `at_user_id` is Some and message_type is "group", also adds an @mention segment.
 #[allow(clippy::too_many_arguments)]
 pub async fn send_reply_message(
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
     message_type: &str,
     target_id: i64,
@@ -246,7 +249,7 @@ pub struct QuotedMessage {
 /// Fetch a message by its ID using the OneBot get_msg API.
 /// Returns a QuotedMessage with text content on success.
 pub async fn get_msg(
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
     message_id: &str,
     timeout_secs: u64,
@@ -267,7 +270,7 @@ pub async fn get_msg(
 /// Fetch forwarded/merged message content using the OneBot get_forward_msg API.
 /// Returns a list of (sender_nickname, message_text) for each node in the forward.
 pub async fn get_forward_msg(
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
     forward_id: &str,
     timeout_secs: u64,
@@ -331,7 +334,7 @@ pub async fn get_forward_msg(
 
 /// Fetch a group title by group_id using direct group info, with group list as fallback.
 pub async fn get_group_name(
-    ws_tx: &mpsc::UnboundedSender<Message>,
+    ws_tx: &channel::Sender<Message>,
     pending: &PendingCalls,
     group_id: i64,
     timeout_secs: u64,
@@ -485,8 +488,10 @@ mod tests {
         PendingCalls, call_api, parse_group_name, parse_quoted_message, validate_api_response,
     };
     use crate::onebot::event::ApiResponse;
+    use macro_rules_attribute::apply;
     use serde_json::json;
-    use tokio::sync::mpsc;
+    use smol::channel;
+    use smol_macros::test;
 
     #[test]
     fn quoted_image_message_becomes_media_summary_not_cq_code() {
@@ -572,9 +577,9 @@ mod tests {
         assert_eq!(parse_group_name(&json!({"group_name": "   "})), None);
     }
 
-    #[tokio::test]
+    #[apply(test!)]
     async fn closed_pending_calls_fail_before_ws_send() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, rx) = channel::unbounded();
         let pending = PendingCalls::new();
         pending.close_all().await;
 

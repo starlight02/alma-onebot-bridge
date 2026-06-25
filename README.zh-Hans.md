@@ -15,12 +15,12 @@
 - **Alma 群命令兼容**：`alma group list/history/search/context` 可以读取 QQ 群日志。主动发 QQ 消息走桥接器 HTTP 端点，因为 `alma group send` 面向 Telegram。
 - **富消息处理**：桥接器把 QQ 表情转成文本，给图片/语音/视频加标签，并提取转发消息内容。
 - **回复和 @提及**：桥接器处理 incoming 引用上下文和 outgoing 回复引用，群聊回复会 @发送者。
-- **People Profiles**：桥接器为 QQ 用户创建 Alma People Profile，写入 `qq_id` frontmatter。
+- **People Profiles**：桥接器为 QQ 用户创建 Alma People Profile，写入 `qq_id` 和 `telegram_id` frontmatter，保证伪装 Telegram 的 Alma 匹配链路继续工作。
 - **消息分段**：长回复先按段落拆分，再按 QQ 的 4500 字限制拆分。
 - **状态持久化**：Turso 保存线程映射、用户资料、QQ群名和群名片元数据。
 - **安全认证**：WebSocket 可要求 `Bearer` token。HTTP 发送端点接受本机 loopback 或有效 token。
 - **配置**：支持 TOML 配置文件和 macOS 设置窗口。
-- **macOS 应用**：菜单栏应用管理桥接服务、设置、日志、启动/停止/重启和退出。
+- **桌面应用**：macOS 菜单栏应用和 Windows 托盘应用管理桥接服务、设置、日志、启动/停止/重启和退出。
 
 ## 架构
 
@@ -39,7 +39,7 @@ flowchart LR
     onebot -->|"QQ 投递"| qq
 ```
 
-桥接服务同时作为 OneBot 客户端的 **WebSocket 服务器** 和 Alma 内部聊天管线的 **WebSocket 客户端**（`ws://localhost:23001/ws/threads`）。
+桥接服务同时作为 OneBot 客户端的 **WebSocket 服务器** 和 Alma 内部聊天管线的 **WebSocket 客户端**（`ws://localhost:23001/ws/threads`）。运行时栈是 `smol` + Trillium（`trillium-smol`、`trillium-router`、`trillium-websockets`、`trillium-client`、`trillium-rustls`）；Alma 侧出站 WS 客户端使用 `trillium-websockets` re-export 的 `async-tungstenite`。
 
 ## 快速开始
 
@@ -87,6 +87,17 @@ INSTALL_TO_APPLICATIONS=1 ./scripts/build-macos.sh
 ```
 
 macOS 说明：[platforms/macos/README.md](./platforms/macos/README.md)。
+
+### Windows 托盘应用
+
+Windows 应用是 Rust + WinUI 托盘程序，桥接服务在进程内后台运行。发布包同时提供 Velopack MSI 和便携 ZIP：
+
+```powershell
+.\scripts\package-windows-velopack.ps1
+.\scripts\package-windows-zip.ps1
+```
+
+Windows 说明：[platforms/windows/README.md](./platforms/windows/README.md)。
 
 ### 配置
 
@@ -195,7 +206,7 @@ RUST_LOG=debug ./target/debug/alma-onebot-bridge --debugger
 
 ### 双向同步（Alma GUI → QQ）
 
-在 Alma GUI 中为已跟踪的线程发送消息时，回复会转发到对应的 QQ 会话。去重机制（前 100 字符比较）防止桥接服务自身生成的回复被重复转发。
+在 Alma GUI 中为已跟踪的线程发送消息时，回复会转发到对应的 QQ 会话。桥接器使用规范化后的可见文本去重，防止自身生成的回复被重复转发，同时不会误杀只是共享长前缀的不同消息。
 
 ### Alma 群命令和主动发送
 

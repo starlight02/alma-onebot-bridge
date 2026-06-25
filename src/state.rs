@@ -4,10 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use reqwest::Client;
 use serde::Serialize;
-use tokio::sync::RwLock;
+use smol::lock::RwLock;
 use tracing::{debug, error, info};
+use trillium_client::Client;
+use trillium_rustls::{RustlsClientConfig, RustlsConfig};
+use trillium_smol::ClientConfig as SmolClientConfig;
 use turso::Builder;
 
 use crate::alma_ws::{AlmaEvent, AlmaWsClient};
@@ -112,7 +114,7 @@ struct SentReply {
 
 /// Application-wide shared state.
 pub struct AppState {
-    pub http_client: Client,
+    pub http_client: Arc<Client>,
     pub config: RwLock<Config>,
     pub db: turso::Database,
     pub default_model: RwLock<Option<String>>,
@@ -132,7 +134,7 @@ pub struct AppState {
     /// Active OneBot reverse-WS API path for HTTP command endpoints.
     onebot_api: RwLock<Option<OneBotApiHandle>>,
     /// Broadcast channel: Alma GUI events → OneBot handler (for bidirectional forwarding)
-    pub alma_event_tx: tokio::sync::broadcast::Sender<AlmaEvent>,
+    pub alma_event_tx: async_broadcast::Sender<AlmaEvent>,
     /// Monotonic generation for active OneBot reverse WS connections.
     /// Only the newest connection may forward Alma GUI events to QQ.
     onebot_connection_epoch: AtomicU64,
@@ -237,7 +239,8 @@ impl SharedState {
 
         let known_group_ids = load_known_group_ids(&conn).await?;
 
-        let (alma_event_tx, _) = tokio::sync::broadcast::channel(64);
+        let (mut alma_event_tx, _) = async_broadcast::broadcast(64);
+        alma_event_tx.set_overflow(true);
 
         Ok(SharedState(Arc::new(AppState {
             // No global request timeout: Alma control-plane REST calls
@@ -248,9 +251,10 @@ impl SharedState {
             // would cap REST calls below the configured generation timeout
             // (alma_run_timeout_secs, default 120s) and cause spurious
             // failures under load. Each call site applies the timeout it needs.
-            http_client: Client::builder()
-                .build()
-                .expect("Failed to build HTTP client"),
+            http_client: Arc::new(Client::new(RustlsConfig::new(
+                RustlsClientConfig::default(),
+                SmolClientConfig::new().with_nodelay(true),
+            ))),
             config: RwLock::new(config),
             db,
             default_model: RwLock::new(None),
@@ -851,6 +855,8 @@ fn sent_reply_matches(sent: &str, candidate: &str) -> bool {
 mod tests {
     use super::{ReverseThreadCache, SESSION_REVERSE_LIMIT, SharedState, sent_reply_matches};
     use crate::config::Config;
+    use macro_rules_attribute::apply;
+    use smol_macros::test;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -889,7 +895,7 @@ mod tests {
 
     /// Reproduces log case: pipeline registers sanitize'd text; Alma WS sends
     /// `message_updated` with `<br/>` — must still dedup (835 vs 836 char class).
-    #[tokio::test]
+    #[apply(test!)]
     async fn was_sent_recently_matches_after_normalize_mismatch() {
         let db_path = temp_db_path("dedup-normalize");
         let mut config = Config::load();
@@ -905,7 +911,7 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
     }
 
-    #[tokio::test]
+    #[apply(test!)]
     async fn onebot_connection_epoch_keeps_only_latest_current() {
         let db_path = temp_db_path("connection-epoch");
         let mut config = Config::load();
@@ -942,7 +948,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[apply(test!)]
     async fn malformed_session_key_returns_no_qq_target() {
         let db_path = temp_db_path("malformed-session-key");
         let mut config = Config::load();
@@ -959,7 +965,7 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
     }
 
-    #[tokio::test]
+    #[apply(test!)]
     async fn touch_group_reports_new_groups_and_loads_existing_groups_on_startup() {
         let db_path = temp_db_path("known-groups");
         let mut config = Config::load();

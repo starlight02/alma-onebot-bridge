@@ -1,6 +1,6 @@
+use serde_json::Value;
 use serde_json::json;
 use std::time::Duration;
-use tokio::time::timeout;
 use tracing::{debug, info};
 
 use crate::state::SharedState;
@@ -14,38 +14,76 @@ use crate::state::SharedState;
 /// failure is never blamed on a timeout the user can't see.
 const ALMA_REST_TIMEOUT: Duration = Duration::from_secs(180);
 
+async fn get_json(state: &SharedState, url: &str) -> Result<(u16, Value), String> {
+    let conn = state
+        .http_client
+        .get(url)
+        .with_timeout(ALMA_REST_TIMEOUT)
+        .await
+        .map_err(format_alma_http_error)?;
+    read_json_response(conn).await
+}
+
+async fn post_json(state: &SharedState, url: &str, body: Value) -> Result<(u16, Value), String> {
+    let conn = state
+        .http_client
+        .post(url)
+        .with_json_body(&body)
+        .map_err(|e| format!("Failed to serialize JSON body: {}", e))?
+        .with_timeout(ALMA_REST_TIMEOUT)
+        .await
+        .map_err(format_alma_http_error)?;
+    read_json_response(conn).await
+}
+
+async fn read_json_response(mut conn: trillium_client::Conn) -> Result<(u16, Value), String> {
+    let status = conn.status().map(u16::from).unwrap_or(0);
+    let body_text = conn
+        .response_body()
+        .read_string()
+        .await
+        .map_err(|e| format!("Failed to read Alma response body: {}", e))?;
+    let body = if body_text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&body_text).unwrap_or(Value::Null)
+    };
+    Ok((status, body))
+}
+
+fn format_alma_http_error(error: trillium_client::Error) -> String {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        format!(
+            "HTTP request timed out after {}s",
+            ALMA_REST_TIMEOUT.as_secs()
+        )
+    } else {
+        format!("HTTP request failed: {}", message)
+    }
+}
+
 /// Create a new thread via Alma REST API. Returns the thread ID.
 pub async fn create_thread(state: &SharedState, title: &str) -> Result<String, String> {
     let url = format!("{}/api/threads", state.config.read().await.alma_api);
 
-    let resp = timeout(
-        ALMA_REST_TIMEOUT,
-        state
-            .http_client
-            .post(&url)
-            .json(&json!({"title": title}))
-            .send(),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "Create thread timed out after {}s",
-            ALMA_REST_TIMEOUT.as_secs()
-        )
-    })?
-    .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Alma API returned status {}",
-            resp.status().as_u16()
-        ));
-    }
-
-    let body: serde_json::Value = resp
-        .json()
+    let (status, body) = post_json(state, &url, json!({"title": title}))
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|e| {
+            if e.contains("timed out") {
+                format!(
+                    "Create thread timed out after {}s",
+                    ALMA_REST_TIMEOUT.as_secs()
+                )
+            } else {
+                e
+            }
+        })?;
+
+    if !(200..300).contains(&status) {
+        return Err(format!("Alma API returned status {}", status));
+    }
 
     let thread_id = body
         .get("id")
@@ -70,29 +108,24 @@ pub async fn fetch_thread_model(
         thread_id
     );
 
-    let resp = timeout(ALMA_REST_TIMEOUT, state.http_client.get(&url).send())
-        .await
-        .map_err(|_| {
+    let (status, body) = get_json(state, &url).await.map_err(|e| {
+        if e.contains("timed out") {
             format!(
                 "Fetch thread {} timed out after {}s",
                 thread_id,
                 ALMA_REST_TIMEOUT.as_secs()
             )
-        })?
-        .map_err(|e| format!("Failed to fetch thread {}: {}", thread_id, e))?;
+        } else {
+            format!("Failed to fetch thread {}: {}", thread_id, e)
+        }
+    })?;
 
-    if !resp.status().is_success() {
+    if !(200..300).contains(&status) {
         return Err(format!(
             "Thread API returned status {} for {}",
-            resp.status().as_u16(),
-            thread_id
+            status, thread_id
         ));
     }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse thread {} response: {}", thread_id, e))?;
 
     Ok(body
         .get("model")
@@ -107,27 +140,20 @@ pub async fn fetch_thread_model(
 pub async fn fetch_default_model(state: &SharedState) -> Result<String, String> {
     let url = format!("{}/api/settings", state.config.read().await.alma_api);
 
-    let resp = timeout(ALMA_REST_TIMEOUT, state.http_client.get(&url).send())
-        .await
-        .map_err(|_| {
+    let (status, body) = get_json(state, &url).await.map_err(|e| {
+        if e.contains("timed out") {
             format!(
                 "Fetch settings timed out after {}s",
                 ALMA_REST_TIMEOUT.as_secs()
             )
-        })?
-        .map_err(|e| format!("Failed to fetch settings: {}", e))?;
+        } else {
+            format!("Failed to fetch settings: {}", e)
+        }
+    })?;
 
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Settings API returned status {}",
-            resp.status().as_u16()
-        ));
+    if !(200..300).contains(&status) {
+        return Err(format!("Settings API returned status {}", status));
     }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse settings: {}", e))?;
 
     let model = body
         .get("chat")
@@ -148,28 +174,28 @@ pub async fn thread_exists(state: &SharedState, thread_id: &str) -> Result<bool,
         thread_id
     );
 
-    let resp = timeout(ALMA_REST_TIMEOUT, state.http_client.get(&url).send())
-        .await
-        .map_err(|_| {
+    let (status, _body) = get_json(state, &url).await.map_err(|e| {
+        if e.contains("timed out") {
             format!(
                 "Thread {} existence check timed out after {}s",
                 thread_id,
                 ALMA_REST_TIMEOUT.as_secs()
             )
-        })?
-        .map_err(|e| format!("Failed to fetch thread {}: {}", thread_id, e))?;
+        } else {
+            format!("Failed to fetch thread {}: {}", thread_id, e)
+        }
+    })?;
 
-    if resp.status().is_success() {
+    if (200..300).contains(&status) {
         return Ok(true);
     }
 
-    if resp.status().as_u16() == 404 {
+    if status == 404 {
         return Ok(false);
     }
 
     Err(format!(
         "Thread API returned status {} for {}",
-        resp.status().as_u16(),
-        thread_id
+        status, thread_id
     ))
 }

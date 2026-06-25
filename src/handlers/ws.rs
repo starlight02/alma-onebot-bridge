@@ -1,10 +1,11 @@
-use futures_util::{SinkExt, StreamExt};
+use futures_lite::StreamExt as _;
+use futures_util::{FutureExt, select};
+use smol::channel;
 use std::collections::HashMap;
-use tokio::sync::{mpsc, watch};
-use tokio::time::{Duration, timeout};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
-use warp::ws::{Message, WebSocket};
+use trillium_smol::SmolRuntime;
+use trillium_websockets::{Message, WebSocketConn};
 
 use crate::auth::is_ws_authorized;
 use crate::onebot::{OneBotApiHandle, PendingCalls, try_resolve_api_response};
@@ -16,7 +17,7 @@ const MAX_INCOMING_TEXT_BYTES: usize = 1_000_000;
 /// Handle a new reverse WebSocket connection from the OneBot client.
 /// Validates the current access token if configured.
 pub async fn handle_ws_connection(
-    ws: WebSocket,
+    mut ws: WebSocketConn,
     state: SharedState,
     auth_header: Option<String>,
     query: HashMap<String, String>,
@@ -28,18 +29,21 @@ pub async fn handle_ws_connection(
         return;
     }
 
+    let Some(mut stream) = ws.take_inbound_stream() else {
+        warn!("WebSocket connection has no inbound stream");
+        return;
+    };
+
     let connection_id = state.register_onebot_connection();
     info!(
         "OneBot client connected via WebSocket (connection_id={})",
         connection_id
     );
 
-    let (ws_sink, ws_stream) = ws.split();
-
     // Channel for pushing messages TO the WebSocket (any task can send)
-    let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Message>();
-    let mut ws_rx = UnboundedReceiverStream::new(ws_rx);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ws_tx, ws_rx) = channel::unbounded::<Message>();
+    let (mut shutdown_tx, shutdown_rx) = async_broadcast::broadcast::<bool>(1);
+    shutdown_tx.set_overflow(true);
 
     // Pending API call correlation map
     let pending_calls = PendingCalls::new();
@@ -52,11 +56,12 @@ pub async fn handle_ws_connection(
         .await;
 
     // ── Bidirectional: subscribe to Alma events → forward to QQ ──────────
-    let mut alma_event_rx = state.alma_event_tx.subscribe();
+    let mut alma_event_rx = state.alma_event_tx.new_receiver();
     let fwd_state = state.clone();
     let fwd_tx = ws_tx.clone();
     let fwd_pending = pending_calls.clone();
-    let forwarding = tokio::spawn(async move {
+    let mut fwd_shutdown = shutdown_rx.clone();
+    SmolRuntime::default().spawn(async move {
         loop {
             if !fwd_state.is_current_onebot_connection(connection_id) {
                 info!(
@@ -66,36 +71,51 @@ pub async fn handle_ws_connection(
                 break;
             }
 
-            match alma_event_rx.recv().await {
-                Ok(event) => {
-                    if let Err(e) =
-                        handle_alma_event(&event, &fwd_state, &fwd_tx, &fwd_pending).await
-                    {
-                        warn!("[Alma→QQ] Forwarding error: {}", e);
+            let event = alma_event_rx.recv().fuse();
+            let closed = fwd_shutdown.recv().fuse();
+            futures_util::pin_mut!(event, closed);
+            select! {
+                result = event => {
+                    match result {
+                        Ok(event) => {
+                            if let Err(e) =
+                                handle_alma_event(&event, &fwd_state, &fwd_tx, &fwd_pending).await
+                            {
+                                warn!("[Alma→QQ] Forwarding error: {}", e);
+                            }
+                        }
+                        Err(async_broadcast::RecvError::Overflowed(n)) => {
+                            warn!("[Alma→QQ] Event receiver lagged {} events", n);
+                        }
+                        Err(async_broadcast::RecvError::Closed) => break,
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("[Alma→QQ] Event receiver lagged {} events", n);
+                _ = closed => {
+                    debug!(
+                        "[Alma→QQ] Connection {} closed; stopping forwarding task",
+                        connection_id
+                    );
+                    break;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
 
     // ── Writer task: channel → WebSocket ─────────────────────────────────
-    let writer = tokio::spawn(async move {
-        let mut sink = ws_sink;
-        while let Some(msg) = ws_rx.next().await {
-            if let Err(e) = SinkExt::send(&mut sink, msg).await {
+    let (writer_done_tx, writer_done_rx) = channel::bounded::<()>(1);
+    SmolRuntime::default().spawn(async move {
+        let mut socket = ws;
+        while let Ok(msg) = ws_rx.recv().await {
+            if let Err(e) = socket.send(msg).await {
                 debug!("WS writer ended: {}", e);
                 break;
             }
         }
         debug!("WS writer task finished");
+        let _ = writer_done_tx.send(()).await;
     });
 
     // ── Reader task: WebSocket → dispatch ────────────────────────────────
-    let mut stream = ws_stream;
     let mut self_id: Option<i64> = None;
 
     while let Some(result) = stream.next().await {
@@ -124,7 +144,7 @@ pub async fn handle_ws_connection(
             continue;
         }
 
-        let text = match msg.to_str() {
+        let text = match msg.to_text() {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -178,14 +198,17 @@ pub async fn handle_ws_connection(
                     let tx = ws_tx.clone();
                     let pc = pending_calls.clone();
                     let mut shutdown = shutdown_rx.clone();
-                    tokio::spawn(async move {
-                        tokio::select! {
-                            result = process_message_event(&event, &st, &tx, &pc) => {
+                    SmolRuntime::default().spawn(async move {
+                        let processing = process_message_event(&event, &st, &tx, &pc).fuse();
+                        let closed = shutdown.recv().fuse();
+                        futures_util::pin_mut!(processing, closed);
+                        select! {
+                            result = processing => {
                                 if let Err(e) = result {
                                     error!("Message processing error: {}", e);
                                 }
                             }
-                            _ = shutdown.changed() => {
+                            _ = closed => {
                                 debug!("Message processing cancelled because OneBot connection closed");
                             }
                         }
@@ -245,12 +268,15 @@ pub async fn handle_ws_connection(
             .unwrap_or_default()
     );
     state.clear_onebot_api_handle(connection_id).await;
-    let _ = shutdown_tx.send(true);
+    let _ = shutdown_tx.broadcast(true).await;
     pending_calls.close_all().await;
-    let _ = ws_tx.send(Message::close());
+    let _ = ws_tx.send(Message::Close(None)).await;
     drop(ws_tx);
-    forwarding.abort();
-    if timeout(Duration::from_secs(2), writer).await.is_err() {
+    if SmolRuntime::default()
+        .timeout(Duration::from_secs(2), writer_done_rx.recv())
+        .await
+        .is_none()
+    {
         warn!(
             "WS writer did not finish after close frame for connection {}; aborting",
             connection_id

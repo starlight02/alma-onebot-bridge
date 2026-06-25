@@ -8,7 +8,7 @@ use alma_onebot_bridge::{
     BridgeRunHooks, BridgeRunOptions, Config, init_tracing_with_log_file,
     run_bridge_until_with_hooks,
 };
-use tokio::sync::oneshot;
+use smol::channel;
 
 use crate::config_model::ConfigModel;
 
@@ -46,7 +46,7 @@ pub struct AppSnapshot {
 #[derive(Debug)]
 struct BridgeInner {
     status: BridgeStatus,
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_tx: Option<channel::Sender<()>>,
 }
 
 pub struct AppState {
@@ -108,7 +108,7 @@ impl AppState {
             return;
         }
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
         inner.shutdown_tx = Some(shutdown_tx);
         inner.status = BridgeStatus::Starting;
         drop(inner);
@@ -129,24 +129,11 @@ impl AppState {
                     }
                 })),
             };
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(e) => {
-                    let mut inner = state.inner.lock().expect("bridge state poisoned");
-                    inner.shutdown_tx = None;
-                    inner.status =
-                        BridgeStatus::Failed(format!("Failed to start async runtime: {e}"));
-                    return;
-                }
-            };
-            let result = runtime.block_on(run_bridge_until_with_hooks(
+            let result = smol::block_on(run_bridge_until_with_hooks(
                 config,
                 options,
                 async move {
-                    let _ = shutdown_rx.await;
+                    let _ = shutdown_rx.recv().await;
                 },
                 hooks,
             ));
@@ -164,7 +151,7 @@ impl AppState {
         let mut inner = self.inner.lock().expect("bridge state poisoned");
         if let Some(shutdown_tx) = inner.shutdown_tx.take() {
             inner.status = BridgeStatus::Stopping;
-            let _ = shutdown_tx.send(());
+            let _ = shutdown_tx.try_send(());
         } else {
             inner.status = BridgeStatus::Stopped;
         }

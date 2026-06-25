@@ -1,23 +1,22 @@
 use std::env;
 
 use alma_onebot_bridge::{
-    BridgeRunOptions, Config, apply_debugger_defaults, init_tracing, run_bridge_until,
-    shutdown_signal,
+    BridgeRunOptions, Config, init_tracing, run_bridge_until, shutdown_signal,
 };
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    smol::block_on(async_main());
+}
+
+async fn async_main() {
     let _tracing_guard = init_tracing();
 
     let debugger_mode = env::args().any(|arg| arg == "--debugger");
-    let mut config = Config::load();
-    if debugger_mode {
-        apply_debugger_defaults(&mut config);
-    }
+    let config = Config::load();
 
     let options = BridgeRunOptions {
-        debugger_mode: false,
-        write_pid_file: true,
+        debugger_mode,
+        write_pid_file: !debugger_mode,
     };
 
     if let Err(e) = run_bridge_until(config, options, shutdown_signal()).await {
