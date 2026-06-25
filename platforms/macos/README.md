@@ -51,6 +51,8 @@ Common settings:
 - Access token: optional token for OneBot WebSocket auth and non-local HTTP send commands
 - Group history size: how many recent group messages are sent to Alma as context
 - Thinking message: optional message sent before a slow AI reply
+- Tool call display: optional QQ status messages for Alma tool invocations, formatted as `正在调用工具：...`.
+- Segmented replies: optional paragraph-level reply splitting. Tool-boundary stage messages are always enabled to match Alma's Telegram bridge.
 
 Preferences are saved to:
 

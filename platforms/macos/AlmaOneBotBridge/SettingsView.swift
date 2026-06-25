@@ -228,6 +228,18 @@ struct SettingsView: View {
                     .labelsHidden()
                     .toggleStyle(.switch)
             }
+
+            LabeledContent("显示工具调用") {
+                Toggle("", isOn: $editing.showToolCalls)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+
+            LabeledContent("分段式回复") {
+                Toggle("", isOn: $editing.segmentedReplies)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
         }
     }
 

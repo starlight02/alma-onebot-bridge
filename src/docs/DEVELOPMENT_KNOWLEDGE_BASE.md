@@ -178,7 +178,14 @@ During generation, `message_delta` events carry incremental text:
 }
 ```
 
-Only accumulate `partType: "text"` deltas. Ignore `reasoning` (thinking) deltas.
+Accumulate visible text from `text_append` with `partType: "text"`/`"output_text"`,
+`text-delta`, and `part_add` text parts. Ignore `reasoning` (thinking) deltas.
+When a `part_add` tool invocation arrives, emit the accumulated visible text as a
+Telegram-style stage message, but keep the generation pending until the final
+completion after tool results. The Alma generation timeout is an idle timeout:
+each emitted stage/tool-call progress event resets the wait window for the next
+stage, because tool execution can legitimately take longer than one initial
+request window.
 
 #### `<think>...</think>` Blocks
 
@@ -628,7 +635,7 @@ port = 8090
 [alma]
 api = "http://localhost:23001"
 model = "anthropic:claude-sonnet-4-20250514"  # Override Alma's default model
-timeout = 120                                  # Generation timeout in seconds
+timeout = 120                                  # Generation idle timeout in seconds; resets after each stage text
 max_retries = 2                                # Retry attempts for failed generations
 retry_delay_ms = 3000                          # Base delay between retries (exponential backoff)
 
@@ -645,6 +652,8 @@ api_timeout = 30
 [chat]
 group_history_size = 30        # Number of recent group messages for context (0 = disabled)
 # thinking_message = "思考中..."  # Optional message sent before AI generation starts
+show_tool_calls = false     # Show tool invocation status messages in QQ
+segmented_replies = false      # Split replies by paragraphs when enabled
 ```
 
 The bridge reads config in this order:
@@ -664,7 +673,7 @@ The macOS app starts the bridge in `~/.config/alma/bridge`, so the GUI-managed
 | `bridge.port` | `8090` | WebSocket/HTTP listen port |
 | `alma.api` | `http://localhost:23001` | Alma REST API base URL |
 | `alma.model` | *(Alma settings)* | Override AI model |
-| `alma.timeout` | `120` | Generation timeout (seconds) |
+| `alma.timeout` | `120` | Generation idle timeout (seconds). The window resets after each tool-boundary stage/tool-call progress event from Alma. |
 | `alma.max_retries` | `2` | Number of retry attempts for failed generations |
 | `alma.retry_delay_ms` | `3000` | Base delay between retries (ms, exponential backoff) |
 | `people.dir` | `~/.config/alma/people` | People profiles directory |
@@ -674,6 +683,8 @@ The macOS app starts the bridge in `~/.config/alma/bridge`, so the GUI-managed
 | `chat.group_history_size` | `30` | Number of recent group messages for context (0 = disabled) |
 | `chat.thinking_message` | *(none)* | Optional "thinking" message sent before generation |
 | `chat.show_thinking` | `false` | Send thinking blocks as separate QQ messages |
+| `chat.show_tool_calls` | `false` | Send `正在调用工具：...` status messages when Alma starts tool invocations |
+| `chat.segmented_replies` | `false` | Split each assistant reply by paragraphs before QQ length chunking |
 
 ### Model Priority
 
@@ -1176,8 +1187,10 @@ Built-in bridges always reply to the triggering user message:
 The QQ bridge additionally includes an `at` segment in group replies to @mention the
 triggering user, ensuring they receive a notification. Private chats omit the `at` segment.
 
-Only the first chunk of the first paragraph includes the reply reference (and @mention).
-Subsequent chunks are sent as plain messages.
+Only the first final-reply chunk includes the reply reference (and @mention). Stage
+messages sent before tool calls are plain messages, matching Alma's built-in Telegram
+bridge. `chat.segmented_replies=true` restores paragraph-level splitting; otherwise a
+reply is only split when it exceeds QQ's message length limit.
 
 ### 8.8 Outgoing Routing and Local Bridge Mapping
 

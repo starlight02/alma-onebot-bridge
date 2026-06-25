@@ -36,6 +36,31 @@ pub struct AlmaEvent {
     pub thinking_text: Option<String>,
 }
 
+/// A visible assistant text segment completed right before Alma starts a tool call.
+#[derive(Clone, Debug)]
+pub struct AlmaStageEvent {
+    pub thread_id: String,
+    pub message_text: String,
+    /// Full visible assistant prefix represented by this stage. The caller uses
+    /// this only after a successful platform send to strip the final reply.
+    pub visible_prefix: String,
+}
+
+/// A tool invocation started by Alma during a generation.
+#[derive(Clone, Debug)]
+pub struct AlmaToolCallEvent {
+    pub thread_id: String,
+    pub tool_name: String,
+    pub parameters_text: String,
+}
+
+/// Ordered progress events emitted by one Alma generation.
+#[derive(Clone, Debug)]
+pub enum AlmaProgressEvent {
+    StageText(AlmaStageEvent),
+    ToolCall(AlmaToolCallEvent),
+}
+
 /// Tracks a single in-flight generation request.
 struct PendingGeneration {
     /// Local bridge-owned generation id. Alma does not currently echo a request
@@ -44,6 +69,16 @@ struct PendingGeneration {
     generation_id: u64,
     /// Accumulated assistant text (text_append with partType "text")
     text: String,
+    /// Full visible prefix already emitted as stage events.
+    stage_sent_prefix: String,
+    /// Optional per-generation channel for Telegram-style progress messages.
+    progress_tx: Option<channel::Sender<AlmaProgressEvent>>,
+    /// Local signal to reset the generation idle timeout after a stage message.
+    activity_tx: channel::Sender<()>,
+    /// Alma can emit generation_completed/thread_generating=false after asking
+    /// for a tool, then continue the same assistant message after the tool
+    /// result. While this is true, completion events are not final.
+    awaiting_tool_continuation: bool,
     /// User message ID captured from message_added event (for retry support)
     user_message_id: Option<String>,
     /// `thread_generating=false` can arrive just before `generation_error`.
@@ -67,6 +102,7 @@ const STOP_GENERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 const STOP_GENERATION_DRAIN_POLL: Duration = Duration::from_millis(100);
 const STALE_BRIDGE_GENERATION_SUPPRESSION_TTL: Duration = Duration::from_secs(120);
 const BRIDGE_OWNED_ASSISTANT_MESSAGE_TTL: Duration = Duration::from_secs(60 * 60);
+const TOOL_PARAMETER_PREVIEW_LIMIT: usize = 1_000;
 
 #[derive(Clone, Debug)]
 struct RecentBridgeGeneration {
@@ -168,6 +204,7 @@ impl AlmaWsClient {
         timeout_secs: u64,
         source: &str,
         ephemeral_context: &str,
+        progress_tx: Option<channel::Sender<AlmaProgressEvent>>,
     ) -> GenerationResult {
         // Acquire per-thread guard to serialize generations for the same thread
         let guard = {
@@ -185,6 +222,8 @@ impl AlmaWsClient {
         }
 
         let (tx, rx) = channel::bounded(1);
+        let (activity_tx, activity_rx) = channel::unbounded();
+        let _activity_keepalive = activity_tx.clone();
         let generation_id = self.generation_seq.fetch_add(1, Ordering::Relaxed);
 
         // Register this generation request
@@ -205,6 +244,10 @@ impl AlmaWsClient {
                 PendingGeneration {
                     generation_id,
                     text: String::new(),
+                    stage_sent_prefix: String::new(),
+                    progress_tx,
+                    activity_tx,
+                    awaiting_tool_continuation: false,
                     user_message_id: None,
                     empty_response_grace_started: false,
                     result_tx: tx,
@@ -274,50 +317,69 @@ impl AlmaWsClient {
         )
         .await;
 
-        // Wait for the response with timeout
-        let generation_result = match SmolRuntime::default()
-            .timeout(Duration::from_secs(timeout_secs), rx.recv())
-            .await
-        {
-            Some(Ok(result)) => {
-                remember_bridge_activity(
-                    &self.bridge_suppressions,
-                    thread_id,
-                    RECENT_BRIDGE_GENERATION_TTL,
-                )
-                .await;
-                result
-            }
-            Some(Err(_)) => {
-                remove_pending_generation_if_matches(&self.pending, thread_id, generation_id).await;
-                Err("Generation channel closed unexpectedly".to_string())
-            }
-            None => {
-                warn!(
-                    "[AlmaWS] Generation {} for thread {} timed out after {}s; sending stop_generation before retry",
-                    generation_id, thread_id, timeout_secs
-                );
-                request_stop_generation(&self.ws_tx, thread_id);
-                remember_bridge_activity(
-                    &self.bridge_suppressions,
-                    thread_id,
-                    STALE_BRIDGE_GENERATION_SUPPRESSION_TTL,
-                )
-                .await;
-                if wait_for_generation_drain(&self.pending, thread_id, generation_id).await {
-                    info!(
-                        "[AlmaWS] Stale generation {} for thread {} drained after stop_generation",
-                        generation_id, thread_id
-                    );
-                } else {
-                    warn!(
-                        "[AlmaWS] Stale generation {} for thread {} did not drain after stop_generation; dropping local pending slot",
-                        generation_id, thread_id
-                    );
-                    remove_pending_generation_if_matches(&self.pending, thread_id, generation_id)
-                        .await;
+        // Wait for final response with an idle timeout. Telegram-compatible
+        // stage messages reset this window; raw token deltas do not.
+        let generation_result = loop {
+            let result_fut = rx.recv().fuse();
+            let activity_fut = activity_rx.recv().fuse();
+            let runtime = SmolRuntime::default();
+            let timeout_fut = runtime.delay(Duration::from_secs(timeout_secs)).fuse();
+            futures_util::pin_mut!(result_fut, activity_fut, timeout_fut);
+
+            select! {
+                result = result_fut => {
+                    break match result {
+                        Ok(result) => {
+                            remember_bridge_activity(
+                                &self.bridge_suppressions,
+                                thread_id,
+                                RECENT_BRIDGE_GENERATION_TTL,
+                            )
+                            .await;
+                            result
+                        }
+                        Err(_) => {
+                            remove_pending_generation_if_matches(&self.pending, thread_id, generation_id).await;
+                            Err("Generation channel closed unexpectedly".to_string())
+                        }
+                    };
                 }
-                Err(format!("Generation timed out after {}s", timeout_secs))
+                activity = activity_fut => {
+                    if activity.is_ok() {
+                        debug!(
+                            "[AlmaWS] Stage activity for generation {} in thread {}; timeout window reset to {}s",
+                            generation_id, thread_id, timeout_secs
+                        );
+                        continue;
+                    }
+                }
+                _ = timeout_fut => {
+                    warn!(
+                        "[AlmaWS] Generation {} for thread {} idle-timed out after {}s; sending stop_generation before retry",
+                        generation_id, thread_id, timeout_secs
+                    );
+                    request_stop_generation(&self.ws_tx, thread_id);
+                    remember_bridge_activity(
+                        &self.bridge_suppressions,
+                        thread_id,
+                        STALE_BRIDGE_GENERATION_SUPPRESSION_TTL,
+                    )
+                    .await;
+                    if wait_for_generation_drain(&self.pending, thread_id, generation_id).await {
+                        info!(
+                            "[AlmaWS] Stale generation {} for thread {} drained after stop_generation",
+                            generation_id, thread_id
+                        );
+                    } else {
+                        warn!(
+                            "[AlmaWS] Stale generation {} for thread {} did not drain after stop_generation; dropping local pending slot",
+                            generation_id, thread_id
+                        );
+                        remove_pending_generation_if_matches(&self.pending, thread_id, generation_id)
+                            .await;
+                    }
+                    break Err(format!("Generation timed out after {}s", timeout_secs));
+                }
             }
         };
 
@@ -601,6 +663,244 @@ fn pending_generation_parts(pg: &PendingGeneration) -> (String, Option<String>, 
     (trimmed, thinking, user_msg_id)
 }
 
+fn stage_unsent_text(visible_text: &str, sent_prefix: &str) -> String {
+    let remaining = visible_text
+        .strip_prefix(sent_prefix)
+        .unwrap_or(visible_text)
+        .trim();
+    remaining.to_string()
+}
+
+fn append_text_delta(pg: &mut PendingGeneration, delta: &Value) -> bool {
+    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let part_type = delta.get("partType").and_then(|t| t.as_str()).unwrap_or("");
+
+    if delta_type == "text_append"
+        && matches!(part_type, "text" | "output_text")
+        && let Some(text) = delta.get("text").and_then(|t| t.as_str())
+    {
+        pg.text.push_str(text);
+        pg.awaiting_tool_continuation = false;
+        pg.empty_response_grace_started = false;
+        return true;
+    }
+
+    if delta_type == "text-delta"
+        && let Some(text) = delta.get("textDelta").and_then(|t| t.as_str())
+    {
+        pg.text.push_str(text);
+        pg.awaiting_tool_continuation = false;
+        pg.empty_response_grace_started = false;
+        return true;
+    }
+
+    if delta_type == "part_add"
+        && let Some(part) = delta.get("part")
+    {
+        let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if matches!(part_type, "text" | "output_text")
+            && let Some(text) = part.get("text").and_then(|t| t.as_str())
+        {
+            pg.text.push_str(text);
+            pg.awaiting_tool_continuation = false;
+            pg.empty_response_grace_started = false;
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_tool_invocation_delta(delta: &Value) -> bool {
+    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if delta_type != "part_add" {
+        return false;
+    }
+
+    let Some(part) = delta.get("part") else {
+        return false;
+    };
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if part_type == "tool-AttemptCompletion" || part_type.contains("result") {
+        return false;
+    }
+    part_type == "tool-invocation" || part_type.starts_with("tool-")
+}
+
+fn extract_tool_call_event(thread_id: &str, delta: &Value) -> Option<AlmaToolCallEvent> {
+    if !is_tool_invocation_delta(delta) {
+        return None;
+    }
+
+    let part = delta.get("part")?;
+    let invocation = part
+        .get("toolInvocation")
+        .or_else(|| part.get("tool_invocation"))
+        .unwrap_or(part);
+    let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    let tool_name = first_string_field(
+        invocation,
+        &["toolName", "tool_name", "name", "tool", "toolId", "tool_id"],
+    )
+    .or_else(|| first_string_field(part, &["toolName", "tool_name", "name", "tool"]))
+    .or_else(|| part_type.strip_prefix("tool-").map(str::to_string))
+    .unwrap_or_else(|| "unknown".to_string());
+
+    let parameters = first_value_field(
+        invocation,
+        &[
+            "args",
+            "arguments",
+            "input",
+            "parameters",
+            "params",
+            "rawArgs",
+            "raw_args",
+        ],
+    )
+    .or_else(|| {
+        first_value_field(
+            part,
+            &[
+                "args",
+                "arguments",
+                "input",
+                "parameters",
+                "params",
+                "rawArgs",
+                "raw_args",
+            ],
+        )
+    })
+    .map(format_tool_parameters)
+    .unwrap_or_else(|| "无".to_string());
+
+    Some(AlmaToolCallEvent {
+        thread_id: thread_id.to_string(),
+        tool_name,
+        parameters_text: parameters,
+    })
+}
+
+fn first_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn first_value_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        if is_empty_json_value(value) {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
+fn is_empty_json_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        _ => false,
+    }
+}
+
+fn format_tool_parameters(value: &Value) -> String {
+    let raw = match value {
+        Value::String(s) => s.trim().to_string(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    };
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "无".to_string()
+    } else {
+        truncate_chars(&compact, TOOL_PARAMETER_PREVIEW_LIMIT)
+    }
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let keep = limit.saturating_sub(3);
+    let mut truncated = text.chars().take(keep).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn emit_stage_text_if_needed(thread_id: &str, pg: &mut PendingGeneration) {
+    let Some(progress_tx) = pg.progress_tx.as_ref() else {
+        return;
+    };
+
+    let (visible_text, _, _) = pending_generation_parts(pg);
+    if visible_text.is_empty() || visible_text == pg.stage_sent_prefix {
+        return;
+    }
+
+    let message_text = stage_unsent_text(&visible_text, &pg.stage_sent_prefix);
+    if message_text.is_empty() {
+        pg.stage_sent_prefix = visible_text;
+        return;
+    }
+
+    let event = AlmaStageEvent {
+        thread_id: thread_id.to_string(),
+        message_text,
+        visible_prefix: visible_text.clone(),
+    };
+    match progress_tx.try_send(AlmaProgressEvent::StageText(event)) {
+        Ok(()) => {
+            let _ = pg.activity_tx.try_send(());
+            debug!(
+                "[AlmaWS] Emitted stage text for thread {} (prefix={} chars)",
+                thread_id,
+                visible_text.len()
+            );
+            pg.stage_sent_prefix = visible_text;
+        }
+        Err(e) => {
+            debug!(
+                "[AlmaWS] Stage text receiver unavailable for thread {}: {}",
+                thread_id, e
+            );
+        }
+    }
+}
+
+fn emit_tool_call_if_needed(thread_id: &str, pg: &mut PendingGeneration, delta: &Value) {
+    let _ = pg.activity_tx.try_send(());
+
+    let Some(progress_tx) = pg.progress_tx.as_ref() else {
+        return;
+    };
+    let Some(event) = extract_tool_call_event(thread_id, delta) else {
+        return;
+    };
+
+    match progress_tx.try_send(AlmaProgressEvent::ToolCall(event)) {
+        Ok(()) => {
+            debug!(
+                "[AlmaWS] Emitted tool-call progress for thread {}",
+                thread_id
+            );
+        }
+        Err(e) => {
+            debug!(
+                "[AlmaWS] Tool-call progress receiver unavailable for thread {}: {}",
+                thread_id, e
+            );
+        }
+    }
+}
+
 fn resolve_pending_generation(thread_id: &str, pg: PendingGeneration) -> Option<String> {
     let (trimmed, thinking, user_msg_id) = pending_generation_parts(&pg);
 
@@ -652,8 +952,17 @@ async fn complete_pending_or_start_empty_grace(
 
     if let Some(pg) = map.get_mut(thread_id) {
         had_pending_generation = true;
-        let (trimmed, _, _) = pending_generation_parts(pg);
+        if pg.awaiting_tool_continuation {
+            debug!(
+                "[AlmaWS] completion event for thread {} follows a tool call; waiting for continuation",
+                thread_id
+            );
+            pg.empty_response_grace_started = false;
+            drop(map);
+            return (had_pending_generation, false, None);
+        }
 
+        let (trimmed, _, _) = pending_generation_parts(pg);
         if trimmed.is_empty() {
             if !pg.empty_response_grace_started {
                 pg.empty_response_grace_started = true;
@@ -877,14 +1186,14 @@ async fn dispatch_event(
 
             if let Some(deltas) = data.get("deltas").and_then(|d| d.as_array()) {
                 for delta in deltas {
-                    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    let part_type = delta.get("partType").and_then(|t| t.as_str()).unwrap_or("");
+                    if append_text_delta(pg, delta) {
+                        continue;
+                    }
 
-                    if delta_type == "text_append"
-                        && part_type == "text"
-                        && let Some(text) = delta.get("text").and_then(|t| t.as_str())
-                    {
-                        pg.text.push_str(text);
+                    if is_tool_invocation_delta(delta) {
+                        pg.awaiting_tool_continuation = true;
+                        emit_stage_text_if_needed(thread_id, pg);
+                        emit_tool_call_if_needed(thread_id, pg, delta);
                     }
                 }
             }
@@ -1401,7 +1710,7 @@ pub(crate) fn visible_assistant_text_matches_for_dedup(left: &str, right: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingGeneration, PendingMap, dispatch_event, extract_think_blocks,
+        AlmaProgressEvent, PendingGeneration, PendingMap, dispatch_event, extract_think_blocks,
         normalize_assistant_text, sanitize_visible_assistant_text,
     };
     use futures_util::StreamExt;
@@ -1423,6 +1732,26 @@ mod tests {
 
     fn bridge_owned_assistant_messages() -> super::BridgeOwnedAssistantMessages {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn pending_generation(
+        generation_id: u64,
+        text: &str,
+        user_message_id: Option<&str>,
+        result_tx: channel::Sender<super::GenerationResult>,
+    ) -> PendingGeneration {
+        let (activity_tx, _activity_rx) = channel::unbounded();
+        PendingGeneration {
+            generation_id,
+            text: text.to_string(),
+            stage_sent_prefix: String::new(),
+            progress_tx: None,
+            activity_tx,
+            awaiting_tool_continuation: false,
+            user_message_id: user_message_id.map(str::to_string),
+            empty_response_grace_started: false,
+            result_tx,
+        }
     }
 
     #[test]
@@ -1474,13 +1803,7 @@ mod tests {
         let (result_tx, result_rx) = channel::bounded(1);
         pending.lock().await.insert(
             "thread-1".to_string(),
-            PendingGeneration {
-                generation_id: 1,
-                text: String::new(),
-                user_message_id: Some("user-msg-1".to_string()),
-                empty_response_grace_started: false,
-                result_tx,
-            },
+            pending_generation(1, "", Some("user-msg-1"), result_tx),
         );
 
         let (event_tx, _event_rx) = channel::unbounded();
@@ -1537,13 +1860,7 @@ mod tests {
         let (result_tx, result_rx) = channel::bounded(1);
         pending.lock().await.insert(
             "thread-2".to_string(),
-            PendingGeneration {
-                generation_id: 2,
-                text: "hello".to_string(),
-                user_message_id: Some("user-msg-2".to_string()),
-                empty_response_grace_started: false,
-                result_tx,
-            },
+            pending_generation(2, "hello", Some("user-msg-2"), result_tx),
         );
 
         let (event_tx, _event_rx) = channel::unbounded();
@@ -1581,18 +1898,165 @@ mod tests {
     }
 
     #[apply(test!)]
+    async fn tool_boundary_emits_stage_text_and_waits_for_continuation() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (result_tx, result_rx) = channel::bounded(1);
+        let (progress_tx, progress_rx) = channel::unbounded();
+        let (activity_tx, _activity_rx) = channel::unbounded();
+        pending.lock().await.insert(
+            "thread-stage".to_string(),
+            PendingGeneration {
+                generation_id: 7,
+                text: String::new(),
+                stage_sent_prefix: String::new(),
+                progress_tx: Some(progress_tx),
+                activity_tx,
+                awaiting_tool_continuation: false,
+                user_message_id: Some("user-msg-stage".to_string()),
+                empty_response_grace_started: false,
+                result_tx,
+            },
+        );
+
+        let (event_tx, _event_rx) = channel::unbounded();
+        let mut generating_threads = HashSet::from(["thread-stage".to_string()]);
+        let mut pending_assistant_updates = HashMap::new();
+        let mut recent_bridge_generations = HashMap::new();
+        let bridge_suppressions = bridge_suppressions();
+        let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
+
+        dispatch_event(
+            &json!({
+                "type": "message_delta",
+                "data": {
+                    "threadId": "thread-stage",
+                    "deltas": [
+                        {"type": "text_append", "partType": "text", "text": "我先查一下"},
+                        {
+                            "type": "part_add",
+                            "part": {
+                                "type": "tool-invocation",
+                                "toolInvocation": {
+                                    "toolName": "WebSearch",
+                                    "args": {"query": "alma onebot"}
+                                }
+                            }
+                        }
+                    ]
+                }
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+            &bridge_owned_assistant_messages,
+        )
+        .await;
+
+        let progress = progress_rx
+            .try_recv()
+            .expect("stage text should be emitted");
+        let AlmaProgressEvent::StageText(stage) = progress else {
+            panic!("expected stage text progress");
+        };
+        assert_eq!(stage.message_text, "我先查一下");
+        assert_eq!(stage.visible_prefix, "我先查一下");
+
+        let progress = progress_rx
+            .try_recv()
+            .expect("tool-call progress should be emitted");
+        let AlmaProgressEvent::ToolCall(tool_call) = progress else {
+            panic!("expected tool-call progress");
+        };
+        assert_eq!(tool_call.tool_name, "WebSearch");
+        assert_eq!(tool_call.parameters_text, r#"{"query":"alma onebot"}"#);
+
+        dispatch_event(
+            &json!({
+                "type": "generation_completed",
+                "data": {"threadId": "thread-stage"}
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+            &bridge_owned_assistant_messages,
+        )
+        .await;
+        dispatch_event(
+            &json!({
+                "type": "thread_generating",
+                "data": {"id": "thread-stage", "isGenerating": false}
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+            &bridge_owned_assistant_messages,
+        )
+        .await;
+
+        assert!(pending.lock().await.contains_key("thread-stage"));
+        assert!(result_rx.try_recv().is_err());
+
+        dispatch_event(
+            &json!({
+                "type": "message_delta",
+                "data": {
+                    "threadId": "thread-stage",
+                    "deltas": [
+                        {"type": "text-delta", "textDelta": "\n查完了"}
+                    ]
+                }
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+            &bridge_owned_assistant_messages,
+        )
+        .await;
+        dispatch_event(
+            &json!({
+                "type": "generation_completed",
+                "data": {"threadId": "thread-stage"}
+            }),
+            &pending,
+            &event_tx,
+            &mut generating_threads,
+            &mut pending_assistant_updates,
+            &mut recent_bridge_generations,
+            &bridge_suppressions,
+            &bridge_owned_assistant_messages,
+        )
+        .await;
+
+        let result = SmolRuntime::default()
+            .timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0, "我先查一下\n查完了");
+        assert_eq!(result.1.as_deref(), Some("user-msg-stage"));
+        assert!(!pending.lock().await.contains_key("thread-stage"));
+    }
+
+    #[apply(test!)]
     async fn post_completion_message_updated_for_bridge_generation_is_suppressed() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (result_tx, result_rx) = channel::bounded(1);
         pending.lock().await.insert(
             "thread-3".to_string(),
-            PendingGeneration {
-                generation_id: 3,
-                text: "同一条回复".to_string(),
-                user_message_id: Some("user-msg-3".to_string()),
-                empty_response_grace_started: false,
-                result_tx,
-            },
+            pending_generation(3, "同一条回复", Some("user-msg-3"), result_tx),
         );
 
         let (event_tx, event_rx) = channel::unbounded();
@@ -1658,13 +2122,7 @@ mod tests {
         let (result_tx, result_rx) = channel::bounded(1);
         pending.lock().await.insert(
             "thread-4".to_string(),
-            PendingGeneration {
-                generation_id: 4,
-                text: "段落一\n\n段落二".to_string(),
-                user_message_id: Some("user-msg-4".to_string()),
-                empty_response_grace_started: false,
-                result_tx,
-            },
+            pending_generation(4, "段落一\n\n段落二", Some("user-msg-4"), result_tx),
         );
 
         let (event_tx, event_rx) = channel::unbounded();
@@ -1731,13 +2189,7 @@ mod tests {
         let prefix = "这是同一轮桥接生成的完整回复，长度足够超过前缀抑制阈值，用来模拟 Alma 在完成后继续发出递增 message_updated 的情况。";
         pending.lock().await.insert(
             "thread-5".to_string(),
-            PendingGeneration {
-                generation_id: 5,
-                text: completed.to_string(),
-                user_message_id: Some("user-msg-5".to_string()),
-                empty_response_grace_started: false,
-                result_tx,
-            },
+            pending_generation(5, completed, Some("user-msg-5"), result_tx),
         );
 
         let (event_tx, event_rx) = channel::unbounded();
@@ -1802,13 +2254,7 @@ mod tests {
         let (result_tx, _result_rx) = channel::bounded(1);
         pending.lock().await.insert(
             "thread-late".to_string(),
-            PendingGeneration {
-                generation_id: 6,
-                text: String::new(),
-                user_message_id: Some("user-msg-late".to_string()),
-                empty_response_grace_started: false,
-                result_tx,
-            },
+            pending_generation(6, "", Some("user-msg-late"), result_tx),
         );
 
         let (event_tx, event_rx) = channel::unbounded();
@@ -1973,6 +2419,7 @@ mod tests {
                 1,
                 "telegram",
                 "",
+                None,
             )
             .await;
 
@@ -1985,6 +2432,122 @@ mod tests {
             .delay(Duration::from_millis(100))
             .await;
         assert!(client.try_recv_event().await.is_none());
+    }
+
+    #[apply(test!)]
+    async fn stage_text_resets_generation_idle_timeout() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let server = smol::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let first = ws.next().await.unwrap().unwrap();
+            let first_json: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+            assert_eq!(
+                first_json.get("type").and_then(|v| v.as_str()),
+                Some("generate_response")
+            );
+
+            SmolRuntime::default()
+                .delay(Duration::from_millis(300))
+                .await;
+            ws.send(Message::Text(
+                json!({
+                    "type": "message_delta",
+                    "data": {
+                        "threadId": "thread-stage-timeout",
+                        "deltas": [
+                            {"type": "text_append", "partType": "text", "text": "我先查一下"},
+                            {
+                                "type": "part_add",
+                                "part": {
+                                    "type": "tool-invocation",
+                                    "toolInvocation": {"toolName": "WebSearch"}
+                                }
+                            }
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "type": "generation_completed",
+                    "data": {"threadId": "thread-stage-timeout"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            SmolRuntime::default()
+                .delay(Duration::from_millis(800))
+                .await;
+            ws.send(Message::Text(
+                json!({
+                    "type": "message_delta",
+                    "data": {
+                        "threadId": "thread-stage-timeout",
+                        "deltas": [
+                            {"type": "text-delta", "textDelta": "\n查完了"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "type": "generation_completed",
+                    "data": {"threadId": "thread-stage-timeout"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let client = super::AlmaWsClient::connect(&format!("http://{}", addr))
+            .await
+            .unwrap();
+        let (progress_tx, progress_rx) = channel::unbounded();
+        let result = client
+            .generate(
+                "thread-stage-timeout",
+                None,
+                "hello",
+                Vec::new(),
+                1,
+                "telegram",
+                "",
+                Some(progress_tx),
+            )
+            .await;
+
+        let result = result.unwrap();
+        assert_eq!(result.0, "我先查一下\n查完了");
+        let progress = progress_rx
+            .try_recv()
+            .expect("stage event should be emitted");
+        let AlmaProgressEvent::StageText(stage) = progress else {
+            panic!("expected stage text progress");
+        };
+        assert_eq!(stage.message_text, "我先查一下");
+        SmolRuntime::default()
+            .timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap();
     }
 
     #[apply(test!)]

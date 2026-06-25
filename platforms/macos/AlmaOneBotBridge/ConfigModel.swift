@@ -22,6 +22,8 @@ final class ConfigModel: ObservableObject {
     @Published var groupHistorySize: String = "30"
     @Published var thinkingMessage: String = ""
     @Published var showThinking: Bool = false
+    @Published var showToolCalls: Bool = false
+    @Published var segmentedReplies: Bool = false
 
     // MARK: Paths
     @Published var peopleDir: String = ConfigModel.defaultPeopleDir()
@@ -84,6 +86,8 @@ final class ConfigModel: ObservableObject {
         groupHistorySize = o.groupHistorySize
         thinkingMessage = o.thinkingMessage
         showThinking = o.showThinking
+        showToolCalls = o.showToolCalls
+        segmentedReplies = o.segmentedReplies
         peopleDir = o.peopleDir
         dbPath = o.dbPath
     }
@@ -100,6 +104,8 @@ final class ConfigModel: ObservableObject {
         && groupHistorySize == o.groupHistorySize
         && thinkingMessage == o.thinkingMessage
         && showThinking == o.showThinking
+        && showToolCalls == o.showToolCalls
+        && segmentedReplies == o.segmentedReplies
         && peopleDir == o.peopleDir
         && dbPath == o.dbPath
     }

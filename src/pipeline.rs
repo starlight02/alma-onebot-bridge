@@ -1,11 +1,15 @@
 use futures_util::future::join_all;
 use smol::channel;
+use smol::lock::Mutex;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 use trillium_smol::SmolRuntime;
 use trillium_websockets::Message;
 
 use crate::alma;
-use crate::alma_ws::{AlmaEvent, AlmaWsClient};
+use crate::alma_ws::{
+    AlmaEvent, AlmaProgressEvent, AlmaStageEvent, AlmaToolCallEvent, AlmaWsClient,
+};
 use crate::group_log;
 use crate::onebot::event::{
     OneBotEvent, contains_at_bot, convert_faces_to_text, extract_forward_id, extract_images,
@@ -39,12 +43,23 @@ pub async fn process_message_event(
     let segments = event.message.as_deref().unwrap_or(&[]);
 
     // ── Snapshot config values (avoids repeated RwLock reads) ──────────────
-    let (onebot_timeout, thinking_msg_cfg, show_thinking, max_retries, base_delay_ms, run_timeout) = {
+    let (
+        onebot_timeout,
+        thinking_msg_cfg,
+        show_thinking,
+        show_tool_calls,
+        segmented_replies,
+        max_retries,
+        base_delay_ms,
+        run_timeout,
+    ) = {
         let cfg = state.config.read().await;
         (
             cfg.onebot_api_timeout_secs,
             cfg.thinking_message.clone(),
             cfg.show_thinking,
+            cfg.show_tool_calls,
+            cfg.segmented_replies,
             cfg.alma_max_retries,
             cfg.alma_retry_delay_ms,
             cfg.alma_run_timeout_secs,
@@ -416,12 +431,13 @@ pub async fn process_message_event(
         );
     }
 
+    let target_id = if is_group { group_id_value } else { user_id };
+    let target_type = if is_group { "group" } else { "private" };
+
     // ── Send thinking indicator (optional, config-gated) ─────────────────
     // If configured, sends a brief placeholder message before generation starts,
     // so users see activity while Alma is processing. OneBot v11 has no typing API.
     if let Some(ref thinking_msg) = thinking_msg_cfg {
-        let target_id = if is_group { group_id_value } else { user_id };
-        let target_type = if is_group { "group" } else { "private" };
         match send_text_message(
             ws_tx,
             pending,
@@ -439,6 +455,26 @@ pub async fn process_message_event(
             Err(e) => tracing::debug!("[Thinking] Failed to send thinking message: {}", e),
         }
     }
+
+    let (progress_tx, progress_rx) = channel::unbounded::<AlmaProgressEvent>();
+    let sent_stage_prefix = Arc::new(Mutex::new(String::new()));
+    let progress_forward_task = SmolRuntime::default().spawn(forward_alma_progress_events(
+        progress_rx,
+        StageForwardContext {
+            state: state.clone(),
+            ws_tx: ws_tx.clone(),
+            pending: pending.clone(),
+            thread_id: thread_id.clone(),
+            target_type: target_type.to_string(),
+            target_id,
+            onebot_timeout,
+            is_group,
+            group_id_value,
+            segmented_replies,
+            show_tool_calls,
+            sent_stage_prefix: sent_stage_prefix.clone(),
+        },
+    ));
 
     let (reply, thinking) = {
         let mut last_err = String::new();
@@ -475,6 +511,7 @@ pub async fn process_message_event(
                     run_timeout,
                     source,
                     &ephemeral_ctx,
+                    Some(progress_tx.clone()),
                 )
                 .await
             {
@@ -498,7 +535,12 @@ pub async fn process_message_event(
             }
         }
     };
+    drop(progress_tx);
+    progress_forward_task.await;
+
     let reply = crate::alma_ws::sanitize_visible_assistant_text(&reply);
+    let sent_stage_prefix = sent_stage_prefix.lock().await.clone();
+    let reply = strip_sent_stage_prefix(&reply, &sent_stage_prefix);
     // Register the full reply before any QQ send so Alma `message_updated` cannot
     // race through and duplicate the same assistant turn via Alma→QQ forwarding.
     if !reply.is_empty() {
@@ -517,9 +559,6 @@ pub async fn process_message_event(
         info!("[Reply] Empty reply, skipping");
         return Ok(());
     }
-
-    let target_id = if is_group { group_id_value } else { user_id };
-    let target_type = if is_group { "group" } else { "private" };
 
     // ── Send thinking content as separate message (if enabled) ────────────
     if show_thinking
@@ -548,97 +587,263 @@ pub async fn process_message_event(
         }
     }
 
-    // Split by paragraphs first, then by QQ message limit
-    let paragraphs = split_paragraphs(&reply);
     let user_message_id = event.message_id.map(|id| id.to_string());
     let at_user_id = if is_group {
         Some(user_id.to_string())
     } else {
         None
     };
-    let mut is_first = true;
-    let mut any_reply_chunk_sent = false;
-    let mut all_reply_chunks_sent = true;
-    for para in &paragraphs {
-        let chunks = split_text(para, QQ_MSG_LIMIT);
-        for chunk in &chunks {
-            // Reply to user's triggering message (first chunk only, groups + private)
-            let result = if is_first {
-                is_first = false;
-                if let Some(ref reply_id) = user_message_id {
-                    send_reply_message(
-                        ws_tx,
-                        pending,
-                        target_type,
-                        target_id,
-                        chunk,
-                        reply_id,
-                        at_user_id.as_deref(),
-                        onebot_timeout,
-                    )
-                    .await
-                } else {
-                    send_text_message(
-                        ws_tx,
-                        pending,
-                        target_type,
-                        target_id,
-                        chunk,
-                        onebot_timeout,
-                    )
-                    .await
-                }
-            } else {
-                send_text_message(
-                    ws_tx,
-                    pending,
-                    target_type,
-                    target_id,
-                    chunk,
-                    onebot_timeout,
-                )
-                .await
-            };
+    send_assistant_text_to_qq(SendAssistantText {
+        state,
+        ws_tx,
+        pending,
+        thread_id: &thread_id,
+        target_type,
+        target_id,
+        text: &reply,
+        onebot_timeout,
+        is_group,
+        group_id_value,
+        segmented_replies,
+        reply_to_id: user_message_id.as_deref(),
+        at_user_id: at_user_id.as_deref(),
+        log_label: "Reply",
+    })
+    .await;
 
-            match result {
-                Ok(resp) => {
-                    any_reply_chunk_sent = true;
-                    state.register_sent_reply(&thread_id, chunk).await;
-                    let msg_id = resp
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("message_id"))
-                        .and_then(|m| m.as_i64());
-                    if is_group {
-                        record_alma_group_output(
-                            state,
-                            group_id_value,
-                            chunk,
-                            msg_id,
-                            current_unix_timestamp(),
-                        )
-                        .await;
-                    }
-                    info!(
-                        "[Reply] Sent to {} {}, msg_id={:?}",
-                        target_type, target_id, msg_id
-                    );
-                }
-                Err(e) => {
-                    all_reply_chunks_sent = false;
-                    warn!(
-                        "[Reply] Failed to send to {} {}: {}",
-                        target_type, target_id, e
-                    );
+    Ok(())
+}
+
+struct StageForwardContext {
+    state: SharedState,
+    ws_tx: channel::Sender<Message>,
+    pending: PendingCalls,
+    thread_id: String,
+    target_type: String,
+    target_id: i64,
+    onebot_timeout: u64,
+    is_group: bool,
+    group_id_value: i64,
+    segmented_replies: bool,
+    show_tool_calls: bool,
+    sent_stage_prefix: Arc<Mutex<String>>,
+}
+
+async fn forward_alma_progress_events(
+    progress_rx: channel::Receiver<AlmaProgressEvent>,
+    ctx: StageForwardContext,
+) {
+    while let Ok(event) = progress_rx.recv().await {
+        match event {
+            AlmaProgressEvent::StageText(stage) => forward_stage_text_event(stage, &ctx).await,
+            AlmaProgressEvent::ToolCall(tool_call) => {
+                if ctx.show_tool_calls {
+                    forward_tool_call_event(tool_call, &ctx).await;
                 }
             }
         }
     }
-    if any_reply_chunk_sent && all_reply_chunks_sent {
-        state.register_sent_reply(&thread_id, &reply).await;
+}
+
+async fn forward_stage_text_event(stage: AlmaStageEvent, ctx: &StageForwardContext) {
+    if stage.thread_id != ctx.thread_id {
+        return;
     }
 
-    Ok(())
+    let text = crate::alma_ws::sanitize_visible_assistant_text(&stage.message_text);
+    if text.is_empty() {
+        return;
+    }
+
+    let (any_sent, all_sent) = send_assistant_text_to_qq(SendAssistantText {
+        state: &ctx.state,
+        ws_tx: &ctx.ws_tx,
+        pending: &ctx.pending,
+        thread_id: &ctx.thread_id,
+        target_type: &ctx.target_type,
+        target_id: ctx.target_id,
+        text: &text,
+        onebot_timeout: ctx.onebot_timeout,
+        is_group: ctx.is_group,
+        group_id_value: ctx.group_id_value,
+        segmented_replies: ctx.segmented_replies,
+        reply_to_id: None,
+        at_user_id: None,
+        log_label: "Stage",
+    })
+    .await;
+
+    if any_sent && all_sent {
+        *ctx.sent_stage_prefix.lock().await = stage.visible_prefix;
+    }
+}
+
+async fn forward_tool_call_event(tool_call: AlmaToolCallEvent, ctx: &StageForwardContext) {
+    if tool_call.thread_id != ctx.thread_id {
+        return;
+    }
+
+    let text = format_tool_call_message(&tool_call);
+    for chunk in split_text(&text, QQ_MSG_LIMIT) {
+        match send_text_message(
+            &ctx.ws_tx,
+            &ctx.pending,
+            &ctx.target_type,
+            ctx.target_id,
+            &chunk,
+            ctx.onebot_timeout,
+        )
+        .await
+        {
+            Ok(resp) => {
+                let msg_id = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("message_id"))
+                    .and_then(|m| m.as_i64());
+                info!(
+                    "[ToolCall] Sent to {} {}, tool={}, msg_id={:?}",
+                    ctx.target_type, ctx.target_id, tool_call.tool_name, msg_id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "[ToolCall] Failed to send to {} {}: {}",
+                    ctx.target_type, ctx.target_id, e
+                );
+            }
+        }
+    }
+}
+
+fn format_tool_call_message(tool_call: &AlmaToolCallEvent) -> String {
+    format!(
+        "正在调用工具：{}\n参数：{}",
+        tool_call.tool_name, tool_call.parameters_text
+    )
+}
+
+struct SendAssistantText<'a> {
+    state: &'a SharedState,
+    ws_tx: &'a channel::Sender<Message>,
+    pending: &'a PendingCalls,
+    thread_id: &'a str,
+    target_type: &'a str,
+    target_id: i64,
+    text: &'a str,
+    onebot_timeout: u64,
+    is_group: bool,
+    group_id_value: i64,
+    segmented_replies: bool,
+    reply_to_id: Option<&'a str>,
+    at_user_id: Option<&'a str>,
+    log_label: &'static str,
+}
+
+async fn send_assistant_text_to_qq(args: SendAssistantText<'_>) -> (bool, bool) {
+    let chunks = reply_chunks(args.text, args.segmented_replies);
+    let mut is_first = true;
+    let mut any_sent = false;
+    let mut all_sent = true;
+
+    for chunk in &chunks {
+        let result = if is_first {
+            is_first = false;
+            if let Some(reply_id) = args.reply_to_id {
+                send_reply_message(
+                    args.ws_tx,
+                    args.pending,
+                    args.target_type,
+                    args.target_id,
+                    chunk,
+                    reply_id,
+                    args.at_user_id,
+                    args.onebot_timeout,
+                )
+                .await
+            } else {
+                send_text_message(
+                    args.ws_tx,
+                    args.pending,
+                    args.target_type,
+                    args.target_id,
+                    chunk,
+                    args.onebot_timeout,
+                )
+                .await
+            }
+        } else {
+            send_text_message(
+                args.ws_tx,
+                args.pending,
+                args.target_type,
+                args.target_id,
+                chunk,
+                args.onebot_timeout,
+            )
+            .await
+        };
+
+        match result {
+            Ok(resp) => {
+                any_sent = true;
+                args.state.register_sent_reply(args.thread_id, chunk).await;
+                let msg_id = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("message_id"))
+                    .and_then(|m| m.as_i64());
+                if args.is_group {
+                    record_alma_group_output(
+                        args.state,
+                        args.group_id_value,
+                        chunk,
+                        msg_id,
+                        current_unix_timestamp(),
+                    )
+                    .await;
+                }
+                info!(
+                    "[{}] Sent to {} {}, msg_id={:?}",
+                    args.log_label, args.target_type, args.target_id, msg_id
+                );
+            }
+            Err(e) => {
+                all_sent = false;
+                warn!(
+                    "[{}] Failed to send to {} {}: {}",
+                    args.log_label, args.target_type, args.target_id, e
+                );
+            }
+        }
+    }
+
+    if any_sent && all_sent {
+        args.state
+            .register_sent_reply(args.thread_id, args.text)
+            .await;
+    }
+
+    (any_sent, all_sent)
+}
+
+fn reply_chunks(text: &str, segmented_replies: bool) -> Vec<String> {
+    if segmented_replies {
+        split_paragraphs(text)
+            .into_iter()
+            .flat_map(|paragraph| split_text(&paragraph, QQ_MSG_LIMIT))
+            .collect()
+    } else {
+        split_text(text, QQ_MSG_LIMIT)
+    }
+}
+
+fn strip_sent_stage_prefix(reply: &str, sent_stage_prefix: &str) -> String {
+    reply
+        .strip_prefix(sent_stage_prefix)
+        .unwrap_or(reply)
+        .trim()
+        .to_string()
 }
 
 async fn resolve_group_title(
@@ -869,9 +1074,13 @@ pub async fn handle_alma_event(
     }
 
     // ── Snapshot config values ──────────────────────────────────────────────
-    let (show_thinking, onebot_timeout) = {
+    let (show_thinking, segmented_replies, onebot_timeout) = {
         let cfg = state.config.read().await;
-        (cfg.show_thinking, cfg.onebot_api_timeout_secs)
+        (
+            cfg.show_thinking,
+            cfg.segmented_replies,
+            cfg.onebot_api_timeout_secs,
+        )
     };
 
     // Only forward assistant messages from threads we're tracking
@@ -940,7 +1149,7 @@ pub async fn handle_alma_event(
     }
 
     // Forward the Alma GUI assistant message to QQ
-    let chunks = split_text(&forward_text, QQ_MSG_LIMIT);
+    let chunks = reply_chunks(&forward_text, segmented_replies);
     let mut any_chunk_sent = false;
     let mut all_chunks_sent = true;
     for chunk in &chunks {

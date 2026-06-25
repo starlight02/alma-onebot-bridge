@@ -16,6 +16,8 @@ pub struct ConfigModel {
     pub group_history_size: String,
     pub thinking_message: String,
     pub show_thinking: bool,
+    pub show_tool_calls: bool,
+    pub segmented_replies: bool,
     pub people_dir: String,
     pub db_path: String,
 }
@@ -42,6 +44,8 @@ impl Default for ConfigModel {
             group_history_size: "30".to_string(),
             thinking_message: String::new(),
             show_thinking: false,
+            show_tool_calls: false,
+            segmented_replies: false,
             people_dir,
             db_path: "bridge-state.db".to_string(),
         }
@@ -152,6 +156,16 @@ impl ConfigModel {
                 .as_ref()
                 .and_then(|section| section.show_thinking)
                 .unwrap_or(defaults.show_thinking),
+            show_tool_calls: file
+                .chat
+                .as_ref()
+                .and_then(|section| section.show_tool_calls)
+                .unwrap_or(defaults.show_tool_calls),
+            segmented_replies: file
+                .chat
+                .as_ref()
+                .and_then(|section| section.segmented_replies)
+                .unwrap_or(defaults.segmented_replies),
             people_dir: file
                 .people
                 .as_ref()
@@ -192,6 +206,8 @@ impl ConfigModel {
                 group_history_size: self.group_history_size.parse().ok(),
                 thinking_message: non_empty(self.thinking_message.trim()),
                 show_thinking: Some(self.show_thinking),
+                show_tool_calls: Some(self.show_tool_calls),
+                segmented_replies: Some(self.segmented_replies),
             }),
         }
     }
@@ -250,4 +266,6 @@ struct ChatSection {
     group_history_size: Option<usize>,
     thinking_message: Option<String>,
     show_thinking: Option<bool>,
+    show_tool_calls: Option<bool>,
+    segmented_replies: Option<bool>,
 }

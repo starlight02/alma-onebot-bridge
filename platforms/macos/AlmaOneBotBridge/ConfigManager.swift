@@ -1014,6 +1014,8 @@ final class ConfigManager: ObservableObject {
             if let v = c["group_history_size"]?.int { loaded.groupHistorySize = "\(v)" }
             if let v = c["thinking_message"]?.string { loaded.thinkingMessage = v }
             if let v = c["show_thinking"]?.bool { loaded.showThinking = v }
+            if let v = c["show_tool_calls"]?.bool { loaded.showToolCalls = v }
+            if let v = c["segmented_replies"]?.bool { loaded.segmentedReplies = v }
         }
         if let d = t["database"]?.table {
             if let v = d["path"]?.string { loaded.dbPath = v }
@@ -1056,6 +1058,8 @@ final class ConfigManager: ObservableObject {
             lines.append("thinking_message = \"\(esc(m.thinkingMessage))\"")
         }
         lines.append("show_thinking = \(m.showThinking ? "true" : "false")")
+        lines.append("show_tool_calls = \(m.showToolCalls ? "true" : "false")")
+        lines.append("segmented_replies = \(m.segmentedReplies ? "true" : "false")")
 
         if !m.dbPath.isEmpty {
             lines.append("")

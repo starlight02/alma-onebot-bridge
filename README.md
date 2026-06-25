@@ -132,6 +132,8 @@ api_timeout = 30
 [chat]
 group_history_size = 30        # Recent group messages for AI context (0 = disabled)
 # thinking_message = "思考中..."  # Optional message before AI generation
+show_tool_calls = false     # Show tool invocation status messages in QQ
+segmented_replies = false      # Split replies by paragraphs when enabled
 ```
 
 > **Note**: Git ignores `config.toml`. The repo tracks only `config.toml.example`.
@@ -185,7 +187,7 @@ chooses the first available port starting at `18090`.
 | `bridge.port` | `8090` | Listen port |
 | `alma.api` | `http://localhost:23001` | Alma API base URL |
 | `alma.model` | *(Alma settings)* | Override AI model |
-| `alma.timeout` | `120` | Generation timeout (seconds) |
+| `alma.timeout` | `120` | Generation idle timeout (seconds). The window resets after each tool-boundary stage/tool-call progress event from Alma. |
 | `alma.max_retries` | `2` | Retry attempts for failed generations |
 | `alma.retry_delay_ms` | `3000` | Base retry delay (ms, exponential backoff) |
 | `database.path` | `bridge-state.db` | Database file path |
@@ -195,6 +197,8 @@ chooses the first available port starting at `18090`.
 | `chat.group_history_size` | `30` | Group history context size (0 = disabled) |
 | `chat.thinking_message` | *(none)* | Pre-generation indicator message |
 | `chat.show_thinking` | `false` | Send thinking blocks as separate QQ messages |
+| `chat.show_tool_calls` | `false` | Send `正在调用工具：...` status messages when Alma starts tool invocations |
+| `chat.segmented_replies` | `false` | Split each assistant reply by paragraphs before QQ length chunking |
 
 ## How It Works
 
@@ -208,7 +212,7 @@ chooses the first available port starting at `18090`.
 6. Bridge finds or creates an Alma thread (keyed by `private:{user_id}` or `group:{group_id}`)
 7. Bridge sends `generate_response` via Alma WebSocket with sender identity and ephemeral context
 8. Alma processes with full pipeline (SOUL + Memory + People Profiles)
-9. Bridge collects the response and sends it back to QQ (with reply reference and @mention for groups)
+9. Bridge sends visible text before tool calls as stage messages, optionally sends tool-call status messages, resets the generation idle timeout for the next stage, then sends the final remaining response back to QQ (with reply reference and @mention for groups)
 
 ### Bidirectional Sync (Alma GUI → QQ)
 

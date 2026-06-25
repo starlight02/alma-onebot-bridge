@@ -49,6 +49,8 @@ struct ChatSection {
     group_history_size: Option<usize>,
     thinking_message: Option<String>,
     show_thinking: Option<bool>,
+    show_tool_calls: Option<bool>,
+    segmented_replies: Option<bool>,
 }
 
 /// Bridge configuration — populated from config.toml with built-in defaults.
@@ -75,6 +77,11 @@ pub struct Config {
     /// Whether to show AI thinking content (from `<think>` / `<thinking>` blocks)
     /// as a separate message before the main reply. Default: false (strip silently).
     pub show_thinking: bool,
+    /// Whether to show tool invocation status messages in QQ. Default: false.
+    pub show_tool_calls: bool,
+    /// Whether to split assistant replies by paragraphs. Default: false.
+    /// Long messages are still split by QQ's message length limit.
+    pub segmented_replies: bool,
 }
 
 impl Config {
@@ -121,6 +128,8 @@ impl Config {
             group_history_size: chat.group_history_size.unwrap_or(30),
             thinking_message: chat.thinking_message,
             show_thinking: chat.show_thinking.unwrap_or(false),
+            show_tool_calls: chat.show_tool_calls.unwrap_or(false),
+            segmented_replies: chat.segmented_replies.unwrap_or(false),
         }
     }
 

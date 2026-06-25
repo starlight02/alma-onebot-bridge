@@ -241,6 +241,24 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                         set_model.call(next);
                     }
                 }),
+                toggle_row("Show tool calls", model.show_tool_calls, {
+                    let base = model.clone();
+                    let set_model = set_model.clone();
+                    move |value| {
+                        let mut next = base.clone();
+                        next.show_tool_calls = value;
+                        set_model.call(next);
+                    }
+                }),
+                toggle_row("Segment replies", model.segmented_replies, {
+                    let base = model.clone();
+                    let set_model = set_model.clone();
+                    move |value| {
+                        let mut next = base.clone();
+                        next.segmented_replies = value;
+                        set_model.call(next);
+                    }
+                }),
             ],
         ),
         section(

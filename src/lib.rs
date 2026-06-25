@@ -184,6 +184,22 @@ where
     if config.show_thinking {
         tracing::info!("  Show thinking: enabled (thinking blocks sent as separate messages)");
     }
+    tracing::info!(
+        "  Show tool calls: {}",
+        if config.show_tool_calls {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    tracing::info!(
+        "  Segmented replies: {}",
+        if config.segmented_replies {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     if options.write_pid_file {
         write_pid_file();
@@ -259,6 +275,8 @@ where
                 cfg.group_history_size = new_config.group_history_size;
                 cfg.thinking_message = new_config.thinking_message;
                 cfg.show_thinking = new_config.show_thinking;
+                cfg.show_tool_calls = new_config.show_tool_calls;
+                cfg.segmented_replies = new_config.segmented_replies;
                 cfg.alma_run_timeout_secs = new_config.alma_run_timeout_secs;
                 cfg.alma_max_retries = new_config.alma_max_retries;
                 cfg.alma_retry_delay_ms = new_config.alma_retry_delay_ms;

@@ -9,7 +9,7 @@ port = 8090
 [alma]
 api = "http://localhost:23001"
 # model = "anthropic:claude-sonnet-4-20250514"  # Uncomment to override Alma's default model
-timeout = 120               # Generation timeout in seconds
+timeout = 120               # Generation idle timeout in seconds; resets after each stage text
 max_retries = 2             # Max retry attempts on generation failure (0 = no retry)
 retry_delay_ms = 3000       # Base delay between retries in ms (exponential backoff)
 
@@ -27,3 +27,5 @@ api_timeout = 30            # OneBot API call timeout in seconds
 group_history_size = 30     # Recent group messages for AI context (0 = disabled)
 # thinking_message = ""     # Optional message sent before AI generation (e.g. "思考中...")
 # show_thinking = false      # Show AI thinking content as a separate message (strips by default)
+# show_tool_calls = false    # Show "正在调用工具..." status messages in QQ
+segmented_replies = false   # Split replies by paragraphs. Stage text sending is always enabled.
