@@ -21,12 +21,16 @@ if ! command -v cross >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ -z "${CROSS_CONTAINER_OPTS:-}" && "$(uname -m)" == "arm64" ]]; then
-  export CROSS_CONTAINER_OPTS="--platform linux/amd64"
-fi
-
-if [[ -z "${CROSS_BUILD_OPTS:-}" && "$(uname -m)" == "arm64" ]]; then
-  export CROSS_BUILD_OPTS="--platform linux/amd64"
+if [[ "$(uname -m)" == "arm64" ]]; then
+  # cross-rs images are amd64-only; without this, Docker on Apple Silicon fails with
+  # "no match for platform in manifest".
+  export DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}"
+  if [[ -z "${CROSS_CONTAINER_OPTS:-}" ]]; then
+    export CROSS_CONTAINER_OPTS="--platform linux/amd64"
+  fi
+  if [[ -z "${CROSS_BUILD_OPTS:-}" ]]; then
+    export CROSS_BUILD_OPTS="--platform linux/amd64"
+  fi
 fi
 
 shim_link_args=(

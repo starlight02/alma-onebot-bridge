@@ -88,6 +88,15 @@ The ZIP package can also be created from macOS/Linux:
 ./scripts/package-windows-zip.sh
 ```
 
+Local release check on macOS/Linux (cross build + portable ZIP; MSI still needs Windows):
+
+```bash
+./scripts/test-windows-packaging-macos.sh
+```
+
+Use `./scripts/build-windows-cross.sh` (not bare `cross build`) so `GetHostNameW` shim
+`RUSTFLAGS` and arm64 Docker `linux/amd64` platform are applied.
+
 Velopack MSI packaging must run on Windows. The `vpk [win] pack` cross-pack path
 does not expose Velopack's MSI/per-machine installer options.
 
