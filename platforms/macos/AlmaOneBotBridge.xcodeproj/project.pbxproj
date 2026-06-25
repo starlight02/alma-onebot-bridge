@@ -297,7 +297,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 					CODE_SIGN_STYLE = Automatic;
-					CURRENT_PROJECT_VERSION = 110;
+					CURRENT_PROJECT_VERSION = 111;
 					ENABLE_APP_INTENTS_METADATA_PROCESSOR = NO;
 					ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
@@ -317,7 +317,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MARKETING_VERSION = 0.1.10;
+				MARKETING_VERSION = 0.1.11;
 				PRODUCT_BUNDLE_IDENTIFIER = "moe.aili.alma-onebot-bridge";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -337,7 +337,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 					CODE_SIGN_STYLE = Automatic;
-					CURRENT_PROJECT_VERSION = 110;
+					CURRENT_PROJECT_VERSION = 111;
 					ENABLE_APP_INTENTS_METADATA_PROCESSOR = NO;
 					ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
@@ -357,7 +357,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MARKETING_VERSION = 0.1.10;
+				MARKETING_VERSION = 0.1.11;
 				PRODUCT_BUNDLE_IDENTIFIER = "moe.aili.alma-onebot-bridge";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;

@@ -70,7 +70,7 @@ checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
 
 [[package]]
 name = "alma-onebot-bridge"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "base64",
  "dirs",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "alma-onebot-bridge-windows"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "alma-onebot-bridge",
  "dirs",

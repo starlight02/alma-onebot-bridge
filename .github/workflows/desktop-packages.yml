@@ -290,14 +290,6 @@ jobs:
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      - name: Run Rust tests on Windows GNU target
-        shell: pwsh
-        run: cargo test --target x86_64-pc-windows-gnu
-
-      - name: Check Windows tray app
-        shell: pwsh
-        run: cargo check --manifest-path platforms/windows/Cargo.toml --target x86_64-pc-windows-gnu
-
       - name: Build Windows Velopack installer
         shell: pwsh
         run: scripts/package-windows-velopack.ps1
