@@ -4,6 +4,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastE
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use crate::shell::show_info;
+use crate::i18n::{tr, Text};
 
 pub struct SingleInstance {
     handle: HANDLE,
@@ -22,7 +23,7 @@ impl SingleInstance {
             }
             show_info(
                 "Alma OneBot Bridge",
-                "Alma OneBot Bridge is already running in the notification area.",
+                tr(Text::AppAlreadyRunning),
             );
             std::process::exit(0);
         }

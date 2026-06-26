@@ -15,6 +15,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::app_state::AppState;
+use crate::i18n::{tr, Text};
 use crate::shell::{open_path, wide_null};
 use crate::ui;
 
@@ -159,17 +160,17 @@ fn show_menu(hwnd: HWND) {
         if menu.is_null() {
             return;
         }
-        append(menu, IDM_SETTINGS, "Settings...");
-        append(menu, IDM_START, "Start Bridge");
-        append(menu, IDM_STOP, "Stop Bridge");
-        append(menu, IDM_RESTART, "Restart Bridge");
-        append(menu, IDM_OPEN_CONFIG, "Open Config Directory");
-        append(menu, IDM_OPEN_LOG, "Open Bridge Log");
-        append(menu, IDM_ABOUT, "About");
+        append(menu, IDM_SETTINGS, tr(Text::Settings));
+        append(menu, IDM_START, tr(Text::StartBridge));
+        append(menu, IDM_STOP, tr(Text::StopBridge));
+        append(menu, IDM_RESTART, tr(Text::RestartBridge));
+        append(menu, IDM_OPEN_CONFIG, tr(Text::OpenConfigDirectory));
+        append(menu, IDM_OPEN_LOG, tr(Text::OpenBridgeLog));
+        append(menu, IDM_ABOUT, tr(Text::About));
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         append_disabled(menu, &status);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        append(menu, IDM_QUIT, "Quit");
+        append(menu, IDM_QUIT, tr(Text::Quit));
 
         let mut point = POINT { x: 0, y: 0 };
         GetCursorPos(&mut point);

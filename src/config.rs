@@ -97,10 +97,11 @@ pub struct Config {
 impl Config {
     pub fn load() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-
-        // Try to load config.toml
         let file_config = Self::load_config_file();
+        Self::from_file_config(file_config, home)
+    }
 
+    fn from_file_config(file_config: FileConfig, home: PathBuf) -> Self {
         // Extract TOML section values
         let bridge = file_config.bridge.unwrap_or_default();
         let alma = file_config.alma.unwrap_or_default();
@@ -202,25 +203,20 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
-    use std::env;
-    use std::fs;
+    use super::{Config, FileConfig};
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_config(content: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = env::temp_dir().join(format!("alma-onebot-bridge-config-{nonce}.toml"));
-        fs::write(&path, content).unwrap();
-        path
+    fn config_from_toml(content: &str) -> Config {
+        let file_config = toml::from_str::<FileConfig>(content).unwrap();
+        Config::from_file_config(
+            file_config,
+            PathBuf::from("/tmp/alma-onebot-bridge-test-home"),
+        )
     }
 
     #[test]
     fn group_chat_flags_default_to_enabled() {
-        let path = temp_config(
+        let cfg = config_from_toml(
             r#"
 [bridge]
 port = 8090
@@ -228,19 +224,6 @@ port = 8090
 api = "http://localhost:23001"
 "#,
         );
-        let prev = env::var_os("ALMA_ONEBOT_BRIDGE_CONFIG");
-        unsafe {
-            env::set_var("ALMA_ONEBOT_BRIDGE_CONFIG", &path);
-        }
-        let cfg = Config::load();
-        unsafe {
-            if let Some(p) = prev {
-                env::set_var("ALMA_ONEBOT_BRIDGE_CONFIG", p);
-            } else {
-                env::remove_var("ALMA_ONEBOT_BRIDGE_CONFIG");
-            }
-        }
-        let _ = fs::remove_file(path);
 
         assert!(cfg.listen_group_messages);
         assert!(cfg.respond_to_group_messages);
@@ -248,7 +231,7 @@ api = "http://localhost:23001"
 
     #[test]
     fn respond_to_group_forced_off_when_listen_disabled() {
-        let path = temp_config(
+        let cfg = config_from_toml(
             r#"
 [bridge]
 port = 8090
@@ -259,19 +242,6 @@ listen_group_messages = false
 respond_to_group_messages = true
 "#,
         );
-        let prev = env::var_os("ALMA_ONEBOT_BRIDGE_CONFIG");
-        unsafe {
-            env::set_var("ALMA_ONEBOT_BRIDGE_CONFIG", &path);
-        }
-        let cfg = Config::load();
-        unsafe {
-            if let Some(p) = prev {
-                env::set_var("ALMA_ONEBOT_BRIDGE_CONFIG", p);
-            } else {
-                env::remove_var("ALMA_ONEBOT_BRIDGE_CONFIG");
-            }
-        }
-        let _ = fs::remove_file(path);
 
         assert!(!cfg.listen_group_messages);
         assert!(

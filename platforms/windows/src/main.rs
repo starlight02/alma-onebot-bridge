@@ -5,6 +5,8 @@ mod app_state;
 #[cfg(windows)]
 mod config_model;
 #[cfg(windows)]
+mod i18n;
+#[cfg(windows)]
 mod shell;
 #[cfg(windows)]
 mod single_instance;

@@ -7,6 +7,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW, SW_SHOWNORMAL,
 };
 
+use crate::i18n;
+
 pub fn open_path(path: &Path) {
     let target = path.to_string_lossy();
     open_target(&target);
@@ -33,7 +35,7 @@ fn open_target(target: &str) {
         tracing::warn!(target = target, error = %error, "ShellExecuteW failed");
         show_error(
             "Alma OneBot Bridge",
-            &format!("Could not open:\n{target}\n\n{error}"),
+            &i18n::open_target_failed(target, &error),
         );
     }
 }
@@ -69,21 +71,7 @@ fn show_message(title: &str, message: &str, flags: u32) {
 }
 
 fn shell_execute_error(code: isize) -> String {
-    match code {
-        0 => "The operating system is out of memory or resources.".to_string(),
-        2 => "The target file was not found.".to_string(),
-        3 => "The target path was not found.".to_string(),
-        5 => "Access was denied.".to_string(),
-        8 => "There is not enough memory to complete the operation.".to_string(),
-        26 => "A sharing violation occurred.".to_string(),
-        27 => "The file association is incomplete or invalid.".to_string(),
-        28 => "The DDE transaction timed out.".to_string(),
-        29 => "The DDE transaction failed.".to_string(),
-        30 => "The DDE transaction is busy.".to_string(),
-        31 => "No application is associated with the target.".to_string(),
-        32 => "The dynamic-link library was not found.".to_string(),
-        other => format!("ShellExecuteW returned error code {other}."),
-    }
+    i18n::shell_execute_error(code)
 }
 
 pub fn wide_null(value: &str) -> Vec<u16> {

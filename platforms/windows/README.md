@@ -94,8 +94,10 @@ Local release check on macOS/Linux (cross build + portable ZIP; MSI still needs 
 ./scripts/test-windows-packaging-macos.sh
 ```
 
-Use `./scripts/build-windows-cross.sh` (not bare `cross build`) so `GetHostNameW` shim
-`RUSTFLAGS` and arm64 Docker `linux/amd64` platform are applied.
+Use `./scripts/check-windows-cross.sh` for local Windows GNU dependency checks from
+macOS/Linux. Use `./scripts/build-windows-cross.sh` for actual app builds so the
+MinGW `GetHostNameW` weak-symbol compatibility shim is linked, the payload is
+assembled, and Apple Silicon hosts force Docker to `linux/amd64`.
 
 Velopack MSI packaging must run on Windows. The `vpk [win] pack` cross-pack path
 does not expose Velopack's MSI/per-machine installer options.

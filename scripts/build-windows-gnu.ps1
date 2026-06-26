@@ -27,6 +27,8 @@ function Write-GetHostNameShim {
 #include <winsock2.h>
 #include <windows.h>
 
+int WSAAPI GetHostNameW(PWSTR name, int namelen) __attribute__((weak));
+
 int WSAAPI GetHostNameW(PWSTR name, int namelen) {
     DWORD size;
 
@@ -53,27 +55,6 @@ int WSAAPI GetHostNameW(PWSTR name, int namelen) {
     return $object
 }
 
-function Test-MingwGetHostNameW {
-    param([string]$OutputDir)
-
-    New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
-    $source = Join-Path $OutputDir "check_gethostnamew.c"
-    $binary = Join-Path $OutputDir "check_gethostnamew.exe"
-
-    @'
-#include <winsock2.h>
-#include <windows.h>
-
-int main(void) {
-    WCHAR name[256];
-    return GetHostNameW(name, 256);
-}
-'@ | Set-Content -Path $source -Encoding ASCII
-
-    & gcc $source -o $binary -lws2_32 *> $null
-    return $LASTEXITCODE -eq 0
-}
-
 if (Test-Path "C:\msys64\mingw64\bin") {
     Add-PathEntry "C:\msys64\mingw64\bin"
 }
@@ -90,17 +71,12 @@ if (-not (Get-Command windres -ErrorAction SilentlyContinue)) {
 
 $oldRustFlags = $env:RUSTFLAGS
 $ShimDir = Join-Path $RepoRoot "target/windows-gnu-shims/$Target"
-if (-not (Test-MingwGetHostNameW $ShimDir)) {
-    Write-Host "MinGW ws2_32 import library is missing GetHostNameW; enabling compatibility shim."
-    $ShimObj = Write-GetHostNameShim $ShimDir
-    $shimArg = "-C link-arg=$ShimObj -C link-arg=-lws2_32 -C link-arg=-lkernel32"
-    if ([string]::IsNullOrWhiteSpace($oldRustFlags)) {
-        $env:RUSTFLAGS = $shimArg
-    } elseif ($oldRustFlags -notlike "*$shimArg*") {
-        $env:RUSTFLAGS = "$oldRustFlags $shimArg"
-    }
-} else {
-    Write-Host "MinGW ws2_32 import library provides GetHostNameW; no shim needed."
+$ShimObj = Write-GetHostNameShim $ShimDir
+$shimArg = "-C link-arg=$ShimObj -C link-arg=-lws2_32 -C link-arg=-lkernel32"
+if ([string]::IsNullOrWhiteSpace($oldRustFlags)) {
+    $env:RUSTFLAGS = $shimArg
+} elseif ($oldRustFlags -notlike "*$shimArg*") {
+    $env:RUSTFLAGS = "$oldRustFlags $shimArg"
 }
 
 Push-Location $WindowsRoot

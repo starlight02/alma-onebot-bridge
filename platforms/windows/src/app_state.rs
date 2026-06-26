@@ -11,6 +11,7 @@ use alma_onebot_bridge::{
 use smol::channel;
 
 use crate::config_model::ConfigModel;
+use crate::i18n;
 
 #[derive(Clone, Debug)]
 pub enum BridgeStatus {
@@ -24,11 +25,11 @@ pub enum BridgeStatus {
 impl BridgeStatus {
     pub fn text(&self, port: u16) -> String {
         match self {
-            Self::Stopped => "Stopped".to_string(),
-            Self::Starting => format!("Starting on port {port}"),
-            Self::Running => format!("Running on port {port}"),
-            Self::Stopping => "Stopping".to_string(),
-            Self::Failed(reason) => format!("Failed: {reason}"),
+            Self::Stopped => i18n::status_stopped().to_string(),
+            Self::Starting => i18n::status_starting(port),
+            Self::Running => i18n::status_running(port),
+            Self::Stopping => i18n::status_stopping().to_string(),
+            Self::Failed(reason) => i18n::status_failed(reason),
         }
     }
 }
@@ -197,10 +198,10 @@ impl AppSnapshot {
     pub fn status_line(&self) -> String {
         match (&self.status, self.healthy) {
             (BridgeStatus::Running, true) => {
-                format!("{} - port check passed", self.status.text(self.port))
+                i18n::status_port_check(&self.status.text(self.port), true)
             }
             (BridgeStatus::Running, false) => {
-                format!("{} - port check failed", self.status.text(self.port))
+                i18n::status_port_check(&self.status.text(self.port), false)
             }
             _ => self.status.text(self.port),
         }

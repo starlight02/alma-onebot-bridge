@@ -35,6 +35,44 @@ jobs:
       - name: Run Rust tests
         run: cargo test
 
+  check-windows:
+    name: Check Windows GNU app
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust Windows GNU target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            platforms/windows -> platforms/windows
+          cache-targets: true
+
+      - name: Install MSYS2 MinGW GNU tools
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-gcc
+
+      - name: Add MSYS2 GNU tools to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Check Windows GNU compilation
+        shell: pwsh
+        run: cargo check --manifest-path platforms/windows/Cargo.toml --target x86_64-pc-windows-gnu
+
   build-pkg:
     name: Build macOS PKG (${{ matrix.package_arch }})
     runs-on: macos-26
@@ -242,7 +280,9 @@ jobs:
   build-windows:
     name: Build Windows installer and ZIP
     runs-on: windows-latest
-    needs: test
+    needs:
+      - test
+      - check-windows
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
 
     steps:

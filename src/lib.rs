@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::alma_ws::AlmaWsClient;
 pub use crate::config::Config;
 use crate::state::SharedState;
+#[cfg(unix)]
 use smol::channel;
 use trillium_smol::SmolRuntime;
 
@@ -290,12 +291,12 @@ where
                 let alma_api_changed = cfg.alma_api != new_config.alma_api;
                 cfg.group_history_size = new_config.group_history_size;
                 cfg.thinking_message = new_config.thinking_message;
-	                cfg.show_thinking = new_config.show_thinking;
-	                cfg.show_tool_calls = new_config.show_tool_calls;
-	                cfg.segmented_replies = new_config.segmented_replies;
-	                cfg.listen_group_messages = new_config.listen_group_messages;
-	                cfg.respond_to_group_messages = new_config.respond_to_group_messages;
-	                cfg.alma_run_timeout_secs = new_config.alma_run_timeout_secs;
+                cfg.show_thinking = new_config.show_thinking;
+                cfg.show_tool_calls = new_config.show_tool_calls;
+                cfg.segmented_replies = new_config.segmented_replies;
+                cfg.listen_group_messages = new_config.listen_group_messages;
+                cfg.respond_to_group_messages = new_config.respond_to_group_messages;
+                cfg.alma_run_timeout_secs = new_config.alma_run_timeout_secs;
                 cfg.alma_max_retries = new_config.alma_max_retries;
                 cfg.alma_retry_delay_ms = new_config.alma_retry_delay_ms;
                 cfg.access_token = new_config.access_token;
@@ -355,15 +356,32 @@ fn first_available_port(start: u16, attempts: u16) -> Option<u16> {
 }
 
 pub async fn shutdown_signal() {
-    let _ = smol::unblock(|| {
-        let mut signals = signal_hook::iterator::Signals::new([
-            signal_hook::consts::SIGINT,
-            signal_hook::consts::SIGTERM,
-        ])?;
-        let _ = signals.forever().next();
-        Ok::<(), std::io::Error>(())
-    })
-    .await;
+    let term = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut registered_any = false;
+
+    for signal in signal_hook::consts::TERM_SIGNALS {
+        match signal_hook::flag::register(*signal, std::sync::Arc::clone(&term)) {
+            Ok(_) => {
+                registered_any = true;
+            }
+            Err(e) => {
+                tracing::warn!("failed to install shutdown handler for signal {signal}: {e}");
+            }
+        }
+    }
+
+    if !registered_any {
+        tracing::warn!(
+            "No shutdown signal handlers were installed; waiting for external process termination"
+        );
+        std::future::pending::<()>().await;
+    }
+
+    while !term.load(std::sync::atomic::Ordering::Relaxed) {
+        SmolRuntime::default()
+            .delay(std::time::Duration::from_millis(200))
+            .await;
+    }
 
     tracing::info!("Shutdown signal received; stopping HTTP/WebSocket server");
 }

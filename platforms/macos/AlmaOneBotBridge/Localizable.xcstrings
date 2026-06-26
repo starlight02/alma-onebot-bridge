@@ -1360,6 +1360,54 @@
           }
         }
       }
+    },
+    "监听群聊消息": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Listen to group messages"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "监听群聊消息"
+          }
+        }
+      }
+    },
+    "响应群聊消息": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Respond to group messages"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "响应群聊消息"
+          }
+        }
+      }
+    },
+    "关闭监听后，群聊不会写入日志与群聊记录，也不会响应群聊；仅私聊可用。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "When listening is off, group messages are not logged or recorded in group history and will not be answered; private chat remains available."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关闭监听后，群聊不会写入日志与群聊记录，也不会响应群聊；仅私聊可用。"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

@@ -5,6 +5,7 @@ use windows_reactor::*;
 
 use crate::app_state::{AppState, BridgeStatus};
 use crate::config_model::ConfigModel;
+use crate::i18n::{self, tr, Text};
 use crate::shell::{open_path, open_url, show_error};
 
 thread_local! {
@@ -23,7 +24,7 @@ pub fn show_settings(state: Arc<AppState>) {
             state: Arc::clone(&state),
         });
         let host = match ReactorHost::new_with_window_options(
-            "Alma OneBot Bridge",
+            tr(Text::SettingsWindowTitle),
             Some(WindowSize {
                 width: 820.0,
                 height: 760.0,
@@ -38,13 +39,13 @@ pub fn show_settings(state: Arc<AppState>) {
         ) {
             Ok(host) => host,
             Err(error) => {
-                report_window_error("Settings", &state, error);
+                report_window_error(tr(Text::SettingsWindowName), &state, error);
                 return;
             }
         };
         host.set_backdrop(Backdrop::Mica);
         if let Err(error) = host.activate() {
-            report_window_error("Settings", &state, error);
+            report_window_error(tr(Text::SettingsWindowName), &state, error);
         }
         slot.borrow_mut().replace(host);
     });
@@ -61,7 +62,7 @@ pub fn show_about(state: Arc<AppState>) {
             state: Arc::clone(&state),
         });
         let host = match ReactorHost::new_with_window_options(
-            "About Alma OneBot Bridge",
+            tr(Text::AboutWindowTitle),
             Some(WindowSize {
                 width: 540.0,
                 height: 440.0,
@@ -76,13 +77,13 @@ pub fn show_about(state: Arc<AppState>) {
         ) {
             Ok(host) => host,
             Err(error) => {
-                report_window_error("About", &state, error);
+                report_window_error(tr(Text::About), &state, error);
                 return;
             }
         };
         host.set_backdrop(Backdrop::Mica);
         if let Err(error) = host.activate() {
-            report_window_error("About", &state, error);
+            report_window_error(tr(Text::About), &state, error);
         }
         slot.borrow_mut().replace(host);
     });
@@ -96,10 +97,7 @@ fn report_window_error(window_name: &str, state: &Arc<AppState>, error: windows_
     );
     show_error(
         "Alma OneBot Bridge",
-        &format!(
-            "Could not open the {window_name} window.\n\nCheck the bridge log:\n{}",
-            state.log_file().display()
-        ),
+        &i18n::window_open_failed(window_name, &state.log_file().display().to_string()),
     );
 }
 
@@ -140,7 +138,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
 
     let mut content = vec![
         title("Alma OneBot Bridge").into(),
-        InfoBar::new("Bridge status")
+        InfoBar::new(tr(Text::BridgeStatus))
             .message(status_message)
             .severity(match snapshot.status {
                 BridgeStatus::Running if snapshot.healthy => InfoBarSeverity::Success,
@@ -152,10 +150,10 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
             .into(),
         command_row(state, refresh, &set_refresh),
         section(
-            "Bridge service",
+            tr(Text::BridgeService),
             vec![
                 text_field(
-                    "Listen port",
+                    tr(Text::ListenPort),
                     &model,
                     &set_model,
                     |m| &m.bridge_port,
@@ -163,7 +161,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                     "8090",
                 ),
                 text_field(
-                    "Alma API",
+                    tr(Text::AlmaApi),
                     &model,
                     &set_model,
                     |m| &m.alma_api,
@@ -171,15 +169,15 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                     "http://localhost:23001",
                 ),
                 text_field(
-                    "Model override",
+                    tr(Text::ModelOverride),
                     &model,
                     &set_model,
                     |m| &m.alma_model,
                     |m, value| m.alma_model = value,
-                    "Leave empty to use Alma default",
+                    i18n::empty_model_placeholder(),
                 ),
                 text_field(
-                    "Generation timeout",
+                    tr(Text::GenerationTimeout),
                     &model,
                     &set_model,
                     |m| &m.alma_timeout,
@@ -187,7 +185,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                     "120",
                 ),
                 text_field(
-                    "Max retries",
+                    tr(Text::MaxRetries),
                     &model,
                     &set_model,
                     |m| &m.alma_max_retries,
@@ -195,7 +193,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                     "2",
                 ),
                 text_field(
-                    "Retry delay ms",
+                    tr(Text::RetryDelayMs),
                     &model,
                     &set_model,
                     |m| &m.alma_retry_delay_ms,
@@ -205,19 +203,19 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
             ],
         ),
         section(
-            "OneBot and chat",
+            tr(Text::OneBotAndChat),
             vec![
                 text_field(
-                    "OneBot timeout",
+                    tr(Text::OneBotTimeout),
                     &model,
                     &set_model,
                     |m| &m.onebot_api_timeout,
                     |m, value| m.onebot_api_timeout = value,
                     "30",
                 ),
-                password_field("Access token", &model, &set_model),
+                password_field(tr(Text::AccessToken), &model, &set_model),
                 text_field(
-                    "Group history size",
+                    tr(Text::GroupHistorySize),
                     &model,
                     &set_model,
                     |m| &m.group_history_size,
@@ -225,14 +223,14 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                     "30",
                 ),
                 text_field(
-                    "Thinking message",
+                    tr(Text::ThinkingMessage),
                     &model,
                     &set_model,
                     |m| &m.thinking_message,
                     |m, value| m.thinking_message = value,
-                    "Leave empty to disable",
+                    i18n::empty_disabled_placeholder(),
                 ),
-                toggle_row("Show thinking in QQ", model.show_thinking, {
+                toggle_row(tr(Text::ShowThinkingInQq), model.show_thinking, {
                     let base = model.clone();
                     let set_model = set_model.clone();
                     move |value| {
@@ -241,7 +239,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                         set_model.call(next);
                     }
                 }),
-                toggle_row("Show tool calls", model.show_tool_calls, {
+                toggle_row(tr(Text::ShowToolCalls), model.show_tool_calls, {
                     let base = model.clone();
                     let set_model = set_model.clone();
                     move |value| {
@@ -250,7 +248,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                         set_model.call(next);
                     }
                 }),
-                toggle_row("Segment replies", model.segmented_replies, {
+                toggle_row(tr(Text::SegmentReplies), model.segmented_replies, {
                     let base = model.clone();
                     let set_model = set_model.clone();
                     move |value| {
@@ -259,7 +257,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                         set_model.call(next);
                     }
                 }),
-                toggle_row("Listen to group messages", model.listen_group_messages, {
+                toggle_row(tr(Text::ListenToGroupMessages), model.listen_group_messages, {
                     let base = model.clone();
                     let set_model = set_model.clone();
                     move |value| {
@@ -272,7 +270,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                     }
                 }),
                 toggle_row(
-                    "Respond to group messages",
+                    tr(Text::RespondToGroupMessages),
                     model.respond_to_group_messages && model.listen_group_messages,
                     {
                         let base = model.clone();
@@ -289,10 +287,10 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
             ],
         ),
         section(
-            "Storage",
+            tr(Text::Storage),
             vec![
                 text_field(
-                    "Database path",
+                    tr(Text::DatabasePath),
                     &model,
                     &set_model,
                     |m| &m.db_path,
@@ -300,7 +298,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                     "bridge-state.db",
                 ),
                 text_field(
-                    "People directory",
+                    tr(Text::PeopleDirectory),
                     &model,
                     &set_model,
                     |m| &m.people_dir,
@@ -313,7 +311,7 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
 
     if !save_message.is_empty() {
         content.push(
-            InfoBar::new("Settings")
+            InfoBar::new(tr(Text::Settings))
                 .message(save_message.clone())
                 .severity(if model.is_valid() {
                     InfoBarSeverity::Success
@@ -327,30 +325,30 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
 
     content.push(
         hstack((
-            button("Save and restart bridge")
+            button(tr(Text::SaveAndRestartBridge))
                 .accent()
                 .enabled(save_enabled)
                 .on_click(move || {
                     if !save_model.is_valid() {
-                        save_set_message.call("Some settings are invalid.".to_string());
+                        save_set_message.call(i18n::invalid_settings_message().to_string());
                         return;
                     }
                     match save_model.save_to(&save_state.config_file()) {
                         Ok(()) => {
                             save_state.restart_bridge();
-                            save_set_message.call("Saved. Bridge restart requested.".to_string());
+                            save_set_message.call(i18n::saved_restart_message().to_string());
                             save_set_refresh.call(refresh + 1);
                         }
                         Err(e) => {
-                            save_set_message.call(format!("Save failed: {e}"));
+                            save_set_message.call(i18n::save_failed_message(&e));
                         }
                     }
                 }),
-            button("Open config").subtle().on_click({
+            button(tr(Text::OpenConfig)).subtle().on_click({
                 let path = state.config_file();
                 move || open_path(&path)
             }),
-            button("Open log").subtle().on_click({
+            button(tr(Text::OpenLog)).subtle().on_click({
                 let path = state.log_file();
                 move || open_path(&path)
             }),
@@ -370,26 +368,26 @@ fn render_about(state: &Arc<AppState>) -> Element {
 
     vstack((
         title("Alma OneBot Bridge"),
-        body("Windows native tray app powered by Rust and WinUI 3.").wrap(),
+        body(i18n::app_description()).wrap(),
         section(
-            "Runtime",
+            tr(Text::Runtime),
             vec![
-                about_row("Version", env!("CARGO_PKG_VERSION")),
-                about_row("Status", &snapshot.status_line()),
-                about_row("Config dir", &snapshot.config_dir.to_string_lossy()),
-                about_row("Config", &snapshot.config_file.to_string_lossy()),
-                about_row("Log", &snapshot.log_file.to_string_lossy()),
+                about_row(tr(Text::Version), env!("CARGO_PKG_VERSION")),
+                about_row(tr(Text::Status), &snapshot.status_line()),
+                about_row(tr(Text::ConfigDir), &snapshot.config_dir.to_string_lossy()),
+                about_row(tr(Text::Config), &snapshot.config_file.to_string_lossy()),
+                about_row(tr(Text::Log), &snapshot.log_file.to_string_lossy()),
             ],
         ),
         section(
-            "Project",
+            tr(Text::Project),
             vec![
-                about_row("Author", "\u{661f}\u{5149}\u{306e}\u{6bb2}\u{6ec5}\u{8005}"),
-                about_row("License", "AGPL-3.0-only"),
+                about_row(tr(Text::Author), "\u{661f}\u{5149}\u{306e}\u{6bb2}\u{6ec5}\u{8005}"),
+                about_row(tr(Text::License), "AGPL-3.0-only"),
                 hstack((
-                    button("Project").on_click(move || open_url(project_url)),
-                    button("Author").on_click(move || open_url(author_url)),
-                    button("License").on_click(move || open_url(license_url)),
+                    button(tr(Text::Project)).on_click(move || open_url(project_url)),
+                    button(tr(Text::Author)).on_click(move || open_url(author_url)),
+                    button(tr(Text::License)).on_click(move || open_url(license_url)),
                 ))
                 .spacing(8.0)
                 .into(),
@@ -403,7 +401,7 @@ fn render_about(state: &Arc<AppState>) -> Element {
 
 fn command_row(state: &Arc<AppState>, refresh: i32, set_refresh: &SetState<i32>) -> Element {
     hstack((
-        button("Start").on_click({
+        button(tr(Text::Start)).on_click({
             let state = Arc::clone(state);
             let set_refresh = set_refresh.clone();
             move || {
@@ -411,7 +409,7 @@ fn command_row(state: &Arc<AppState>, refresh: i32, set_refresh: &SetState<i32>)
                 set_refresh.call(refresh + 1);
             }
         }),
-        button("Stop").on_click({
+        button(tr(Text::Stop)).on_click({
             let state = Arc::clone(state);
             let set_refresh = set_refresh.clone();
             move || {
@@ -419,7 +417,7 @@ fn command_row(state: &Arc<AppState>, refresh: i32, set_refresh: &SetState<i32>)
                 set_refresh.call(refresh + 1);
             }
         }),
-        button("Restart").accent().on_click({
+        button(tr(Text::Restart)).accent().on_click({
             let state = Arc::clone(state);
             let set_refresh = set_refresh.clone();
             move || {
@@ -484,9 +482,9 @@ fn password_field(label: &str, model: &ConfigModel, set_model: &SetState<ConfigM
     let setter = set_model.clone();
     row(
         label,
-        PasswordBox::new()
+            PasswordBox::new()
             .value(model.access_token.clone())
-            .placeholder_text("Disabled")
+            .placeholder_text(tr(Text::Disabled))
             .on_password_changed(move |value| {
                 let mut next = base.clone();
                 next.access_token = value;
@@ -502,8 +500,8 @@ fn toggle_row(label: &str, value: bool, on_change: impl Fn(bool) + 'static) -> E
         label,
         ToggleSwitch::new(value)
             .on_toggled(on_change)
-            .on_content("On")
-            .off_content("Off")
+            .on_content(tr(Text::On))
+            .off_content(tr(Text::Off))
             .into(),
     )
 }

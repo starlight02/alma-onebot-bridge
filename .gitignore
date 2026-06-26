@@ -17,6 +17,7 @@ config.toml
 .vscode/
 *.swp
 *.swo
+.alma-snapshots
 
 # Xcode
 platforms/macos/build/

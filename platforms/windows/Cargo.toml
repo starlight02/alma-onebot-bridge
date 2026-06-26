@@ -1,6 +1,6 @@
 [package]
 name = "alma-onebot-bridge-windows"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
@@ -21,6 +21,7 @@ velopack = "1.2.0"
 windows-reactor = { git = "https://github.com/microsoft/windows-rs", package = "windows-reactor" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
