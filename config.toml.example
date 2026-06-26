@@ -29,3 +29,5 @@ group_history_size = 30     # Recent group messages for AI context (0 = disabled
 # show_thinking = false      # Show AI thinking content as a separate message (strips by default)
 # show_tool_calls = false    # Show "正在调用工具..." status messages in QQ
 segmented_replies = false   # Split replies by paragraphs. Stage text sending is always enabled.
+listen_group_messages = true   # Record group logs/history; when false, ignore all group traffic
+respond_to_group_messages = true   # Reply to @bot in groups; requires listen_group_messages

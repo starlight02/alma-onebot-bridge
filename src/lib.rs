@@ -200,6 +200,22 @@ where
             "disabled"
         }
     );
+    tracing::info!(
+        "  Listen group messages: {}",
+        if config.listen_group_messages {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    tracing::info!(
+        "  Respond to group messages: {}",
+        if config.respond_to_group_messages {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     if options.write_pid_file {
         write_pid_file();
@@ -274,10 +290,12 @@ where
                 let alma_api_changed = cfg.alma_api != new_config.alma_api;
                 cfg.group_history_size = new_config.group_history_size;
                 cfg.thinking_message = new_config.thinking_message;
-                cfg.show_thinking = new_config.show_thinking;
-                cfg.show_tool_calls = new_config.show_tool_calls;
-                cfg.segmented_replies = new_config.segmented_replies;
-                cfg.alma_run_timeout_secs = new_config.alma_run_timeout_secs;
+	                cfg.show_thinking = new_config.show_thinking;
+	                cfg.show_tool_calls = new_config.show_tool_calls;
+	                cfg.segmented_replies = new_config.segmented_replies;
+	                cfg.listen_group_messages = new_config.listen_group_messages;
+	                cfg.respond_to_group_messages = new_config.respond_to_group_messages;
+	                cfg.alma_run_timeout_secs = new_config.alma_run_timeout_secs;
                 cfg.alma_max_retries = new_config.alma_max_retries;
                 cfg.alma_retry_delay_ms = new_config.alma_retry_delay_ms;
                 cfg.access_token = new_config.access_token;

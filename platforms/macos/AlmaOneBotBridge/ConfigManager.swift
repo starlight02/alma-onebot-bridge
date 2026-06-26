@@ -1016,6 +1016,13 @@ final class ConfigManager: ObservableObject {
             if let v = c["show_thinking"]?.bool { loaded.showThinking = v }
             if let v = c["show_tool_calls"]?.bool { loaded.showToolCalls = v }
             if let v = c["segmented_replies"]?.bool { loaded.segmentedReplies = v }
+            if let v = c["listen_group_messages"]?.bool { loaded.listenGroupMessages = v }
+            if let v = c["respond_to_group_messages"]?.bool {
+                loaded.respondToGroupMessages = v
+            }
+            if !loaded.listenGroupMessages {
+                loaded.respondToGroupMessages = false
+            }
         }
         if let d = t["database"]?.table {
             if let v = d["path"]?.string { loaded.dbPath = v }
@@ -1060,6 +1067,9 @@ final class ConfigManager: ObservableObject {
         lines.append("show_thinking = \(m.showThinking ? "true" : "false")")
         lines.append("show_tool_calls = \(m.showToolCalls ? "true" : "false")")
         lines.append("segmented_replies = \(m.segmentedReplies ? "true" : "false")")
+        lines.append("listen_group_messages = \(m.listenGroupMessages ? "true" : "false")")
+        let respondToGroups = m.listenGroupMessages && m.respondToGroupMessages
+        lines.append("respond_to_group_messages = \(respondToGroups ? "true" : "false")")
 
         if !m.dbPath.isEmpty {
             lines.append("")

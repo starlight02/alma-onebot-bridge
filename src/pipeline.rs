@@ -49,6 +49,8 @@ pub async fn process_message_event(
         show_thinking,
         show_tool_calls,
         segmented_replies,
+        listen_groups,
+        respond_to_groups,
         max_retries,
         base_delay_ms,
         run_timeout,
@@ -60,6 +62,8 @@ pub async fn process_message_event(
             cfg.show_thinking,
             cfg.show_tool_calls,
             cfg.segmented_replies,
+            cfg.listen_group_messages,
+            cfg.respond_to_group_messages,
             cfg.alma_max_retries,
             cfg.alma_retry_delay_ms,
             cfg.alma_run_timeout_secs,
@@ -106,17 +110,24 @@ pub async fn process_message_event(
         );
         return Ok(());
     }
-    let group_id = if is_group {
-        Some(
-            event
-                .group_id
-                .filter(|id| *id > 0)
-                .ok_or_else(|| "OneBot group message event missing group_id".to_string())?,
-        )
-    } else {
-        None
-    };
-    let group_id_value = group_id.unwrap_or_default();
+	    let group_id = if is_group {
+	        Some(
+	            event
+	                .group_id
+	                .filter(|id| *id > 0)
+	                .ok_or_else(|| "OneBot group message event missing group_id".to_string())?,
+	        )
+	    } else {
+	        None
+	    };
+	    if is_group && !listen_groups {
+	        debug!(
+	            "[Message] Group message ignored (listen_group_messages disabled), group_id={:?}",
+	            group_id
+	        );
+	        return Ok(());
+	    }
+	    let group_id_value = group_id.unwrap_or_default();
     let sender_nickname = event
         .sender
         .as_ref()
@@ -214,11 +225,19 @@ pub async fn process_message_event(
     } else {
         true
     };
-    if !should_process {
-        return Ok(());
-    }
+	    if !should_process {
+	        return Ok(());
+	    }
 
-    let cleaned_text = if is_group {
+	    if is_group && !respond_to_groups {
+	        debug!(
+	            "[Message] Group trigger matched but respond_to_group_messages disabled, group_id={}",
+	            group_id_value
+	        );
+	        return Ok(());
+	    }
+
+	    let cleaned_text = if is_group {
         crate::onebot::event::clean_at_from_text(&text, bot_id)
     } else {
         text.clone()
@@ -1165,18 +1184,20 @@ pub async fn handle_alma_event(
         return Ok(());
     }
 
-    // ── Snapshot config values ──────────────────────────────────────────────
-    let (show_thinking, segmented_replies, onebot_timeout) = {
-        let cfg = state.config.read().await;
-        (
-            cfg.show_thinking,
-            cfg.segmented_replies,
-            cfg.onebot_api_timeout_secs,
-        )
-    };
+	    // ── Snapshot config values ──────────────────────────────────────────────
+	    let (show_thinking, segmented_replies, onebot_timeout, listen_groups, respond_to_groups) = {
+	        let cfg = state.config.read().await;
+	        (
+	            cfg.show_thinking,
+	            cfg.segmented_replies,
+	            cfg.onebot_api_timeout_secs,
+	            cfg.listen_group_messages,
+	            cfg.respond_to_group_messages,
+	        )
+	    };
 
-    // Only forward assistant messages from threads we're tracking
-    let target = match state.get_qq_target(&event.thread_id).await? {
+	    // Only forward assistant messages from threads we're tracking
+	    let target = match state.get_qq_target(&event.thread_id).await? {
         Some(t) => t,
         None => {
             // Promoted to info: critical for diagnosing "Alma GUI reply not
@@ -1187,11 +1208,19 @@ pub async fn handle_alma_event(
                 "[Alma→QQ] Thread {} has no QQ target mapping (not in session_reverse or DB), skipping",
                 event.thread_id
             );
-            return Ok(());
-        }
-    };
+	            return Ok(());
+	        }
+	    };
 
-    let forward_text = crate::alma_ws::sanitize_visible_assistant_text(&event.message_text);
+	    if target.target_type == "group" && (!listen_groups || !respond_to_groups) {
+	        debug!(
+	            "[Alma→QQ] Skipping group forward (listen={}, respond={})",
+	            listen_groups, respond_to_groups
+	        );
+	        return Ok(());
+	    }
+
+	    let forward_text = crate::alma_ws::sanitize_visible_assistant_text(&event.message_text);
 
     // Dedup: skip if the bridge pipeline already delivered this assistant turn to QQ.
     if state
@@ -1374,13 +1403,16 @@ fn build_recent_chat_history_context(history: &[crate::state::GroupMessage]) -> 
 }
 
 pub(crate) async fn record_alma_group_output(
-    state: &SharedState,
-    group_id: i64,
-    text: &str,
-    message_id: Option<i64>,
-    timestamp_secs: u64,
-) {
-    let history_session_key = format!("group:{}", group_id);
+	    state: &SharedState,
+	    group_id: i64,
+	    text: &str,
+	    message_id: Option<i64>,
+	    timestamp_secs: u64,
+	) {
+	    if !state.config.read().await.listen_group_messages {
+	        return;
+	    }
+	    let history_session_key = format!("group:{}", group_id);
     state
         .record_group_message(
             &history_session_key,

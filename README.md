@@ -134,6 +134,8 @@ group_history_size = 30        # Recent group messages for AI context (0 = disab
 # thinking_message = "思考中..."  # Optional message before AI generation
 show_tool_calls = false        # Show tool invocation status messages in QQ after parameters are available
 segmented_replies = false      # Split replies by paragraphs when enabled
+listen_group_messages = true   # Group logs/history; false = ignore all group traffic
+respond_to_group_messages = true   # Reply to @bot in groups; requires listen_group_messages
 ```
 
 > **Note**: Git ignores `config.toml`. The repo tracks only `config.toml.example`.
@@ -199,6 +201,8 @@ chooses the first available port starting at `18090`.
 | `chat.show_thinking` | `false` | Send thinking blocks as separate QQ messages |
 | `chat.show_tool_calls` | `false` | Send `正在调用工具：...` status messages after Alma tool parameters are available |
 | `chat.segmented_replies` | `false` | Split each assistant reply by paragraphs before QQ length chunking |
+| `chat.listen_group_messages` | `true` | Listen to group messages (logs, `~/.config/alma/groups`, history). When `false`, group events are ignored; private chat only |
+| `chat.respond_to_group_messages` | `true` | Respond to group triggers (@bot, etc.). Requires `listen_group_messages`; when listen is off, respond is forced off |
 
 ## How It Works
 

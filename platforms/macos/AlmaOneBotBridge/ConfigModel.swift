@@ -24,6 +24,8 @@ final class ConfigModel: ObservableObject {
     @Published var showThinking: Bool = false
     @Published var showToolCalls: Bool = false
     @Published var segmentedReplies: Bool = false
+    @Published var listenGroupMessages: Bool = true
+    @Published var respondToGroupMessages: Bool = true
 
     // MARK: Paths
     @Published var peopleDir: String = ConfigModel.defaultPeopleDir()
@@ -88,6 +90,8 @@ final class ConfigModel: ObservableObject {
         showThinking = o.showThinking
         showToolCalls = o.showToolCalls
         segmentedReplies = o.segmentedReplies
+        listenGroupMessages = o.listenGroupMessages
+        respondToGroupMessages = o.respondToGroupMessages
         peopleDir = o.peopleDir
         dbPath = o.dbPath
     }
@@ -106,6 +110,8 @@ final class ConfigModel: ObservableObject {
         && showThinking == o.showThinking
         && showToolCalls == o.showToolCalls
         && segmentedReplies == o.segmentedReplies
+        && listenGroupMessages == o.listenGroupMessages
+        && respondToGroupMessages == o.respondToGroupMessages
         && peopleDir == o.peopleDir
         && dbPath == o.dbPath
     }

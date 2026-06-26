@@ -259,6 +259,33 @@ fn render_settings(state: &Arc<AppState>, cx: &mut RenderCx) -> Element {
                         set_model.call(next);
                     }
                 }),
+                toggle_row("Listen to group messages", model.listen_group_messages, {
+                    let base = model.clone();
+                    let set_model = set_model.clone();
+                    move |value| {
+                        let mut next = base.clone();
+                        next.listen_group_messages = value;
+                        if !value {
+                            next.respond_to_group_messages = false;
+                        }
+                        set_model.call(next);
+                    }
+                }),
+                toggle_row(
+                    "Respond to group messages",
+                    model.respond_to_group_messages && model.listen_group_messages,
+                    {
+                        let base = model.clone();
+                        let set_model = set_model.clone();
+                        move |value| {
+                            let mut next = base.clone();
+                            if next.listen_group_messages {
+                                next.respond_to_group_messages = value;
+                            }
+                            set_model.call(next);
+                        }
+                    },
+                ),
             ],
         ),
         section(

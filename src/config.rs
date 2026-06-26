@@ -51,6 +51,8 @@ struct ChatSection {
     show_thinking: Option<bool>,
     show_tool_calls: Option<bool>,
     segmented_replies: Option<bool>,
+    listen_group_messages: Option<bool>,
+    respond_to_group_messages: Option<bool>,
 }
 
 /// Bridge configuration — populated from config.toml with built-in defaults.
@@ -82,6 +84,14 @@ pub struct Config {
     /// Whether to split assistant replies by paragraphs. Default: false.
     /// Long messages are still split by QQ's message length limit.
     pub segmented_replies: bool,
+    /// Whether to listen to (record) group chat messages at all.
+    /// When false: no group logs, no group history, no processing of group events.
+    /// Default: true.
+    pub listen_group_messages: bool,
+    /// Whether to respond to group chat messages (requires @bot etc.).
+    /// When false: group messages are recorded (if listen enabled) but no AI response.
+    /// Default: true.
+    pub respond_to_group_messages: bool,
 }
 
 impl Config {
@@ -130,6 +140,15 @@ impl Config {
             show_thinking: chat.show_thinking.unwrap_or(false),
             show_tool_calls: chat.show_tool_calls.unwrap_or(false),
             segmented_replies: chat.segmented_replies.unwrap_or(false),
+            listen_group_messages: {
+                let listen = chat.listen_group_messages.unwrap_or(true);
+                listen
+            },
+            respond_to_group_messages: {
+                let listen = chat.listen_group_messages.unwrap_or(true);
+                let respond = chat.respond_to_group_messages.unwrap_or(true);
+                if listen { respond } else { false }
+            },
         }
     }
 
@@ -178,5 +197,86 @@ impl Config {
 
         tracing::info!("No config.toml found, using defaults");
         FileConfig::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_config(content: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("alma-onebot-bridge-config-{nonce}.toml"));
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn group_chat_flags_default_to_enabled() {
+        let path = temp_config(
+            r#"
+[bridge]
+port = 8090
+[alma]
+api = "http://localhost:23001"
+"#,
+        );
+        let prev = env::var_os("ALMA_ONEBOT_BRIDGE_CONFIG");
+        unsafe {
+            env::set_var("ALMA_ONEBOT_BRIDGE_CONFIG", &path);
+        }
+        let cfg = Config::load();
+        unsafe {
+            if let Some(p) = prev {
+                env::set_var("ALMA_ONEBOT_BRIDGE_CONFIG", p);
+            } else {
+                env::remove_var("ALMA_ONEBOT_BRIDGE_CONFIG");
+            }
+        }
+        let _ = fs::remove_file(path);
+
+        assert!(cfg.listen_group_messages);
+        assert!(cfg.respond_to_group_messages);
+    }
+
+    #[test]
+    fn respond_to_group_forced_off_when_listen_disabled() {
+        let path = temp_config(
+            r#"
+[bridge]
+port = 8090
+[alma]
+api = "http://localhost:23001"
+[chat]
+listen_group_messages = false
+respond_to_group_messages = true
+"#,
+        );
+        let prev = env::var_os("ALMA_ONEBOT_BRIDGE_CONFIG");
+        unsafe {
+            env::set_var("ALMA_ONEBOT_BRIDGE_CONFIG", &path);
+        }
+        let cfg = Config::load();
+        unsafe {
+            if let Some(p) = prev {
+                env::set_var("ALMA_ONEBOT_BRIDGE_CONFIG", p);
+            } else {
+                env::remove_var("ALMA_ONEBOT_BRIDGE_CONFIG");
+            }
+        }
+        let _ = fs::remove_file(path);
+
+        assert!(!cfg.listen_group_messages);
+        assert!(
+            !cfg.respond_to_group_messages,
+            "respond must be false when listen is off"
+        );
     }
 }

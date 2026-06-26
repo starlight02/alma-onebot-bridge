@@ -18,6 +18,8 @@ pub struct ConfigModel {
     pub show_thinking: bool,
     pub show_tool_calls: bool,
     pub segmented_replies: bool,
+    pub listen_group_messages: bool,
+    pub respond_to_group_messages: bool,
     pub people_dir: String,
     pub db_path: String,
 }
@@ -46,6 +48,8 @@ impl Default for ConfigModel {
             show_thinking: false,
             show_tool_calls: false,
             segmented_replies: false,
+            listen_group_messages: true,
+            respond_to_group_messages: true,
             people_dir,
             db_path: "bridge-state.db".to_string(),
         }
@@ -166,6 +170,26 @@ impl ConfigModel {
                 .as_ref()
                 .and_then(|section| section.segmented_replies)
                 .unwrap_or(defaults.segmented_replies),
+            listen_group_messages: file
+                .chat
+                .as_ref()
+                .and_then(|section| section.listen_group_messages)
+                .unwrap_or(defaults.listen_group_messages),
+            respond_to_group_messages: {
+                let listen = file
+                    .chat
+                    .as_ref()
+                    .and_then(|section| section.listen_group_messages)
+                    .unwrap_or(defaults.listen_group_messages);
+                if !listen {
+                    false
+                } else {
+                    file.chat
+                        .as_ref()
+                        .and_then(|section| section.respond_to_group_messages)
+                        .unwrap_or(defaults.respond_to_group_messages)
+                }
+            },
             people_dir: file
                 .people
                 .as_ref()
@@ -208,6 +232,10 @@ impl ConfigModel {
                 show_thinking: Some(self.show_thinking),
                 show_tool_calls: Some(self.show_tool_calls),
                 segmented_replies: Some(self.segmented_replies),
+                listen_group_messages: Some(self.listen_group_messages),
+                respond_to_group_messages: Some(
+                    self.listen_group_messages && self.respond_to_group_messages,
+                ),
             }),
         }
     }
@@ -268,4 +296,6 @@ struct ChatSection {
     show_thinking: Option<bool>,
     show_tool_calls: Option<bool>,
     segmented_replies: Option<bool>,
+    listen_group_messages: Option<bool>,
+    respond_to_group_messages: Option<bool>,
 }

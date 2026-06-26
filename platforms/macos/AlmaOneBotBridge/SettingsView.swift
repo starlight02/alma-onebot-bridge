@@ -240,7 +240,36 @@ struct SettingsView: View {
                     .labelsHidden()
                     .toggleStyle(.switch)
             }
+
+            LabeledContent("监听群聊消息") {
+                Toggle("", isOn: listenGroupBinding)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+
+            LabeledContent("响应群聊消息") {
+                Toggle("", isOn: $editing.respondToGroupMessages)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .disabled(!editing.listenGroupMessages)
+            }
+            ValidationMessage(
+                isVisible: !editing.listenGroupMessages,
+                text: "关闭监听后，群聊不会写入日志与群聊记录，也不会响应群聊；仅私聊可用。"
+            )
         }
+    }
+
+    private var listenGroupBinding: Binding<Bool> {
+        Binding(
+            get: { editing.listenGroupMessages },
+            set: { newValue in
+                editing.listenGroupMessages = newValue
+                if !newValue {
+                    editing.respondToGroupMessages = false
+                }
+            }
+        )
     }
 
     private var storageSection: some View {
