@@ -1,0 +1,52 @@
+version: 2
+updates:
+  # Rust 主工程依赖
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Windows 平台 Rust 子工程依赖
+  - package-ecosystem: cargo
+    directory: "/platforms/windows"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(windows)"
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # macOS 平台 Swift Package Manager 依赖（Xcode 项目，依赖定义在 .xcodeproj 内）
+  - package-ecosystem: swift
+    directory: "/platforms/macos"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(macos)"
+    groups:
+      swift-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions workflow 依赖
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "ci"
