@@ -1,0 +1,20 @@
+name: Setup MinGW GNU toolchain
+description: 安装 MSYS2 MinGW-w64 GNU 工具链（binutils + gcc）并加入 PATH，供 x86_64-pc-windows-gnu 交叉编译使用。
+
+runs:
+  using: composite
+  steps:
+    - name: Install MSYS2 MinGW GNU tools
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-binutils
+          mingw-w64-x86_64-gcc
+
+    - name: Add MSYS2 GNU tools to PATH
+      shell: pwsh
+      run: |
+        "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+        "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append

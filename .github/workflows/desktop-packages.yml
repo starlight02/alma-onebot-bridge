@@ -10,13 +10,20 @@ on:
       - published
   workflow_dispatch:
 
+# 同一 ref 的新一轮 push 自动取消进行中的旧 run，节省 runner。
+# tag/release 的 ref 各自唯一，不会被误取消。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认最小权限（只读）；仅需要写 GitHub Release 的 job 单独提权。
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     name: Test Rust bridge
-    runs-on: macos-26
+    runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
@@ -25,9 +32,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            .
-            platforms/windows -> platforms/windows
+          cache-targets: true
 
       - name: Verify release version metadata
         run: scripts/verify-version.sh
@@ -54,20 +59,8 @@ jobs:
             platforms/windows -> platforms/windows
           cache-targets: true
 
-      - name: Install MSYS2 MinGW GNU tools
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-binutils
-            mingw-w64-x86_64-gcc
-
-      - name: Add MSYS2 GNU tools to PATH
-        shell: pwsh
-        run: |
-          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Install MinGW GNU toolchain
+        uses: ./.github/actions/setup-mingw
 
       - name: Check Windows GNU compilation
         shell: pwsh
@@ -77,6 +70,8 @@ jobs:
     name: Build macOS PKG (${{ matrix.package_arch }})
     runs-on: macos-26
     needs: test
+    permissions:
+      contents: write  # 上传 PKG 到 GitHub Release
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -255,11 +250,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
-            TAG_NAME="${GITHUB_REF_NAME}"
-          else
-            TAG_NAME="${GITHUB_REF_NAME}"
-          fi
+          TAG_NAME="${GITHUB_REF_NAME}"
 
           if [[ "${SIGNING_MODE}" == "unsigned" ]]; then
             RELEASE_NOTES="Unsigned macOS PKG installer for $TAG_NAME. Gatekeeper will warn because this build has no Developer ID signature or notarization."
@@ -283,6 +274,8 @@ jobs:
     needs:
       - test
       - check-windows
+    permissions:
+      contents: write  # 上传 MSI/ZIP 到 GitHub Release
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
 
     steps:
@@ -315,20 +308,8 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Install MSYS2 MinGW GNU tools
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-binutils
-            mingw-w64-x86_64-gcc
-
-      - name: Add MSYS2 GNU tools to PATH
-        shell: pwsh
-        run: |
-          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Install MinGW GNU toolchain
+        uses: ./.github/actions/setup-mingw
 
       - name: Build Windows Velopack installer
         shell: pwsh
