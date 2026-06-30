@@ -85,6 +85,15 @@ docker run -d --name alma-onebot-bridge \
   ghcr.io/starlight02/alma-onebot-bridge:latest
 ```
 
+Or use Docker Compose:
+
+```bash
+mkdir -p ./docker-data/config ./docker-data/data ./docker-data/alma
+cp config.toml.example ./docker-data/config/config.toml
+# Edit ./docker-data/config/config.toml, then:
+docker compose up -d
+```
+
 The image reads `/config/config.toml` by default, stores the default database under `/data`, logs to stdout/stderr for `docker logs`, runs as the non-root `bridge` user (`uid=10001`), and exposes port `8090`.
 
 ### macOS Menu Bar App

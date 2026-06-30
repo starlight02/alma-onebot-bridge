@@ -85,6 +85,15 @@ docker run -d --name alma-onebot-bridge \
   ghcr.io/starlight02/alma-onebot-bridge:latest
 ```
 
+也可以用 Docker Compose：
+
+```bash
+mkdir -p ./docker-data/config ./docker-data/data ./docker-data/alma
+cp config.toml.example ./docker-data/config/config.toml
+# 先编辑 ./docker-data/config/config.toml，然后：
+docker compose up -d
+```
+
 镜像默认读取 `/config/config.toml`，把默认数据库写入 `/data`，日志输出到 stdout/stderr 供 `docker logs` 查看，使用非 root 用户 `bridge`（`uid=10001`）运行，并暴露 `8090` 端口。
 
 ### macOS 菜单栏应用

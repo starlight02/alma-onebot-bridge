@@ -1,0 +1,29 @@
+# Alma OneBot Bridge — Docker Compose
+#
+# Quick start:
+#   1. cp config.toml.example docker-data/config/config.toml
+#   2. Edit docker-data/config/config.toml (set alma.api, etc.)
+#   3. docker compose up -d
+#
+# Logs:    docker compose logs -f
+# Stop:    docker compose down
+# Rebuild: docker compose up -d --build  (uses local Dockerfile)
+
+services:
+  bridge:
+    image: ghcr.io/starlight02/alma-onebot-bridge:latest
+    # Uncomment the next two lines to build from the local Dockerfile instead:
+    # build:
+    #   context: .
+    container_name: alma-onebot-bridge
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./docker-data/config:/config:ro
+      - ./docker-data/data:/data
+      - ./docker-data/alma:/home/bridge/.config/alma
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - RUST_LOG=info
