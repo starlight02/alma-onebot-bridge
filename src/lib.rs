@@ -11,6 +11,10 @@ mod pipeline;
 mod server;
 mod state;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::env;
 use std::ffi::OsStr;
 use std::fs;

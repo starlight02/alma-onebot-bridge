@@ -71,7 +71,7 @@ fn router(state: SharedState) -> Router {
         .get("/onebot/v11/ws", websocket_handler(state))
 }
 
-fn websocket_handler(state: SharedState) -> impl trillium::Handler + Send + Sync + 'static {
+fn websocket_handler(state: SharedState) -> impl trillium::Handler + 'static {
     websocket(move |ws: WebSocketConn| {
         let state = state.clone();
         async move {

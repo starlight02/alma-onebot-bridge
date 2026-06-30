@@ -1,6 +1,6 @@
 [package]
 name = "alma-onebot-bridge-windows"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
@@ -33,6 +33,7 @@ windows-sys = { version = "0.61.2", features = [
 windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", package = "windows-reactor-setup" }
 
 [profile.release]
+opt-level = 3
 codegen-units = 1
 lto = "thin"
 panic = "abort"

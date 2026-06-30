@@ -112,6 +112,55 @@ type GenerationGuards = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 type BridgeSuppressions = Arc<Mutex<HashMap<String, Instant>>>;
 type BridgeOwnedAssistantMessages = Arc<Mutex<HashMap<String, Instant>>>;
 
+/// Shared, clonable connection state passed to [`connection_supervisor`] and its
+/// inner session loop. Bundles the Arc'd handles that survive reconnects so the
+/// supervisor signature stays flat.
+#[derive(Clone)]
+struct SupervisorContext {
+    url: String,
+    pending: PendingMap,
+    event_tx: channel::Sender<AlmaEvent>,
+    bridge_suppressions: BridgeSuppressions,
+    bridge_owned_assistant_messages: BridgeOwnedAssistantMessages,
+    connected: Arc<AtomicBool>,
+}
+
+/// Cloneable shared handles passed to [`dispatch_event`]. These outlive a single
+/// WebSocket session and are borrowed immutably for the duration of one event.
+struct DispatchShared<'a> {
+    pending: &'a PendingMap,
+    event_tx: &'a channel::Sender<AlmaEvent>,
+    bridge_suppressions: &'a BridgeSuppressions,
+    bridge_owned_assistant_messages: &'a BridgeOwnedAssistantMessages,
+}
+
+/// Per-session mutable bookkeeping passed to [`dispatch_event`]. These maps live
+/// only for the current connection and are mutated as events arrive.
+struct DispatchState {
+    generating_threads: HashSet<String>,
+    pending_assistant_updates: HashMap<String, AlmaEvent>,
+    recent_bridge_generations: HashMap<String, VecDeque<RecentBridgeGeneration>>,
+}
+
+impl DispatchState {
+    fn new() -> Self {
+        Self {
+            generating_threads: HashSet::new(),
+            pending_assistant_updates: HashMap::new(),
+            recent_bridge_generations: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_generating(generating_threads: HashSet<String>) -> Self {
+        Self {
+            generating_threads,
+            pending_assistant_updates: HashMap::new(),
+            recent_bridge_generations: HashMap::new(),
+        }
+    }
+}
+
 const RECENT_BRIDGE_GENERATION_TTL: Duration = Duration::from_secs(30);
 const RECENT_BRIDGE_GENERATION_LIMIT: usize = 8;
 const STOP_GENERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -180,14 +229,16 @@ impl AlmaWsClient {
         let connected = Arc::new(AtomicBool::new(true));
 
         SmolRuntime::default().spawn(connection_supervisor(
-            url,
+            SupervisorContext {
+                url,
+                pending: pending.clone(),
+                event_tx,
+                bridge_suppressions: bridge_suppressions.clone(),
+                bridge_owned_assistant_messages: bridge_owned_assistant_messages.clone(),
+                connected: connected.clone(),
+            },
             Some(ws_stream),
             ws_rx,
-            pending.clone(),
-            event_tx,
-            bridge_suppressions.clone(),
-            bridge_owned_assistant_messages.clone(),
-            connected.clone(),
         ));
 
         Ok(AlmaWsClient {
@@ -421,15 +472,18 @@ impl AlmaWsClient {
 }
 
 async fn connection_supervisor(
-    url: String,
+    ctx: SupervisorContext,
     mut initial_stream: Option<AlmaWsStream>,
     mut outbound_rx: channel::Receiver<Message>,
-    pending: PendingMap,
-    event_tx: channel::Sender<AlmaEvent>,
-    bridge_suppressions: BridgeSuppressions,
-    bridge_owned_assistant_messages: BridgeOwnedAssistantMessages,
-    connected: Arc<AtomicBool>,
 ) {
+    let SupervisorContext {
+        url,
+        pending,
+        event_tx,
+        bridge_suppressions,
+        bridge_owned_assistant_messages,
+        connected,
+    } = ctx;
     let mut reconnect_attempt: u32 = 0;
 
     loop {
@@ -505,10 +559,7 @@ async fn run_connected_session(
     bridge_owned_assistant_messages: &BridgeOwnedAssistantMessages,
 ) -> bool {
     let (mut sink, mut stream) = ws_stream.split();
-    let mut generating_threads: HashSet<String> = HashSet::new();
-    let mut pending_assistant_updates: HashMap<String, AlmaEvent> = HashMap::new();
-    let mut recent_bridge_generations: HashMap<String, VecDeque<RecentBridgeGeneration>> =
-        HashMap::new();
+    let mut state = DispatchState::new();
 
     loop {
         let outbound = outbound_rx.recv().fuse();
@@ -550,13 +601,13 @@ async fn run_connected_session(
                         };
                         dispatch_event(
                             &json,
-                            pending,
-                            event_tx,
-                            &mut generating_threads,
-                            &mut pending_assistant_updates,
-                            &mut recent_bridge_generations,
-                            bridge_suppressions,
-                            bridge_owned_assistant_messages,
+                            &DispatchShared {
+                                pending,
+                                event_tx,
+                                bridge_suppressions,
+                                bridge_owned_assistant_messages,
+                            },
+                            &mut state,
                         )
                         .await;
                     }
@@ -1345,16 +1396,23 @@ fn event_message_text(data: &Value, msg_data: Option<&Value>) -> String {
 }
 
 /// Dispatch a parsed WebSocket event to pending generations and/or event channel.
-async fn dispatch_event(
-    msg: &Value,
-    pending: &PendingMap,
-    event_tx: &channel::Sender<AlmaEvent>,
-    generating_threads: &mut HashSet<String>,
-    pending_assistant_updates: &mut HashMap<String, AlmaEvent>,
-    recent_bridge_generations: &mut HashMap<String, VecDeque<RecentBridgeGeneration>>,
-    bridge_suppressions: &BridgeSuppressions,
-    bridge_owned_assistant_messages: &BridgeOwnedAssistantMessages,
-) {
+///
+/// `shared` bundles the cloneable handles (pending map, event channel, suppression
+/// maps) that outlive a single session; `state` bundles the per-session mutable
+/// bookkeeping that lives only for the current connection. Splitting them keeps
+/// the signature readable and lets callers clone the shared half freely.
+async fn dispatch_event<'a>(msg: &Value, shared: &DispatchShared<'a>, state: &mut DispatchState) {
+    let DispatchShared {
+        pending,
+        event_tx,
+        bridge_suppressions,
+        bridge_owned_assistant_messages,
+    } = shared;
+    let DispatchState {
+        generating_threads,
+        pending_assistant_updates,
+        recent_bridge_generations,
+    } = state;
     let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let data = match msg.get("data") {
         Some(d) => d,
@@ -1441,7 +1499,7 @@ async fn dispatch_event(
             if is_generating {
                 generating_threads.insert(thread_id.to_string());
             } else {
-                generating_threads.remove(thread_id);
+                state.generating_threads.remove(thread_id);
                 let (had_pending_generation, _, completed_text) =
                     complete_pending_or_start_empty_grace(pending, thread_id).await;
                 if had_pending_generation {
@@ -1508,7 +1566,7 @@ async fn dispatch_event(
                 .await;
             }
 
-            generating_threads.remove(thread_id);
+            state.generating_threads.remove(thread_id);
             pending_assistant_updates.remove(thread_id);
         }
 
@@ -1543,7 +1601,7 @@ async fn dispatch_event(
                 .await;
             }
 
-            generating_threads.remove(thread_id);
+            state.generating_threads.remove(thread_id);
             pending_assistant_updates.remove(thread_id);
         }
 
@@ -1717,7 +1775,7 @@ async fn dispatch_event(
         "generation_completed" => {
             if let Some(thread_id) = data.get("threadId").and_then(|t| t.as_str()) {
                 debug!("[AlmaWS] Progress ({}) for thread {}", msg_type, thread_id);
-                generating_threads.remove(thread_id);
+                state.generating_threads.remove(thread_id);
                 let (had_pending_generation, _, completed_text) =
                     complete_pending_or_start_empty_grace(pending, thread_id).await;
                 if had_pending_generation {
@@ -1933,8 +1991,9 @@ pub(crate) fn visible_assistant_text_matches_for_dedup(left: &str, right: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        AlmaProgressEvent, PendingGeneration, PendingMap, dispatch_event, extract_think_blocks,
-        normalize_assistant_text, sanitize_visible_assistant_text,
+        AlmaProgressEvent, DispatchShared, DispatchState, PendingGeneration, PendingMap,
+        dispatch_event, extract_think_blocks, normalize_assistant_text,
+        sanitize_visible_assistant_text,
     };
     use futures_util::StreamExt;
     use macro_rules_attribute::apply;
@@ -2033,9 +2092,7 @@ mod tests {
         );
 
         let (event_tx, _event_rx) = channel::unbounded();
-        let mut generating_threads = HashSet::from(["thread-1".to_string()]);
-        let mut pending_assistant_updates = HashMap::new();
-        let mut recent_bridge_generations = HashMap::new();
+        let mut state = DispatchState::with_generating(HashSet::from(["thread-1".to_string()]));
         let bridge_suppressions = bridge_suppressions();
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
@@ -2044,13 +2101,13 @@ mod tests {
                 "type": "thread_generating",
                 "data": {"id": "thread-1", "isGenerating": false}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2061,13 +2118,13 @@ mod tests {
                 "type": "generation_error",
                 "data": {"threadId": "thread-1", "error": "real alma error"}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2090,9 +2147,7 @@ mod tests {
         );
 
         let (event_tx, _event_rx) = channel::unbounded();
-        let mut generating_threads = HashSet::from(["thread-2".to_string()]);
-        let mut pending_assistant_updates = HashMap::new();
-        let mut recent_bridge_generations = HashMap::new();
+        let mut state = DispatchState::with_generating(HashSet::from(["thread-2".to_string()]));
         let bridge_suppressions = bridge_suppressions();
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
@@ -2101,13 +2156,13 @@ mod tests {
                 "type": "generation_completed",
                 "data": {"threadId": "thread-2"}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2120,7 +2175,7 @@ mod tests {
         assert_eq!(result.0, "hello");
         assert_eq!(result.1.as_deref(), Some("user-msg-2"));
         assert!(!pending.lock().await.contains_key("thread-2"));
-        assert!(!generating_threads.contains("thread-2"));
+        assert!(!state.generating_threads.contains("thread-2"));
     }
 
     #[apply(test!)]
@@ -2148,9 +2203,7 @@ mod tests {
         );
 
         let (event_tx, _event_rx) = channel::unbounded();
-        let mut generating_threads = HashSet::from(["thread-stage".to_string()]);
-        let mut pending_assistant_updates = HashMap::new();
-        let mut recent_bridge_generations = HashMap::new();
+        let mut state = DispatchState::with_generating(HashSet::from(["thread-stage".to_string()]));
         let bridge_suppressions = bridge_suppressions();
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
@@ -2179,13 +2232,13 @@ mod tests {
                     ]
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2214,13 +2267,13 @@ mod tests {
                     ]
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
         assert!(progress_rx.try_recv().is_err());
@@ -2240,13 +2293,13 @@ mod tests {
                     ]
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2274,13 +2327,13 @@ mod tests {
                     ]
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
         assert!(progress_rx.try_recv().is_err());
@@ -2290,13 +2343,13 @@ mod tests {
                 "type": "generation_completed",
                 "data": {"threadId": "thread-stage"}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
         dispatch_event(
@@ -2304,13 +2357,13 @@ mod tests {
                 "type": "thread_generating",
                 "data": {"id": "thread-stage", "isGenerating": false}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2327,13 +2380,13 @@ mod tests {
                     ]
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
         dispatch_event(
@@ -2341,13 +2394,13 @@ mod tests {
                 "type": "generation_completed",
                 "data": {"threadId": "thread-stage"}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2372,9 +2425,7 @@ mod tests {
         );
 
         let (event_tx, event_rx) = channel::unbounded();
-        let mut generating_threads = HashSet::from(["thread-3".to_string()]);
-        let mut pending_assistant_updates = HashMap::new();
-        let mut recent_bridge_generations = HashMap::new();
+        let mut state = DispatchState::with_generating(HashSet::from(["thread-3".to_string()]));
         let bridge_suppressions = bridge_suppressions();
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
@@ -2383,13 +2434,13 @@ mod tests {
                 "type": "thread_generating",
                 "data": {"id": "thread-3", "isGenerating": false}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2414,13 +2465,13 @@ mod tests {
                     }
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2438,9 +2489,7 @@ mod tests {
         );
 
         let (event_tx, event_rx) = channel::unbounded();
-        let mut generating_threads = HashSet::from(["thread-4".to_string()]);
-        let mut pending_assistant_updates = HashMap::new();
-        let mut recent_bridge_generations = HashMap::new();
+        let mut state = DispatchState::with_generating(HashSet::from(["thread-4".to_string()]));
         let bridge_suppressions = bridge_suppressions();
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
@@ -2449,13 +2498,13 @@ mod tests {
                 "type": "generation_completed",
                 "data": {"threadId": "thread-4"}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2480,13 +2529,13 @@ mod tests {
                     }
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2505,9 +2554,7 @@ mod tests {
         );
 
         let (event_tx, event_rx) = channel::unbounded();
-        let mut generating_threads = HashSet::from(["thread-5".to_string()]);
-        let mut pending_assistant_updates = HashMap::new();
-        let mut recent_bridge_generations = HashMap::new();
+        let mut state = DispatchState::with_generating(HashSet::from(["thread-5".to_string()]));
         let bridge_suppressions = bridge_suppressions();
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
@@ -2516,13 +2563,13 @@ mod tests {
                 "type": "generation_completed",
                 "data": {"threadId": "thread-5"}
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2547,13 +2594,13 @@ mod tests {
                     }
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2570,9 +2617,7 @@ mod tests {
         );
 
         let (event_tx, event_rx) = channel::unbounded();
-        let mut generating_threads = HashSet::from(["thread-late".to_string()]);
-        let mut pending_assistant_updates = HashMap::new();
-        let mut recent_bridge_generations = HashMap::new();
+        let mut state = DispatchState::with_generating(HashSet::from(["thread-late".to_string()]));
         let bridge_suppressions = bridge_suppressions();
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
@@ -2586,18 +2631,18 @@ mod tests {
                     "text": ""
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
         pending.lock().await.remove("thread-late");
-        generating_threads.remove("thread-late");
+        state.generating_threads.remove("thread-late");
 
         dispatch_event(
             &json!({
@@ -2609,13 +2654,13 @@ mod tests {
                     "text": "this stale first attempt must not reach QQ"
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2626,9 +2671,7 @@ mod tests {
     async fn unmarked_top_level_message_updated_still_flows_for_gui_forwarding() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = channel::unbounded();
-        let mut generating_threads = HashSet::new();
-        let mut pending_assistant_updates = HashMap::new();
-        let mut recent_bridge_generations = HashMap::new();
+        let mut state = DispatchState::new();
         let bridge_suppressions = bridge_suppressions();
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
@@ -2642,13 +2685,13 @@ mod tests {
                     "text": "manual Alma GUI reply"
                 }
             }),
-            &pending,
-            &event_tx,
-            &mut generating_threads,
-            &mut pending_assistant_updates,
-            &mut recent_bridge_generations,
-            &bridge_suppressions,
-            &bridge_owned_assistant_messages,
+            &DispatchShared {
+                pending: &pending,
+                event_tx: &event_tx,
+                bridge_suppressions: &bridge_suppressions,
+                bridge_owned_assistant_messages: &bridge_owned_assistant_messages,
+            },
+            &mut state,
         )
         .await;
 
@@ -2877,14 +2920,16 @@ mod tests {
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
         let supervisor = smol::spawn(super::connection_supervisor(
-            url,
+            super::SupervisorContext {
+                url,
+                pending,
+                event_tx,
+                bridge_suppressions,
+                bridge_owned_assistant_messages,
+                connected,
+            },
             None,
             outbound_rx,
-            pending,
-            event_tx,
-            bridge_suppressions,
-            bridge_owned_assistant_messages,
-            connected,
         ));
 
         SmolRuntime::default()
@@ -2934,14 +2979,16 @@ mod tests {
         let bridge_owned_assistant_messages = bridge_owned_assistant_messages();
 
         let supervisor = smol::spawn(super::connection_supervisor(
-            url,
+            super::SupervisorContext {
+                url,
+                pending,
+                event_tx,
+                bridge_suppressions,
+                bridge_owned_assistant_messages,
+                connected,
+            },
             None,
             outbound_rx,
-            pending,
-            event_tx,
-            bridge_suppressions,
-            bridge_owned_assistant_messages,
-            connected,
         ));
 
         // If the supervisor were to spin (the reviewed bug), this would hang

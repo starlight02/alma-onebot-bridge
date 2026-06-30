@@ -141,10 +141,7 @@ impl Config {
             show_thinking: chat.show_thinking.unwrap_or(false),
             show_tool_calls: chat.show_tool_calls.unwrap_or(false),
             segmented_replies: chat.segmented_replies.unwrap_or(false),
-            listen_group_messages: {
-                let listen = chat.listen_group_messages.unwrap_or(true);
-                listen
-            },
+            listen_group_messages: chat.listen_group_messages.unwrap_or(true),
             respond_to_group_messages: {
                 let listen = chat.listen_group_messages.unwrap_or(true);
                 let respond = chat.respond_to_group_messages.unwrap_or(true);
