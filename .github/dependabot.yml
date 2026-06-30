@@ -57,3 +57,13 @@ updates:
     auto-merge: true
     commit-message:
       prefix: "ci"
+
+  # Dockerfile base image（rust / debian-slim）digest 更新
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    auto-merge: true
+    commit-message:
+      prefix: "ci(docker)"

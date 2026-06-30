@@ -1,0 +1,40 @@
+# Rust 构建产物（builder 用 BuildKit cache mount 复用，不进 context）
+target/
+**/target/
+
+# 桌面打包产物
+dist/
+**/dist/
+
+# Git
+.git/
+.gitignore
+
+# 运行时状态 / 本地私密配置（不进镜像）
+*.db
+*.db-wal
+*.db-shm
+config.toml
+
+# 临时与快照
+*tmp*
+.alma-snapshots
+.codex_tmp
+.workbuddy
+
+# OS / IDE
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Xcode 构建产物与用户数据
+platforms/macos/build/
+platforms/macos/AlmaOneBotBridge.xcodeproj/xcuserdata/
+platforms/macos/AlmaOneBotBridge.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# macOS app 资源目录内嵌的根 bin 副本
+platforms/macos/AlmaOneBotBridge/Resources/alma-onebot-bridge

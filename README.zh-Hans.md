@@ -57,6 +57,36 @@ cd alma-onebot-bridge
 cargo build --release
 ```
 
+### Docker 镜像
+
+推送版本 tag 后，CI 会自动发布 Linux amd64 服务镜像到 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/starlight02/alma-onebot-bridge:latest
+# 或固定到某个发布版本，例如：
+docker pull ghcr.io/starlight02/alma-onebot-bridge:0.2.2
+```
+
+运行时显式挂载配置和持久化状态目录：
+
+```bash
+mkdir -p ./docker-data/config ./docker-data/data ./docker-data/alma
+cp config.toml.example ./docker-data/config/config.toml
+
+# 先编辑 ./docker-data/config/config.toml。
+# 如果 Alma 跑在 Docker 宿主机上，把 alma.api 设为 "http://host.docker.internal:23001"。
+docker run -d --name alma-onebot-bridge \
+  --restart unless-stopped \
+  --add-host=host.docker.internal:host-gateway \
+  -p 8090:8090 \
+  -v "$PWD/docker-data/config:/config:ro" \
+  -v "$PWD/docker-data/data:/data" \
+  -v "$PWD/docker-data/alma:/home/bridge/.config/alma" \
+  ghcr.io/starlight02/alma-onebot-bridge:latest
+```
+
+镜像默认读取 `/config/config.toml`，把默认数据库写入 `/data`，日志输出到 stdout/stderr 供 `docker logs` 查看，使用非 root 用户 `bridge`（`uid=10001`）运行，并暴露 `8090` 端口。
+
 ### macOS 菜单栏应用
 
 macOS 应用从菜单栏运行 Rust 桥接服务。它负责启动/停止桥接服务，打开设置窗口，

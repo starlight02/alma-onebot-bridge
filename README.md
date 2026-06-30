@@ -57,6 +57,36 @@ cd alma-onebot-bridge
 cargo build --release
 ```
 
+### Docker Image
+
+Version tags publish a Linux amd64 service image to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/starlight02/alma-onebot-bridge:latest
+# or pin a release tag, for example:
+docker pull ghcr.io/starlight02/alma-onebot-bridge:0.2.2
+```
+
+Run with explicit config and persistent state mounts:
+
+```bash
+mkdir -p ./docker-data/config ./docker-data/data ./docker-data/alma
+cp config.toml.example ./docker-data/config/config.toml
+
+# Edit ./docker-data/config/config.toml first.
+# If Alma runs on the Docker host, set alma.api = "http://host.docker.internal:23001".
+docker run -d --name alma-onebot-bridge \
+  --restart unless-stopped \
+  --add-host=host.docker.internal:host-gateway \
+  -p 8090:8090 \
+  -v "$PWD/docker-data/config:/config:ro" \
+  -v "$PWD/docker-data/data:/data" \
+  -v "$PWD/docker-data/alma:/home/bridge/.config/alma" \
+  ghcr.io/starlight02/alma-onebot-bridge:latest
+```
+
+The image reads `/config/config.toml` by default, stores the default database under `/data`, logs to stdout/stderr for `docker logs`, runs as the non-root `bridge` user (`uid=10001`), and exposes port `8090`.
+
 ### macOS Menu Bar App
 
 The macOS app runs the Rust bridge from the menu bar. It starts and stops the
