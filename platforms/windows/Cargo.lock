@@ -3713,7 +3713,7 @@ dependencies = [
 [[package]]
 name = "windows-collections"
 version = "0.3.2"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs)",
 ]
@@ -3734,7 +3734,7 @@ dependencies = [
 [[package]]
 name = "windows-core"
 version = "0.62.2"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs)",
  "windows-result 0.4.1 (git+https://github.com/microsoft/windows-rs)",
@@ -3755,7 +3755,7 @@ dependencies = [
 [[package]]
 name = "windows-future"
 version = "0.3.2"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs)",
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs)",
@@ -3793,7 +3793,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 [[package]]
 name = "windows-link"
 version = "0.2.1"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 
 [[package]]
 name = "windows-numerics"
@@ -3808,7 +3808,7 @@ dependencies = [
 [[package]]
 name = "windows-numerics"
 version = "0.3.1"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs)",
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs)",
@@ -3817,7 +3817,7 @@ dependencies = [
 [[package]]
 name = "windows-reactor"
 version = "0.0.0"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "rustc-hash 2.1.2",
  "windows-collections 0.3.2 (git+https://github.com/microsoft/windows-rs)",
@@ -3832,12 +3832,12 @@ dependencies = [
 [[package]]
 name = "windows-reactor-setup"
 version = "0.0.0"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 
 [[package]]
 name = "windows-reference"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs)",
  "windows-time",
@@ -3855,7 +3855,7 @@ dependencies = [
 [[package]]
 name = "windows-result"
 version = "0.4.1"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs)",
 ]
@@ -3872,7 +3872,7 @@ dependencies = [
 [[package]]
 name = "windows-strings"
 version = "0.5.1"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs)",
 ]
@@ -3932,7 +3932,7 @@ dependencies = [
 [[package]]
 name = "windows-threading"
 version = "0.2.1"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs)",
 ]
@@ -3940,7 +3940,7 @@ dependencies = [
 [[package]]
 name = "windows-time"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/windows-rs#4e3e9154cccadfb8575a363abb0855fa5b109b90"
+source = "git+https://github.com/microsoft/windows-rs#a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f"
 dependencies = [
  "windows-core 0.62.2 (git+https://github.com/microsoft/windows-rs)",
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs)",
