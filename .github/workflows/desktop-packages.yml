@@ -66,6 +66,30 @@ jobs:
         shell: pwsh
         run: cargo check --manifest-path platforms/windows/Cargo.toml --target x86_64-pc-windows-gnu
 
+  enable-dependabot-automerge:
+    name: Enable Dependabot auto-merge
+    # Native GitHub auto-merge: this only flips the PR flag. Required checks from
+    # branch rules (Test Rust bridge / Check Windows GNU app) still gate the merge.
+    # Keep this inside Desktop Packages so we do not create a separate workflow that
+    # paints phantom check-suites on plain pushes.
+    if: >
+      github.event_name == 'pull_request' &&
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable squash auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          gh pr merge --auto --squash "$PR_URL"
+          echo "Auto-merge enabled for $PR_URL"
+
   build-pkg:
     name: Build macOS PKG (${{ matrix.package_arch }})
     runs-on: macos-26

@@ -1,6 +1,7 @@
 version: 2
-# auto-merge: true 需要配合 .github/workflows/dependabot-automerge.yml。
-# 仓库需开启 Allow auto-merge；有 required checks 时等检查绿后自动 squash。
+# Auto-merge is NOT configured here. Desktop Packages CI enables it via
+# jobs.enable-dependabot-automerge (gh pr merge --auto --squash).
+# Prerequisite: repository Allow auto-merge + required checks still gate merge.
 updates:
   # Rust 主工程依赖
   - package-ecosystem: cargo
@@ -8,7 +9,6 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    auto-merge: true
     commit-message:
       prefix: "deps"
     groups:
@@ -23,7 +23,6 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    auto-merge: true
     commit-message:
       prefix: "deps(windows)"
     groups:
@@ -38,7 +37,6 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    auto-merge: true
     commit-message:
       prefix: "deps(macos)"
     groups:
@@ -53,7 +51,6 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    auto-merge: true
     commit-message:
       prefix: "ci"
 
@@ -63,6 +60,5 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    auto-merge: true
     commit-message:
       prefix: "ci(docker)"
