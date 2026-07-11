@@ -1,7 +1,6 @@
 version: 2
-# 所有 ecosystem 启用 auto-merge：Dependabot 在 CI 通过后自动 squash merge。
-# 前提：master 分支保护已要求 "Test Rust bridge" + "Check Windows GNU app"
-# 状态检查通过（见 .github 仓库设置），仓库已开启 Allow auto-merge。
+# auto-merge: true 需要配合 .github/workflows/dependabot-automerge.yml。
+# 仓库需开启 Allow auto-merge；有 required checks 时等检查绿后自动 squash。
 updates:
   # Rust 主工程依赖
   - package-ecosystem: cargo

@@ -1,0 +1,22 @@
+name: Dependabot automerge
+
+# GitHub 官方路径：Allow auto-merge（仓库设置）+ 本 workflow 给 Dependabot PR 打开 auto-merge。
+# dependabot.yml 里的 auto-merge: true  alone 不会合 PR——现网证据：
+# open PR #8-#14 全是 CLEAN/MERGEABLE 但 autoMergeRequest=null，历史 merged 均由 starlight02 手合。
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Enable auto-merge (squash)
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
