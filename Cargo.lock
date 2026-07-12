@@ -142,6 +142,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aristo"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcdeefa800110050103e2459a2f8dbdbd560ad046e30f1f87e24ce19c2cb8bde"
+dependencies = [
+ "aristo-macros",
+]
+
+[[package]]
+name = "aristo-macros"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64a66d21a80182b35b1741997a6d2456911f54b7eb1918aa4e2382fc205268d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "assoc"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2679,9 +2699,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.51"
+version = "0.3.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85c17d80feb7334b40c484e45ed1a5273dfd8bfda537c3be2e74a06a6686f327"
+checksum = "18dfaaeddcb932337b5e7866ee7d0ce9b76d2fd092997146f187ec09b4558a50"
 dependencies = [
  "deranged",
  "libc",
@@ -2701,9 +2721,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.30"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcef1a61bdb119096e153208ec5cbec23944ce8bca13be5c7f60c634f7403935"
+checksum = "c431b87111666e491a90baa837f914fb45cd5dc3c268591b0220ff5057f2085f"
 dependencies = [
  "num-conv",
  "time-core",
@@ -2847,9 +2867,9 @@ dependencies = [
 
 [[package]]
 name = "trillium-client"
-version = "0.9.7"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45746a3af8dd8659bd197b67200fcd61cacc5a1a52054617694976e5ed2b2bdc"
+checksum = "c2f7dd9b3bed0b898fef56dcaf3c6aae4c34b7d31ba7a922ef847ee2d34a9eab"
 dependencies = [
  "async-lock",
  "crossbeam-queue",
@@ -2871,9 +2891,9 @@ dependencies = [
 
 [[package]]
 name = "trillium-http"
-version = "1.3.10"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84c6de92944bcc6f4c19ffa329d9f20ad81bc2f93a2008871e1facd3219ae78a"
+checksum = "d5b8a4754740bd602d54e51bfca9c0641578481cb52f86e8f64e84e4bfb016e7"
 dependencies = [
  "atomic-waker",
  "encoding_rs",
@@ -3014,9 +3034,9 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22b818883a69bb79cdb6e48c20e582b62a5e36ef208c62114d3852e395dd1f0a"
+checksum = "740a6b03372b4a1fba197fb75bdd68c47a8607016b75b15ffa0625a31f38757e"
 dependencies = [
  "thiserror",
  "tracing",
@@ -3028,9 +3048,9 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77da3fcbf1d53c4828b788df3f67eeaf768773cd082135f70f8032b2ad0f635e"
+checksum = "37a242a717a859aa1a044af59365a0044d768fafd693986247e62fecc70ae8db"
 dependencies = [
  "aegis",
  "aes",
@@ -3038,6 +3058,7 @@ dependencies = [
  "allocator-api2 0.4.0",
  "antithesis_sdk",
  "arc-swap",
+ "aristo",
  "bigdecimal",
  "bitflags",
  "branches",
@@ -3097,9 +3118,9 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b255c52a7dcf62a2744ef7f65ea83c93975ef1a3d9a1ab91605cd37e39909a1"
+checksum = "61af2557f635730584ed5227a365bac89a2e48b876374b953b0617f0c8ef86c6"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -3108,9 +3129,9 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "997660c26f248fc59ba55399be85a5dc09870f00539676b9ce0d0ae2ba1535d5"
+checksum = "6f7fbaf634096751abd2a689315ae75b9704498de23a1a1566c8b4440dd388e7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3119,9 +3140,9 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e42b200a507da7c843e5a68088e983eb95e20d8c6b5ba057489387409d4de1"
+checksum = "92e91e768f2c3a1df02ee8c27fe19217a1f03689d8ef8c3001a088e7466fe2db"
 dependencies = [
  "bitflags",
  "memchr",
@@ -3134,9 +3155,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20795688336c8f20743031e239ba71badf65fb1ecee14e665e19bbc4a67f1706"
+checksum = "ebb7f13561dadb97fb576e3a05f8cc072b81f8cbb5336103d49ebda38089e273"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -3151,9 +3172,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09905d3b134c0bd906894b004b893aa58c71b125b45958e55c42d5d56f9a87b7"
+checksum = "59d4612a0c7d516efdd9b68a9687fe7eff2507eaa8cfe56724ce0ba377e437f6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3162,9 +3183,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "459add86b49ed9d5b25ff7d3b7be7faa24dc174bc9c840763231fe8f4a81dc11"
+checksum = "ecbc491080af86a273f520c5ff0595366e8324c2b3d0620eabfccf35c039ded5"
 dependencies = [
  "base64",
  "bytes",
@@ -3184,9 +3205,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.7.0-pre.13"
+version = "0.7.0-pre.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "885cad3abe73b2483a3d2cb4333bd7aae9eedf64368cf16361c6ff881db0ea70"
+checksum = "722ecf45be0c3a988fe31c9a8c5832b7eeda05b531a838b77fd1d3c70633b8f1"
 dependencies = [
  "bindgen",
  "env_logger",
