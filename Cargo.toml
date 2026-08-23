@@ -13,7 +13,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 async-broadcast = "0.7.2"
-async-tungstenite = { version = "0.34.1", default-features = false, features = ["smol-runtime"] }
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["smol-runtime"] }
 base64 = "0.23.0"
 dirs = "6.0.0"
 futures-lite = "2.6.1"
