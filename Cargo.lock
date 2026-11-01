@@ -2872,9 +2872,9 @@ dependencies = [
 
 [[package]]
 name = "trillium"
-version = "1.4.0"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfd13d61c47d3f4bb20a9975b259aba6962392589c800e20b0e7c5626cf459e9"
+checksum = "453a5ef2696059f30bf8a484b523e8d6f78bd382a1ecc6c275c3abde658b4f36"
 dependencies = [
  "futures-lite",
  "log",
@@ -2884,9 +2884,9 @@ dependencies = [
 
 [[package]]
 name = "trillium-client"
-version = "0.9.19"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56c46cfbfd8304977f70e8c422f0cab253b6e7ccb4eb3ce7d9c52ee070f666dc"
+checksum = "ac23da1317cd2fa1367a28824f95e803bdc2a967c2e6cb8e11436042c52dbb12"
 dependencies = [
  "async-lock",
  "crossbeam-queue",
@@ -3327,9 +3327,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.28.0"
+version = "1.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606"
+checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
