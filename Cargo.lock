@@ -1650,9 +1650,9 @@ dependencies = [
 
 [[package]]
 name = "memchr"
-version = "2.8.2"
+version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memoffset"
@@ -2147,13 +2147,12 @@ dependencies = [
 
 [[package]]
 name = "routefinder"
-version = "0.5.4"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0971d3c8943a6267d6bd0d782fdc4afa7593e7381a92a3df950ff58897e066b5"
+checksum = "fe6fbf8ca14f58cee7a718f58ce9ded435a2d0cef651b1d67379f19f12b0f0f2"
 dependencies = [
+ "compact_str",
  "memchr",
- "smartcow",
- "smartstring",
 ]
 
 [[package]]
@@ -2542,26 +2541,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-
-[[package]]
-name = "smartcow"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "656fcb1c1fca8c4655372134ce87d8afdf5ec5949ebabe8d314be0141d8b5da2"
-dependencies = [
- "smartstring",
-]
-
-[[package]]
-name = "smartstring"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
-dependencies = [
- "autocfg",
- "static_assertions",
- "version_check",
-]
 
 [[package]]
 name = "smol"
@@ -2992,9 +2971,9 @@ dependencies = [
 
 [[package]]
 name = "trillium-router"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95d8699286507e794512e07404c190989a3b12317aa51f83e8a4e15ec58b7273"
+checksum = "72a35b4b6944896c1cd6e80ffd56364af3be426242b42fe0effd7e18429768cd"
 dependencies = [
  "log",
  "routefinder",
